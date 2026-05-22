@@ -40,7 +40,7 @@ Example config:
 
 ```toml
 provider = "fake"
-model = "gpt-5.4-nano"
+model = "gpt-5-nano"
 max_parallel_agents = 128
 max_agent_steps = 32
 max_parallel_llm_requests = 32
@@ -62,7 +62,7 @@ Provider config is intentionally small:
 ```toml
 provider = "openai"
 api_key_env = "OPENAI_API_KEY"
-model = "gpt-5.4-nano"
+model = "gpt-5-nano"
 ```
 
 ```toml

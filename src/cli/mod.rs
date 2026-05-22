@@ -188,6 +188,7 @@ fn print_agent_progress(event: AgentProgressEvent) {
             agent_count,
             llm_calls,
             llm_elapsed,
+            ..
         } => println!(
             "Koochi: completed batch {batch_index}/{batch_count} ({agent_count} agents, {llm_calls} LLM calls, LLM {})",
             format_duration(llm_elapsed)
@@ -218,6 +219,9 @@ fn review_scope_line(review: &crate::scope::ReviewScope) -> String {
 struct DebugRunStats {
     agent_batches: usize,
     llm_turns: usize,
+    native_tool_calls: usize,
+    native_final_calls: usize,
+    text_fallback_turns: usize,
     llm_elapsed: Duration,
 }
 
@@ -227,10 +231,16 @@ impl DebugRunStats {
             AgentProgressEvent::BatchCompleted {
                 llm_elapsed,
                 llm_calls,
+                native_tool_calls,
+                native_final_calls,
+                text_fallback_turns,
                 ..
             } => {
                 self.agent_batches += 1;
                 self.llm_turns += llm_calls;
+                self.native_tool_calls += native_tool_calls;
+                self.native_final_calls += native_final_calls;
+                self.text_fallback_turns += text_fallback_turns;
                 self.llm_elapsed += llm_elapsed;
             }
             AgentProgressEvent::BatchPreparing { .. }
@@ -266,6 +276,10 @@ fn print_debug_report(
         llm_bus.provider_calls,
         llm_bus.retry_attempts,
         format_duration(debug.llm_elapsed)
+    );
+    println!(
+        "  LLM actions: {} native tool calls, {} native final verdicts, {} text fallback turns",
+        debug.native_tool_calls, debug.native_final_calls, debug.text_fallback_turns
     );
     println!(
         "  search tools: {} calls total (list_files {}, list_review_files {}, read_file {}, get_file_context {}, search_text {}, definitions {}, references {})",
@@ -313,6 +327,9 @@ struct DebugLlmLog {
     agent_batches: usize,
     provider_calls: usize,
     retry_attempts: usize,
+    native_tool_calls: usize,
+    native_final_calls: usize,
+    text_fallback_turns: usize,
     elapsed_ms: u128,
 }
 
@@ -389,6 +406,9 @@ fn build_debug_log(
             agent_batches: debug.agent_batches,
             provider_calls: llm_bus.provider_calls,
             retry_attempts: llm_bus.retry_attempts,
+            native_tool_calls: debug.native_tool_calls,
+            native_final_calls: debug.native_final_calls,
+            text_fallback_turns: debug.text_fallback_turns,
             elapsed_ms: debug.llm_elapsed.as_millis(),
         },
         search: DebugSearchLog {

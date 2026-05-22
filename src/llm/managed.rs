@@ -1,5 +1,6 @@
 use super::bus::LlmBus;
 use super::bus::LlmBusError;
+use super::types::LlmAction;
 use super::types::LlmRequest;
 use super::types::LlmResponse;
 use super::types::LlmTextResponse;
@@ -88,6 +89,25 @@ impl ManagedLlmBus {
             }
         }
     }
+
+    async fn complete_action_with_retry(
+        &self,
+        request: LlmRequest,
+    ) -> Result<LlmAction, LlmBusError> {
+        let mut attempt = 0;
+        loop {
+            self.stats.provider_calls.fetch_add(1, Ordering::Relaxed);
+            match self.inner.complete_action(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) if should_retry(&error) && attempt < self.config.max_retries => {
+                    self.stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
+                    sleep(backoff(self.config.initial_backoff, attempt)).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -99,6 +119,15 @@ impl LlmBus for ManagedLlmBus {
             .await
             .map_err(|_| LlmBusError::Failed("llm concurrency limiter closed".to_string()))?;
         self.complete_text_with_retry(request).await
+    }
+
+    async fn complete_action(&self, request: LlmRequest) -> Result<LlmAction, LlmBusError> {
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|_| LlmBusError::Failed("llm concurrency limiter closed".to_string()))?;
+        self.complete_action_with_retry(request).await
     }
 
     async fn complete_batch(

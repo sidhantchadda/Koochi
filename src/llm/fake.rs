@@ -124,7 +124,7 @@ mod tests {
         let response = bus
             .complete(LlmRequest {
                 test_id: "retry".to_string(),
-                model: "gpt-5.4-nano".to_string(),
+                model: "gpt-5-nano".to_string(),
                 instruction: "Check retry policy".to_string(),
             })
             .await

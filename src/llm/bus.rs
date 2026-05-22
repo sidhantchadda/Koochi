@@ -4,6 +4,7 @@ use super::managed::ManagedLlmBus;
 use super::managed::ManagedLlmBusConfig;
 use super::managed::ManagedLlmBusStatsSnapshot;
 use super::openai::OpenAiBus;
+use super::types::LlmAction;
 use super::types::LlmRequest;
 use super::types::LlmResponse;
 use super::types::LlmTextResponse;
@@ -35,6 +36,11 @@ pub enum LlmBusError {
 #[async_trait]
 pub trait LlmBus: Send + Sync {
     async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError>;
+
+    async fn complete_action(&self, request: LlmRequest) -> Result<LlmAction, LlmBusError> {
+        let response = self.complete_text(request).await?;
+        Ok(LlmAction::Text(response.content))
+    }
 
     async fn complete(&self, request: LlmRequest) -> Result<LlmResponse, LlmBusError> {
         let response = self.complete_text(request).await?;

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-pub const DEFAULT_MODEL: &str = "gpt-5.4-nano";
+pub const DEFAULT_MODEL: &str = "gpt-5-nano";
 pub const DEFAULT_PROVIDER: AiProvider = AiProvider::Fake;
 pub const DEFAULT_MAX_PARALLEL_AGENTS: usize = 128;
 pub const DEFAULT_MAX_AGENT_STEPS: usize = 32;

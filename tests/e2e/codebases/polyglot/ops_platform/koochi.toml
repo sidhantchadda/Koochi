@@ -1,5 +1,5 @@
 provider = "openai"
-model = "gpt-4o-mini"
+model = "gpt-5-nano"
 api_key_env = "OPENAI_API_KEY"
 max_parallel_agents = 4
 max_parallel_llm_requests = 4

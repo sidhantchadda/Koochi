@@ -64,7 +64,7 @@ async fn runs_agents_through_bus() {
             id: "one".to_string(),
             name: "one".to_string(),
             instruction: "Pass this".to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,
@@ -103,7 +103,7 @@ async fn batches_agents_by_configured_limit() {
             id: format!("test-{index}"),
             name: format!("test-{index}"),
             instruction: "Pass this".to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         })
         .collect();
@@ -138,7 +138,7 @@ async fn grounds_agent_instruction_with_repo_context() {
             id: "one".to_string(),
             name: "one".to_string(),
             instruction: "Pass this".to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,
@@ -181,7 +181,7 @@ async fn drops_provider_evidence_not_found_in_repo_context() {
             id: "one".to_string(),
             name: "one".to_string(),
             instruction: "missing auth".to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,
@@ -238,7 +238,7 @@ async fn failed_verdict_without_review_scope_evidence_is_not_reported() {
             id: "one".to_string(),
             name: "one".to_string(),
             instruction: "Find token logging with concrete evidence.".to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,
@@ -295,7 +295,7 @@ async fn absence_policy_failure_can_fail_without_line_evidence() {
             instruction:
                 "If this commit doesn't contain any python files then fail. Otherwise pass."
                     .to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,
@@ -347,7 +347,7 @@ async fn exact_red_herring_failure_is_preserved_without_evidence() {
             instruction:
                 "If this commit doesn't contain any python files then fail. Otherwise pass."
                     .to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,
@@ -392,7 +392,7 @@ async fn agent_can_search_before_final_verdict() {
             id: "one".to_string(),
             name: "one".to_string(),
             instruction: "Find token logging.".to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,
@@ -407,6 +407,48 @@ async fn agent_can_search_before_final_verdict() {
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence.len(), 1);
     assert_eq!(verdicts[0].evidence[0].line, 2);
+}
+
+#[tokio::test]
+async fn malformed_provider_json_is_rejected_and_reprompted() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn handler() {\n    log_token();\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{}"#,
+        r#"{"action":"search_text","query":"log_token","kind":"source"}"#,
+        r#"{"action":"read_file","path":"lib.rs"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"token logging found",
+                "evidence":[{"path":"lib.rs","line":2,"preview":"log_token();"}]
+            }"#,
+    ]));
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Find token logging.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 4);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence.len(), 1);
 }
 
 #[test]
@@ -436,7 +478,7 @@ async fn accepts_plain_verdict_json_as_final_turn() {
             id: "one".to_string(),
             name: "one".to_string(),
             instruction: "Return this already-known non-code verdict.".to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,
@@ -484,7 +526,7 @@ async fn pass_fixture_check_rejects_failure_before_matching_safe_marker() {
             id: "pass-parameterized-sql".to_string(),
             name: "pass-parameterized-sql".to_string(),
             instruction: "Verify project lookups use parameterized SQL.".to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,
@@ -527,7 +569,7 @@ async fn fail_fixture_check_rejects_pass_after_matching_fail_marker() {
             name: "fail-config-discovery-live".to_string(),
             instruction: "Do not leave config discovery probe markers in reviewed source."
                 .to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,
@@ -557,7 +599,7 @@ async fn honors_configured_agent_step_limit() {
             id: "one".to_string(),
             name: "one".to_string(),
             instruction: "Keep searching.".to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,
@@ -586,7 +628,7 @@ async fn step_limit_failure_with_concrete_evidence_instruction_stays_failed() {
             id: "one".to_string(),
             name: "one".to_string(),
             instruction: "Find this issue with concrete evidence.".to_string(),
-            model: "gpt-5.4-nano".to_string(),
+            model: "gpt-5-nano".to_string(),
             severity: None,
         }],
         search,

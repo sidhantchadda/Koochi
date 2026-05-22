@@ -245,7 +245,7 @@ pub fn live_provider() -> LiveProvider {
     match provider.as_str() {
         "openai" => LiveProvider {
             provider,
-            model: std::env::var("KOOCHI_E2E_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+            model: std::env::var("KOOCHI_E2E_MODEL").unwrap_or_else(|_| "gpt-5-nano".to_string()),
             api_key_env: "OPENAI_API_KEY",
             api_key: key_from_env_or_dotenv("OPENAI_API_KEY")
                 .expect("set OPENAI_API_KEY or create .env.local"),

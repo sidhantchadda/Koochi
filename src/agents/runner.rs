@@ -1,9 +1,11 @@
 use super::verdict::AgentVerdict;
 use crate::Severity;
+use crate::llm::LlmAction;
 use crate::llm::LlmBus;
 use crate::llm::LlmBusError;
 use crate::llm::LlmRequest;
 use crate::llm::LlmResponse;
+use crate::llm::LlmToolCall;
 use crate::llm::TestStatus;
 use crate::llm::parse_verdict;
 use crate::prompts::grounded_agent_prompt;
@@ -54,6 +56,9 @@ pub enum AgentProgressEvent {
         batch_count: usize,
         agent_count: usize,
         llm_calls: usize,
+        native_tool_calls: usize,
+        native_final_calls: usize,
+        text_fallback_turns: usize,
         llm_elapsed: Duration,
     },
 }
@@ -121,11 +126,26 @@ where
             .iter()
             .map(|result| result.llm_calls)
             .sum::<usize>();
+        let native_tool_calls = loop_results
+            .iter()
+            .map(|result| result.native_tool_calls)
+            .sum::<usize>();
+        let native_final_calls = loop_results
+            .iter()
+            .map(|result| result.native_final_calls)
+            .sum::<usize>();
+        let text_fallback_turns = loop_results
+            .iter()
+            .map(|result| result.text_fallback_turns)
+            .sum::<usize>();
         progress(AgentProgressEvent::BatchCompleted {
             batch_index: batch_index + 1,
             batch_count,
             agent_count: loop_results.len(),
             llm_calls,
+            native_tool_calls,
+            native_final_calls,
+            text_fallback_turns,
             llm_elapsed,
         });
         for (agent, loop_result) in chunk.iter().zip(loop_results) {
@@ -179,6 +199,9 @@ struct AgentLoopResult {
     evidence_index: HashSet<(String, u32)>,
     review_paths: HashSet<String>,
     llm_calls: usize,
+    native_tool_calls: usize,
+    native_final_calls: usize,
+    text_fallback_turns: usize,
 }
 
 struct GroundedRequest {
@@ -203,17 +226,35 @@ where
     let mut evidence_index = grounded.evidence_index;
     let mut investigation = InvestigationState::new(agent);
     let mut llm_calls = 0;
+    let mut native_tool_calls = 0;
+    let mut native_final_calls = 0;
+    let mut text_fallback_turns = 0;
 
     for step in 1..=max_agent_steps.max(1) {
         llm_calls += 1;
-        let response = bus
-            .complete_text(LlmRequest {
+        let action = bus
+            .complete_action(LlmRequest {
                 test_id: agent.id.clone(),
                 model: agent.model.clone(),
                 instruction: prompt.clone(),
             })
             .await?;
-        let turn = parse_agent_turn(&response.content)?;
+        match &action {
+            LlmAction::Tool(_) => native_tool_calls += 1,
+            LlmAction::Final(_) => native_final_calls += 1,
+            LlmAction::Text(_) => text_fallback_turns += 1,
+        }
+        let turn = match action_to_turn(action) {
+            Ok(turn) => turn,
+            Err(AgentError::Llm(LlmBusError::InvalidVerdict(content))) => {
+                prompt.push_str(&format!(
+                    "\n\nStep {step} invalid model response rejected:\nThe provider returned `{}` which is not a valid Koochi tool call or final verdict. Return exactly one valid JSON object in one of the documented forms. For code-review tests, prefer a tool call before a final verdict.",
+                    content.trim()
+                ));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(final_response) = turn_to_response(&turn) {
             if let Some(guidance) = investigation.final_guidance(&agent.id, &final_response) {
                 prompt.push_str(&format!(
@@ -226,6 +267,9 @@ where
                 evidence_index,
                 review_paths: grounded.review_paths,
                 llm_calls,
+                native_tool_calls,
+                native_final_calls,
+                text_fallback_turns,
             });
         } else {
             let executed = execute_tool(turn, search.as_ref(), &mut evidence_index).await?;
@@ -250,7 +294,29 @@ where
         evidence_index,
         review_paths: grounded.review_paths,
         llm_calls,
+        native_tool_calls,
+        native_final_calls,
+        text_fallback_turns,
     })
+}
+
+fn action_to_turn(action: LlmAction) -> Result<AgentTurn, AgentError> {
+    match action {
+        LlmAction::Tool(tool) => Ok(tool_call_to_turn(tool)),
+        LlmAction::Final(response) => response_to_final_turn(response),
+        LlmAction::Text(content) => parse_agent_turn(&content),
+    }
+}
+
+fn tool_call_to_turn(tool: LlmToolCall) -> AgentTurn {
+    match tool {
+        LlmToolCall::ListFiles { kind } => AgentTurn::ListFiles { kind },
+        LlmToolCall::SearchText { query, kind } => AgentTurn::SearchText { query, kind },
+        LlmToolCall::ReadFile { path } => AgentTurn::ReadFile { path },
+        LlmToolCall::GetFileContext { path, line } => AgentTurn::GetFileContext { path, line },
+        LlmToolCall::FindDefinitions { symbol } => AgentTurn::FindDefinitions { symbol },
+        LlmToolCall::FindReferences { symbol } => AgentTurn::FindReferences { symbol },
+    }
 }
 
 fn fixture_marker_for_test_id(test_id: &str) -> Option<String> {
