@@ -1,0 +1,7 @@
+[alias]
+unit = "test --lib --bins"
+integration = "test --features integration-tests --test e2e"
+live-fulfillment-e2e = "test --features integration-tests --test e2e fulfillment_hub_flags_payment_timeout_retry_issue -- --ignored --nocapture"
+live-creator-e2e = "test --features integration-tests --test e2e creator_market_flags_javascript_security_issues -- --ignored --nocapture"
+live-clinic-e2e = "test --features integration-tests --test e2e clinic_scheduler_flags_python_privacy_and_path_issues -- --ignored --nocapture"
+live-parallel-e2e = "test --features integration-tests --test e2e polyglot_workspace_runs_parallel_review_agents -- --ignored --nocapture"

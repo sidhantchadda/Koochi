@@ -1,0 +1,25 @@
+mod api;
+mod file_kind;
+mod local;
+mod symbols;
+
+pub use api::CodeSearchApi;
+pub use api::DefinitionMatch;
+pub use api::FindDefinitionsRequest;
+pub use api::FindDefinitionsResponse;
+pub use api::FindReferencesRequest;
+pub use api::FindReferencesResponse;
+pub use api::GetFileContextRequest;
+pub use api::GetFileContextResponse;
+pub use api::ListFilesRequest;
+pub use api::ListFilesResponse;
+pub use api::ReadFileRequest;
+pub use api::ReadFileResponse;
+pub use api::ReferenceMatch;
+pub use api::SearchTextRequest;
+pub use api::SearchTextResponse;
+pub use api::SymbolKind;
+pub use api::TextMatch;
+pub use file_kind::FileKind;
+pub use local::LocalSearchSession;
+pub use local::SearchError;
