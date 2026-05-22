@@ -2,10 +2,14 @@ use super::bus::LlmBus;
 use super::bus::LlmBusError;
 use super::types::LlmRequest;
 use super::types::LlmResponse;
+use super::types::LlmTextResponse;
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone)]
@@ -29,25 +33,54 @@ impl Default for ManagedLlmBusConfig {
 pub struct ManagedLlmBus {
     inner: Arc<dyn LlmBus>,
     config: ManagedLlmBusConfig,
+    stats: Arc<ManagedLlmBusStats>,
+    semaphore: Arc<Semaphore>,
+}
+
+#[derive(Debug, Default)]
+pub struct ManagedLlmBusStats {
+    provider_calls: AtomicUsize,
+    retry_attempts: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ManagedLlmBusStatsSnapshot {
+    pub provider_calls: usize,
+    pub retry_attempts: usize,
 }
 
 impl ManagedLlmBus {
     pub fn new(inner: Arc<dyn LlmBus>, config: ManagedLlmBusConfig) -> Self {
+        let max_concurrent_requests = config.max_concurrent_requests.max(1);
         Self {
             inner,
             config: ManagedLlmBusConfig {
-                max_concurrent_requests: config.max_concurrent_requests.max(1),
+                max_concurrent_requests,
                 ..config
             },
+            stats: Arc::new(ManagedLlmBusStats::default()),
+            semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
         }
     }
 
-    async fn complete_with_retry(&self, request: LlmRequest) -> Result<LlmResponse, LlmBusError> {
+    pub fn stats(&self) -> ManagedLlmBusStatsSnapshot {
+        ManagedLlmBusStatsSnapshot {
+            provider_calls: self.stats.provider_calls.load(Ordering::Relaxed),
+            retry_attempts: self.stats.retry_attempts.load(Ordering::Relaxed),
+        }
+    }
+
+    async fn complete_text_with_retry(
+        &self,
+        request: LlmRequest,
+    ) -> Result<LlmTextResponse, LlmBusError> {
         let mut attempt = 0;
         loop {
-            match self.inner.complete(request.clone()).await {
+            self.stats.provider_calls.fetch_add(1, Ordering::Relaxed);
+            match self.inner.complete_text(request.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(error) if should_retry(&error) && attempt < self.config.max_retries => {
+                    self.stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
                     sleep(backoff(self.config.initial_backoff, attempt)).await;
                     attempt += 1;
                 }
@@ -59,8 +92,13 @@ impl ManagedLlmBus {
 
 #[async_trait]
 impl LlmBus for ManagedLlmBus {
-    async fn complete(&self, request: LlmRequest) -> Result<LlmResponse, LlmBusError> {
-        self.complete_with_retry(request).await
+    async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|_| LlmBusError::Failed("llm concurrency limiter closed".to_string()))?;
+        self.complete_text_with_retry(request).await
     }
 
     async fn complete_batch(
@@ -69,7 +107,7 @@ impl LlmBus for ManagedLlmBus {
     ) -> Result<Vec<LlmResponse>, LlmBusError> {
         futures::stream::iter(requests.into_iter().map(|request| {
             let bus = self.clone();
-            async move { bus.complete_with_retry(request).await }
+            async move { bus.complete(request).await }
         }))
         .buffered(self.config.max_concurrent_requests)
         .collect::<Vec<_>>()
@@ -130,6 +168,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status, TestStatus::Passed);
+        assert_eq!(
+            bus.stats(),
+            ManagedLlmBusStatsSnapshot {
+                provider_calls: 2,
+                retry_attempts: 1,
+            }
+        );
     }
 
     #[tokio::test]
@@ -159,6 +204,43 @@ mod tests {
 
         assert_eq!(responses.len(), 8);
         assert_eq!(inner.max_seen.load(Ordering::SeqCst), 2);
+        assert_eq!(bus.stats().provider_calls, 8);
+        assert_eq!(bus.stats().retry_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn limits_direct_complete_text_concurrency() {
+        let inner = Arc::new(FlakyBus {
+            remaining_failures: Mutex::new(0),
+            in_flight: AtomicUsize::new(0),
+            max_seen: AtomicUsize::new(0),
+        });
+        let bus = ManagedLlmBus::new(
+            inner.clone(),
+            ManagedLlmBusConfig {
+                max_concurrent_requests: 2,
+                max_retries: 0,
+                initial_backoff: Duration::ZERO,
+            },
+        );
+
+        let calls = (0..8).map(|index| {
+            let bus = bus.clone();
+            async move {
+                bus.complete_text(LlmRequest {
+                    test_id: format!("test-{index}"),
+                    model: "fake".to_string(),
+                    instruction: "pass".to_string(),
+                })
+                .await
+            }
+        });
+        let responses = futures::future::try_join_all(calls).await.unwrap();
+
+        assert_eq!(responses.len(), 8);
+        assert_eq!(inner.max_seen.load(Ordering::SeqCst), 2);
+        assert_eq!(bus.stats().provider_calls, 8);
+        assert_eq!(bus.stats().retry_attempts, 0);
     }
 
     struct FlakyBus {
@@ -169,7 +251,10 @@ mod tests {
 
     #[async_trait]
     impl LlmBus for FlakyBus {
-        async fn complete(&self, _request: LlmRequest) -> Result<LlmResponse, LlmBusError> {
+        async fn complete_text(
+            &self,
+            _request: LlmRequest,
+        ) -> Result<LlmTextResponse, LlmBusError> {
             let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_seen.fetch_max(in_flight, Ordering::SeqCst);
             tokio::task::yield_now().await;
@@ -184,11 +269,10 @@ mod tests {
                 });
             }
 
-            Ok(LlmResponse {
-                status: TestStatus::Passed,
-                severity: None,
-                description: "passed".to_string(),
-                evidence: Vec::new(),
+            Ok(LlmTextResponse {
+                content:
+                    r#"{"status":"passed","severity":null,"description":"passed","evidence":[]}"#
+                        .to_string(),
             })
         }
     }

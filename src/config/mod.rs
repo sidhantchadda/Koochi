@@ -8,6 +8,7 @@ use std::path::PathBuf;
 pub const DEFAULT_MODEL: &str = "gpt-5.4-nano";
 pub const DEFAULT_PROVIDER: AiProvider = AiProvider::Fake;
 pub const DEFAULT_MAX_PARALLEL_AGENTS: usize = 128;
+pub const DEFAULT_MAX_AGENT_STEPS: usize = 32;
 pub const DEFAULT_LLM_MAX_RETRIES: usize = 2;
 pub const DEFAULT_CONFIG_FILE: &str = "koochi.toml";
 
@@ -41,6 +42,7 @@ pub struct KoochiConfig {
     pub api_key_env: Option<String>,
     pub base_url: Option<String>,
     pub max_parallel_agents: usize,
+    pub max_agent_steps: usize,
     pub max_parallel_llm_requests: usize,
     pub llm_max_retries: usize,
     pub tests: Vec<AgentTestConfig>,
@@ -79,6 +81,7 @@ struct RawConfig {
     api_key_env: Option<String>,
     base_url: Option<String>,
     max_parallel_agents: Option<usize>,
+    max_agent_steps: Option<usize>,
     max_parallel_llm_requests: Option<usize>,
     llm_max_retries: Option<usize>,
     #[serde(default)]
@@ -187,6 +190,10 @@ impl KoochiConfig {
             api_key_env: raw.api_key_env,
             base_url: raw.base_url,
             max_parallel_agents,
+            max_agent_steps: raw
+                .max_agent_steps
+                .unwrap_or(DEFAULT_MAX_AGENT_STEPS)
+                .max(1),
             max_parallel_llm_requests: raw
                 .max_parallel_llm_requests
                 .unwrap_or(max_parallel_agents)
@@ -264,6 +271,7 @@ mod tests {
         assert_eq!(config.model, DEFAULT_MODEL);
         assert_eq!(config.provider, AiProvider::Fake);
         assert_eq!(config.max_parallel_agents, 128);
+        assert_eq!(config.max_agent_steps, DEFAULT_MAX_AGENT_STEPS);
         assert_eq!(config.max_parallel_llm_requests, 128);
         assert_eq!(config.llm_max_retries, DEFAULT_LLM_MAX_RETRIES);
         assert_eq!(config.tests.len(), 2);
@@ -301,6 +309,7 @@ mod tests {
             provider = "openai"
             api_key_env = "MY_KEY"
             base_url = "https://example.test"
+            max_agent_steps = 9
             max_parallel_llm_requests = 16
             llm_max_retries = 4
             tests = ["x"]
@@ -311,6 +320,7 @@ mod tests {
         assert_eq!(config.provider, AiProvider::OpenAi);
         assert_eq!(config.api_key_env.as_deref(), Some("MY_KEY"));
         assert_eq!(config.base_url.as_deref(), Some("https://example.test"));
+        assert_eq!(config.max_agent_steps, 9);
         assert_eq!(config.max_parallel_llm_requests, 16);
         assert_eq!(config.llm_max_retries, 4);
     }

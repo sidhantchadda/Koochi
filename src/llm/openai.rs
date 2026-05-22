@@ -1,8 +1,7 @@
 use super::bus::LlmBus;
 use super::bus::LlmBusError;
 use super::types::LlmRequest;
-use super::types::LlmResponse;
-use super::verdict_parser::parse_verdict;
+use super::types::LlmTextResponse;
 use crate::config::KoochiConfig;
 use crate::prompts::verdict_system_prompt;
 use async_trait::async_trait;
@@ -36,7 +35,7 @@ impl OpenAiBus {
 
 #[async_trait]
 impl LlmBus for OpenAiBus {
-    async fn complete(&self, request: LlmRequest) -> Result<LlmResponse, LlmBusError> {
+    async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let response = self
             .client
@@ -71,7 +70,7 @@ impl LlmBus for OpenAiBus {
             .next()
             .map(|choice| choice.message.content)
             .ok_or_else(|| LlmBusError::InvalidVerdict(body.clone()))?;
-        parse_verdict(&content)
+        Ok(LlmTextResponse { content })
     }
 }
 

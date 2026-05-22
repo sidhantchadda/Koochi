@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
+use std::process::Output;
 
 pub fn koochi_bin() -> &'static str {
     env!("CARGO_BIN_EXE_koochi")
@@ -11,7 +13,7 @@ pub fn koochi_bin() -> &'static str {
 pub fn fixture_codebase(language: &str, name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
-        .join("fixtures")
+        .join("e2e")
         .join("codebases")
         .join(language)
         .join(name)
@@ -21,12 +23,144 @@ pub fn copy_fixture_codebase(language: &str, name: &str, destination: &Path) {
     copy_dir(&fixture_codebase(language, name), destination);
 }
 
-pub fn copy_fixture_codebase_under(language: &str, name: &str, destination: &Path, child: &str) {
-    copy_dir(&fixture_codebase(language, name), &destination.join(child));
-}
-
 pub fn read_json(path: &Path) -> Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[derive(Debug, Clone)]
+pub enum Fixture {
+    Copy {
+        language: &'static str,
+        name: &'static str,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct E2eCase<'a> {
+    pub fixtures: &'a [Fixture],
+    pub max_parallel_agents: usize,
+    pub max_parallel_llm_requests: usize,
+    pub expected: ExpectedReport<'a>,
+    pub expected_exit: i32,
+    pub debug: bool,
+}
+
+#[derive(Debug)]
+pub struct E2eRun {
+    pub output: Output,
+    pub report: Value,
+    pub debug_log: Option<Value>,
+}
+
+impl<'a> E2eCase<'a> {
+    pub fn live_fixture_config(
+        fixtures: &'a [Fixture],
+        max_parallel_agents: usize,
+        max_parallel_llm_requests: usize,
+        expected: ExpectedReport<'a>,
+    ) -> Self {
+        let expected_exit = if expected.failed.is_empty() { 0 } else { 1 };
+        Self {
+            fixtures,
+            max_parallel_agents,
+            max_parallel_llm_requests,
+            expected,
+            expected_exit,
+            debug: false,
+        }
+    }
+
+    pub fn with_debug(mut self) -> Self {
+        self.debug = true;
+        self
+    }
+
+    pub fn run_with_config_name(self, config_name: &str) -> E2eRun {
+        run_case_with_config_name(self, config_name)
+    }
+}
+
+pub fn run_case(case: E2eCase<'_>) -> E2eRun {
+    run_case_with_config_name(case, "koochi.toml")
+}
+
+fn run_case_with_config_name(case: E2eCase<'_>, config_name: &str) -> E2eRun {
+    let temp = tempfile::tempdir().unwrap();
+    for fixture in case.fixtures {
+        match fixture {
+            Fixture::Copy { language, name } => {
+                copy_fixture_codebase(language, name, temp.path());
+            }
+        }
+    }
+    write_case_config(temp.path(), config_name, &case);
+    let report_path = temp.path().join("report.json");
+    let output = run_case_command(temp.path(), &report_path, &case);
+    assert_eq!(
+        output.status.code(),
+        Some(case.expected_exit),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = read_json(&report_path);
+    assert_report_matches(&report, case.expected);
+    let debug_log = case.debug.then(|| latest_debug_log(temp.path()));
+    E2eRun {
+        output,
+        report,
+        debug_log,
+    }
+}
+
+fn write_case_config(path: &Path, config_name: &str, case: &E2eCase<'_>) {
+    let live = live_provider();
+    let header = live.toml_header(case.max_parallel_agents, case.max_parallel_llm_requests);
+    let config_path = path.join(config_name);
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        config_path,
+        format!("{header}\n{}", strip_provider_header(&config)),
+    )
+    .unwrap();
+}
+
+fn strip_provider_header(config: &str) -> String {
+    config
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("provider =")
+                && !trimmed.starts_with("model =")
+                && !trimmed.starts_with("api_key_env =")
+                && !trimmed.starts_with("max_parallel_agents =")
+                && !trimmed.starts_with("max_parallel_llm_requests =")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn run_case_command(path: &Path, report_path: &Path, case: &E2eCase<'_>) -> Output {
+    let mut command = Command::new(koochi_bin());
+    command
+        .current_dir(path)
+        .arg("--json-output")
+        .arg(report_path);
+    if case.debug {
+        command.arg("--debug");
+    }
+    let live = live_provider();
+    command.env(live.api_key_env, &live.api_key);
+    command.output().unwrap()
+}
+
+pub fn latest_debug_log(root: &Path) -> Value {
+    let mut entries = fs::read_dir(root.join(".koochi").join("debug"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    entries.sort_by_key(|entry| entry.file_name());
+    read_json(&entries.last().unwrap().path())
 }
 
 #[derive(Debug, Clone)]
@@ -145,38 +279,6 @@ fn read_dotenv_key(name: &str) -> Option<String> {
                 .to_string()
         })
     })
-}
-
-pub fn write_koochi_config(
-    path: &Path,
-    live: &LiveProvider,
-    max_parallel_agents: usize,
-    max_parallel_llm_requests: usize,
-    tests: &str,
-) {
-    fs::write(
-        path.join("koochi.toml"),
-        format!(
-            "{}\n{}",
-            live.toml_header(max_parallel_agents, max_parallel_llm_requests),
-            tests
-        ),
-    )
-    .unwrap();
-}
-
-pub fn run_koochi_with_live_provider(
-    path: &Path,
-    report_path: &Path,
-    live: &LiveProvider,
-) -> std::process::Output {
-    std::process::Command::new(koochi_bin())
-        .current_dir(path)
-        .env(live.api_key_env, &live.api_key)
-        .arg("--json-output")
-        .arg(report_path)
-        .output()
-        .unwrap()
 }
 
 fn copy_dir(source: &Path, destination: &Path) {

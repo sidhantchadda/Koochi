@@ -1,8 +1,7 @@
 use super::bus::LlmBus;
 use super::bus::LlmBusError;
 use super::types::LlmRequest;
-use super::types::LlmResponse;
-use super::verdict_parser::parse_verdict;
+use super::types::LlmTextResponse;
 use crate::config::KoochiConfig;
 use crate::prompts::verdict_system_prompt;
 use async_trait::async_trait;
@@ -39,7 +38,7 @@ impl AnthropicBus {
 
 #[async_trait]
 impl LlmBus for AnthropicBus {
-    async fn complete(&self, request: LlmRequest) -> Result<LlmResponse, LlmBusError> {
+    async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
@@ -78,7 +77,7 @@ impl LlmBus for AnthropicBus {
                 AnthropicContent::Text { text } => Some(text),
             })
             .ok_or_else(|| LlmBusError::InvalidVerdict(body.clone()))?;
-        parse_verdict(&content)
+        Ok(LlmTextResponse { content })
     }
 }
 

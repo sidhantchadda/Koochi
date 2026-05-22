@@ -1,0 +1,10 @@
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+max_parallel_agents = 1
+max_parallel_llm_requests = 1
+
+[[test]]
+id = "fulfillment-payment-timeout-retry"
+severity = "high"
+instruction = "Review the courier payout integration for external calls that lack timeout or retry handling. First call search_text with query create_payout, read the matched file, then return failed with concrete evidence if the external payout call is awaited without timeout or retry handling; otherwise return passed."

@@ -9,6 +9,11 @@ pub struct LlmRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmTextResponse {
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmResponse {
     pub status: TestStatus,
     pub severity: Option<Severity>,

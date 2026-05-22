@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 
 const CONTEXT_RADIUS: u32 = 40;
@@ -49,15 +51,51 @@ pub enum SearchError {
 pub struct LocalSearchSession {
     scope: ScopeConfig,
     cache: Arc<Mutex<SearchCache>>,
+    stats: Arc<SearchStats>,
 }
 
 #[derive(Debug, Default)]
 struct SearchCache {
     files: HashMap<FileKind, Vec<FilePath>>,
     contents: HashMap<FilePath, ReadFileResponse>,
+    read_locks: HashMap<FilePath, Arc<Mutex<()>>>,
     text: HashMap<SearchTextRequest, SearchTextResponse>,
     definitions: HashMap<String, FindDefinitionsResponse>,
     references: HashMap<String, FindReferencesResponse>,
+}
+
+#[derive(Debug, Default)]
+struct SearchStats {
+    list_files_hits: AtomicUsize,
+    list_files_misses: AtomicUsize,
+    list_review_files_hits: AtomicUsize,
+    list_review_files_misses: AtomicUsize,
+    read_file_hits: AtomicUsize,
+    read_file_misses: AtomicUsize,
+    get_file_context_calls: AtomicUsize,
+    search_text_hits: AtomicUsize,
+    search_text_misses: AtomicUsize,
+    definition_hits: AtomicUsize,
+    definition_misses: AtomicUsize,
+    reference_hits: AtomicUsize,
+    reference_misses: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SearchStatsSnapshot {
+    pub list_files_hits: usize,
+    pub list_files_misses: usize,
+    pub list_review_files_hits: usize,
+    pub list_review_files_misses: usize,
+    pub read_file_hits: usize,
+    pub read_file_misses: usize,
+    pub get_file_context_calls: usize,
+    pub search_text_hits: usize,
+    pub search_text_misses: usize,
+    pub definition_hits: usize,
+    pub definition_misses: usize,
+    pub reference_hits: usize,
+    pub reference_misses: usize,
 }
 
 impl LocalSearchSession {
@@ -65,11 +103,30 @@ impl LocalSearchSession {
         Self {
             scope,
             cache: Arc::new(Mutex::new(SearchCache::default())),
+            stats: Arc::new(SearchStats::default()),
         }
     }
 
     pub fn scope(&self) -> &ScopeConfig {
         &self.scope
+    }
+
+    pub fn stats(&self) -> SearchStatsSnapshot {
+        SearchStatsSnapshot {
+            list_files_hits: self.stats.list_files_hits.load(Ordering::Relaxed),
+            list_files_misses: self.stats.list_files_misses.load(Ordering::Relaxed),
+            list_review_files_hits: self.stats.list_review_files_hits.load(Ordering::Relaxed),
+            list_review_files_misses: self.stats.list_review_files_misses.load(Ordering::Relaxed),
+            read_file_hits: self.stats.read_file_hits.load(Ordering::Relaxed),
+            read_file_misses: self.stats.read_file_misses.load(Ordering::Relaxed),
+            get_file_context_calls: self.stats.get_file_context_calls.load(Ordering::Relaxed),
+            search_text_hits: self.stats.search_text_hits.load(Ordering::Relaxed),
+            search_text_misses: self.stats.search_text_misses.load(Ordering::Relaxed),
+            definition_hits: self.stats.definition_hits.load(Ordering::Relaxed),
+            definition_misses: self.stats.definition_misses.load(Ordering::Relaxed),
+            reference_hits: self.stats.reference_hits.load(Ordering::Relaxed),
+            reference_misses: self.stats.reference_misses.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -82,14 +139,48 @@ impl CodeSearchApi for LocalSearchSession {
         request: ListFilesRequest,
     ) -> Result<ListFilesResponse, Self::Error> {
         if let Some(files) = self.cache.lock().await.files.get(&request.kind).cloned() {
+            self.stats.list_files_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(ListFilesResponse { files });
         }
+        self.stats.list_files_misses.fetch_add(1, Ordering::Relaxed);
         let files = collect_files(&self.scope.primary_repo.root, request.kind)?;
         self.cache
             .lock()
             .await
             .files
             .insert(request.kind, files.clone());
+        Ok(ListFilesResponse { files })
+    }
+
+    async fn list_review_files(
+        &self,
+        request: ListFilesRequest,
+    ) -> Result<ListFilesResponse, Self::Error> {
+        if self.scope.review.files.is_empty() {
+            if let Some(files) = self.cache.lock().await.files.get(&request.kind).cloned() {
+                self.stats
+                    .list_review_files_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(ListFilesResponse { files });
+            }
+            self.stats
+                .list_review_files_misses
+                .fetch_add(1, Ordering::Relaxed);
+            return self.list_files(request).await;
+        }
+
+        self.stats
+            .list_review_files_misses
+            .fetch_add(1, Ordering::Relaxed);
+        let files = self
+            .scope
+            .review
+            .files
+            .iter()
+            .filter(|path| kind_matches(path, request.kind))
+            .filter(|path| self.scope.primary_repo.root.join(path).is_file())
+            .cloned()
+            .collect();
         Ok(ListFilesResponse { files })
     }
 
@@ -107,8 +198,12 @@ impl CodeSearchApi for LocalSearchSession {
             });
         }
         if let Some(response) = self.cache.lock().await.text.get(&normalized).cloned() {
+            self.stats.search_text_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(response);
         }
+        self.stats
+            .search_text_misses
+            .fetch_add(1, Ordering::Relaxed);
 
         let files = self
             .list_files(ListFilesRequest {
@@ -140,10 +235,27 @@ impl CodeSearchApi for LocalSearchSession {
 
     async fn read_file(&self, request: ReadFileRequest) -> Result<ReadFileResponse, Self::Error> {
         let path = normalize_repo_path(&request.path);
+        let read_lock = {
+            let mut cache = self.cache.lock().await;
+            if let Some(response) = cache.contents.get(&path).cloned() {
+                self.stats.read_file_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(response);
+            }
+            cache
+                .read_locks
+                .entry(path.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = read_lock.lock().await;
         if let Some(response) = self.cache.lock().await.contents.get(&path).cloned() {
+            self.stats.read_file_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(response);
         }
+
         let absolute = scoped_path(&self.scope.primary_repo.root, &path)?;
+        self.stats.read_file_misses.fetch_add(1, Ordering::Relaxed);
         let content = tokio::fs::read_to_string(&absolute)
             .await
             .map_err(|source| SearchError::Read {
@@ -156,11 +268,9 @@ impl CodeSearchApi for LocalSearchSession {
             content,
             line_count,
         };
-        self.cache
-            .lock()
-            .await
-            .contents
-            .insert(path, response.clone());
+        let mut cache = self.cache.lock().await;
+        cache.contents.insert(path.clone(), response.clone());
+        cache.read_locks.remove(&path);
         Ok(response)
     }
 
@@ -168,6 +278,9 @@ impl CodeSearchApi for LocalSearchSession {
         &self,
         request: GetFileContextRequest,
     ) -> Result<GetFileContextResponse, Self::Error> {
+        self.stats
+            .get_file_context_calls
+            .fetch_add(1, Ordering::Relaxed);
         let file = self
             .read_file(ReadFileRequest { path: request.path })
             .await?;
@@ -206,8 +319,10 @@ impl CodeSearchApi for LocalSearchSession {
     ) -> Result<FindDefinitionsResponse, Self::Error> {
         let symbol = request.symbol.trim().to_string();
         if let Some(response) = self.cache.lock().await.definitions.get(&symbol).cloned() {
+            self.stats.definition_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(response);
         }
+        self.stats.definition_misses.fetch_add(1, Ordering::Relaxed);
         if symbol.is_empty() {
             return Ok(FindDefinitionsResponse {
                 definitions: Vec::new(),
@@ -252,8 +367,10 @@ impl CodeSearchApi for LocalSearchSession {
     ) -> Result<FindReferencesResponse, Self::Error> {
         let symbol = request.symbol.trim().to_string();
         if let Some(response) = self.cache.lock().await.references.get(&symbol).cloned() {
+            self.stats.reference_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(response);
         }
+        self.stats.reference_misses.fetch_add(1, Ordering::Relaxed);
         if symbol.is_empty() {
             return Ok(FindReferencesResponse {
                 references: Vec::new(),
@@ -340,89 +457,5 @@ fn path_to_unix(path: &Path) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scope::{GitRevision, RepoScope, ScopeConfig};
-    use crate::search::SymbolKind;
-
-    fn session(root: PathBuf) -> LocalSearchSession {
-        LocalSearchSession::new(ScopeConfig {
-            primary_repo: RepoScope {
-                repo_id: "test".to_string(),
-                root,
-                revision: GitRevision::Head,
-            },
-            accessible_repos: Vec::new(),
-            mcp_servers: Vec::new(),
-            tools: Vec::new(),
-            agents: Vec::new(),
-        })
-    }
-
-    #[tokio::test]
-    async fn searches_and_reads_files() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(temp.path().join("src")).unwrap();
-        std::fs::write(temp.path().join("src/lib.rs"), "fn create_payment() {}\n").unwrap();
-        let search = session(temp.path().to_path_buf());
-
-        let files = search
-            .list_files(ListFilesRequest {
-                kind: FileKind::Source,
-            })
-            .await
-            .unwrap();
-        assert_eq!(files.files, vec!["src/lib.rs"]);
-
-        let matches = search
-            .search_text(SearchTextRequest {
-                query: "create_payment".to_string(),
-                kind: FileKind::Source,
-            })
-            .await
-            .unwrap();
-        assert_eq!(matches.matches[0].line, 1);
-    }
-
-    #[tokio::test]
-    async fn clamps_file_context() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
-        let search = session(temp.path().to_path_buf());
-        let context = search
-            .get_file_context(GetFileContextRequest {
-                path: "a.rs".to_string(),
-                line: 1,
-            })
-            .await
-            .unwrap();
-        assert_eq!(context.start_line, 1);
-        assert_eq!(context.end_line, 3);
-    }
-
-    #[tokio::test]
-    async fn finds_heuristic_definitions_and_references() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp.path().join("a.rs"),
-            "pub fn create_payment() {}\nlet x = create_payment();\n",
-        )
-        .unwrap();
-        let search = session(temp.path().to_path_buf());
-        let definitions = search
-            .find_definitions(FindDefinitionsRequest {
-                symbol: "create_payment".to_string(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(definitions.definitions[0].kind, SymbolKind::Function);
-
-        let references = search
-            .find_references(FindReferencesRequest {
-                symbol: "create_payment".to_string(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(references.references.len(), 2);
-    }
-}
+#[path = "local_tests.rs"]
+mod local_tests;

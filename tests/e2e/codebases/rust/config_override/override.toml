@@ -1,0 +1,11 @@
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+max_parallel_agents = 1
+max_parallel_llm_requests = 1
+max_agent_steps = 8
+
+[[test]]
+id = "fail-override-config-live"
+severity = "medium"
+instruction = "Do not leave explicit override config probe markers in reviewed source. Fail if one remains with concrete evidence."

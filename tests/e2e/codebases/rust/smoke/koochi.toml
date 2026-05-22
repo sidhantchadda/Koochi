@@ -1,0 +1,9 @@
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+max_parallel_agents = 1
+max_parallel_llm_requests = 1
+
+tests = [
+  "Review this tiny Rust fixture and return passed if there is no concrete security, reliability, or correctness issue in the source file."
+]

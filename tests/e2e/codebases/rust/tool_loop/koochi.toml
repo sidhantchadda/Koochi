@@ -1,0 +1,11 @@
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+max_parallel_agents = 1
+max_parallel_llm_requests = 1
+max_agent_steps = 8
+
+[[test]]
+id = "live-multi-turn"
+severity = "high"
+instruction = "This is a live loop behavior test. Do not return a final verdict on the first turn. First call search_text with query KOOCHI_LIVE_LOOP_MARKER. After observing the match, call read_file for the matched file. Only after those two tool observations, return failed with concrete evidence on the marker line."

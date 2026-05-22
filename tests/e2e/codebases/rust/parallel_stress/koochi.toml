@@ -1,0 +1,256 @@
+provider = "openai"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4o-mini"
+max_parallel_agents = 50
+max_parallel_llm_requests = 50
+max_agent_steps = 32
+
+[[test]]
+id = "fail-secret-logging"
+severity = "critical"
+instruction = "Do not log raw authorization headers, cookies, API keys, or bearer tokens. Fail if request logging exposes those secrets with concrete evidence."
+
+[[test]]
+id = "fail-sql-interpolation"
+severity = "critical"
+instruction = "Do not build SQL by interpolating tenant, account, invoice, or user-controlled values into query strings. Fail if dynamic SQL is assembled unsafely with concrete evidence."
+
+[[test]]
+id = "fail-missing-org-auth"
+severity = "critical"
+instruction = "Do not expose project or account data without checking the caller belongs to the same organization and has permission. Fail if a handler or helper skips that authorization check."
+
+[[test]]
+id = "fail-cache-stampede"
+severity = "high"
+instruction = "Do not run expensive cache-miss loaders without an in-flight guard, lock, or single-flight behavior. Fail if a cache can stampede under concurrent misses."
+
+[[test]]
+id = "fail-no-timeout-payment-call"
+severity = "high"
+instruction = "Do not call external payment or billing integrations without a timeout and retry-aware wrapper. Fail if a direct client call bypasses that protection."
+
+[[test]]
+id = "fail-money-as-float"
+severity = "high"
+instruction = "Do not represent or calculate money with floating point values. Fail if currency totals use f32, f64, or equivalent float arithmetic."
+
+[[test]]
+id = "fail-path-traversal"
+severity = "high"
+instruction = "Do not join user-controlled report names or paths into filesystem paths without validation or allowlisting. Fail if path traversal is possible."
+
+[[test]]
+id = "fail-unbounded-background-loop"
+severity = "medium"
+instruction = "Do not create background loops without cancellation, backoff, timeout, or attempt bounds. Fail if repeated work is unbounded."
+
+[[test]]
+id = "fail-dead-code"
+severity = "medium"
+instruction = "Do not leave private migration helpers or legacy functions with no apparent callers. Fail if likely dead code remains."
+
+[[test]]
+id = "fail-tenant-data-leak"
+severity = "critical"
+instruction = "Do not return records from multiple tenants when the caller requested one organization. Fail if tenant filtering is missing."
+
+[[test]]
+id = "pass-authorization-guard"
+severity = "high"
+instruction = "Verify project access checks tenant ownership before returning project data."
+
+[[test]]
+id = "pass-billing-authorization"
+severity = "high"
+instruction = "Verify billing changes require same-tenant access and a billing-capable role."
+
+[[test]]
+id = "pass-report-authorization"
+severity = "high"
+instruction = "Verify report exports require same-tenant access and an export permission."
+
+[[test]]
+id = "pass-job-authorization"
+severity = "medium"
+instruction = "Verify job management requires same-tenant access and a job-management permission."
+
+[[test]]
+id = "pass-parameterized-sql"
+severity = "critical"
+instruction = "Verify the project lookup query builder uses parameterized SQL rather than string interpolation."
+
+[[test]]
+id = "pass-tenant-scoped-query"
+severity = "high"
+instruction = "Verify invoice search queries include tenant scope and a bounded limit."
+
+[[test]]
+id = "pass-pagination-limit"
+severity = "medium"
+instruction = "Verify audit pagination clamps user-provided limits before querying."
+
+[[test]]
+id = "pass-idempotency-storage"
+severity = "medium"
+instruction = "Verify idempotency keys are stored with tenant scope and parameterized SQL."
+
+[[test]]
+id = "pass-redacted-logging"
+severity = "high"
+instruction = "Verify request logs redact authorization headers, API keys, and cookies."
+
+[[test]]
+id = "pass-audit-redaction"
+severity = "medium"
+instruction = "Verify billing audit entries avoid bearer tokens, cookies, and other secret material."
+
+[[test]]
+id = "pass-integer-cents-money"
+severity = "high"
+instruction = "Verify invoice totals use integer cents and checked arithmetic."
+
+[[test]]
+id = "pass-timeout-retry-payment"
+severity = "high"
+instruction = "Verify payment charges go through an authorization check and retry-aware timeout wrapper."
+
+[[test]]
+id = "pass-discount-bounds"
+severity = "medium"
+instruction = "Verify coupon discounts use checked integer math and bounded basis points."
+
+[[test]]
+id = "pass-idempotency-key"
+severity = "medium"
+instruction = "Verify payment idempotency keys include tenant, account, and nonce components."
+
+[[test]]
+id = "pass-single-flight-cache"
+severity = "high"
+instruction = "Verify rate-card cache misses use an in-flight guard or single-flight behavior."
+
+[[test]]
+id = "pass-tenant-cache-key"
+severity = "medium"
+instruction = "Verify feature cache keys include tenant identity and normalized feature names."
+
+[[test]]
+id = "pass-bounded-background-job"
+severity = "medium"
+instruction = "Verify export jobs are authorized and have retry and timeout bounds."
+
+[[test]]
+id = "pass-queue-retry-policy"
+severity = "medium"
+instruction = "Verify queue retry delays use bounded exponential backoff."
+
+[[test]]
+id = "pass-path-allowlist"
+severity = "high"
+instruction = "Verify the safe report path builder constructs file paths from allowlisted report names."
+
+[[test]]
+id = "pass-safe-file-export"
+severity = "high"
+instruction = "Verify report export combines tenant authorization with sanitized path construction."
+
+[[test]]
+id = "pass-http-auth-flow"
+severity = "high"
+instruction = "Verify the project HTTP handler checks access before returning project data."
+
+[[test]]
+id = "pass-list-auth-pagination"
+severity = "medium"
+instruction = "Verify list endpoints check tenant access and clamp pagination."
+
+[[test]]
+id = "pass-webhook-signature"
+severity = "critical"
+instruction = "Verify webhooks require a valid tenant-specific signature before acceptance."
+
+[[test]]
+id = "pass-external-timeout"
+severity = "medium"
+instruction = "Verify the safe external integration wrapper uses a bounded timeout value."
+
+[[test]]
+id = "pass-config-validation"
+severity = "medium"
+instruction = "Verify runtime configuration validates page size, timeout, rollout, and environment bounds."
+
+[[test]]
+id = "pass-feature-flag"
+severity = "low"
+instruction = "Verify feature flag rollout is tenant scoped and percentage bounded."
+
+[[test]]
+id = "pass-tenant-filter"
+severity = "critical"
+instruction = "Verify project collections are filtered by tenant before returning records."
+
+[[test]]
+id = "pass-referenced-helper"
+severity = "low"
+instruction = "Verify the reconciliation plan actually calls the referenced reconciliation helper."
+
+[[test]]
+id = "pass-support-role-check"
+severity = "medium"
+instruction = "Verify support-role access also checks tenant membership."
+
+[[test]]
+id = "pass-scope-check"
+severity = "medium"
+instruction = "Verify scope checks compare requested scope against caller scope membership."
+
+[[test]]
+id = "pass-audit-parameterized-sql"
+severity = "medium"
+instruction = "Verify audit-event queries use parameterized SQL and tenant scope."
+
+[[test]]
+id = "pass-delete-tenant-scoped"
+severity = "medium"
+instruction = "Verify expired session deletion is scoped to a tenant."
+
+[[test]]
+id = "pass-trace-field-filter"
+severity = "medium"
+instruction = "Verify trace field collection drops authorization and cookie values."
+
+[[test]]
+id = "pass-metric-normalization"
+severity = "low"
+instruction = "Verify metric names are normalized before emission."
+
+[[test]]
+id = "pass-cache-ttl"
+severity = "low"
+instruction = "Verify cache TTLs are bounded by known resource type."
+
+[[test]]
+id = "pass-feature-cache-key"
+severity = "medium"
+instruction = "Verify feature cache keys include tenant identity."
+
+[[test]]
+id = "pass-retry-backoff"
+severity = "medium"
+instruction = "Verify retry backoff is capped."
+
+[[test]]
+id = "pass-digest-enqueue-bound"
+severity = "medium"
+instruction = "Verify digest enqueue decisions are bounded by pending event count."
+
+[[test]]
+id = "pass-report-name-sanitizer"
+severity = "high"
+instruction = "Verify the safe report-name sanitizer rejects unsafe names before file access."
+
+[[test]]
+id = "pass-webhook-acceptance"
+severity = "critical"
+instruction = "Verify webhook acceptance delegates to signature verification."

@@ -23,3 +23,4 @@ pub use api::TextMatch;
 pub use file_kind::FileKind;
 pub use local::LocalSearchSession;
 pub use local::SearchError;
+pub use local::SearchStatsSnapshot;

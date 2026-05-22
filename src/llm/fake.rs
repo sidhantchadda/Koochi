@@ -2,9 +2,9 @@ use super::bus::LlmBus;
 use super::bus::LlmBusError;
 use super::types::LlmRequest;
 use super::types::LlmResponse;
-use super::types::TestStatus;
-use crate::Severity;
+use super::types::LlmTextResponse;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 pub struct FakeLlmBus {
     requests: Arc<Mutex<Vec<LlmRequest>>>,
     batches: Arc<Mutex<Vec<usize>>>,
+    turns: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl FakeLlmBus {
@@ -30,24 +31,29 @@ impl FakeLlmBus {
 
 #[async_trait]
 impl LlmBus for FakeLlmBus {
-    async fn complete(&self, request: LlmRequest) -> Result<LlmResponse, LlmBusError> {
+    async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
         self.requests.lock().await.push(request.clone());
-        let lower = request.instruction.to_ascii_lowercase();
+        let instruction = fake_test_instruction(&request.instruction);
+        if let Some(content) = scripted_response(&request.test_id, instruction, &self.turns).await {
+            return Ok(LlmTextResponse { content });
+        }
+
+        let lower = instruction.to_ascii_lowercase();
         let failed =
             lower.contains("missing") || lower.contains("retry") || lower.contains("authorization");
         if failed {
-            Ok(LlmResponse {
-                status: TestStatus::Failed,
-                severity: Some(Severity::Medium),
-                description: format!("Fake bus flagged `{}` for review.", request.test_id),
-                evidence: Vec::new(),
+            Ok(LlmTextResponse {
+                content: format!(
+                    r#"{{"action":"final","status":"failed","severity":"medium","description":"Fake bus flagged `{}` for review.","evidence":[]}}"#,
+                    request.test_id
+                ),
             })
         } else {
-            Ok(LlmResponse {
-                status: TestStatus::Passed,
-                severity: None,
-                description: format!("Fake bus passed `{}`.", request.test_id),
-                evidence: Vec::new(),
+            Ok(LlmTextResponse {
+                content: format!(
+                    r#"{{"action":"final","status":"passed","severity":null,"description":"Fake bus passed `{}`.","evidence":[]}}"#,
+                    request.test_id
+                ),
             })
         }
     }
@@ -65,9 +71,52 @@ impl LlmBus for FakeLlmBus {
     }
 }
 
+async fn scripted_response(
+    test_id: &str,
+    _instruction: &str,
+    turns: &Mutex<HashMap<String, usize>>,
+) -> Option<String> {
+    let mut turns = turns.lock().await;
+    let turn = turns.entry(test_id.to_string()).or_insert(0);
+    *turn += 1;
+    let turn = *turn;
+
+    if test_id == "tool-triad" {
+        return Some(match turn {
+            1 => r#"{"action":"get_file_context","path":"src/review.rs","line":3}"#.to_string(),
+            2 => r#"{"action":"find_definitions","symbol":"dangerous_sink"}"#.to_string(),
+            3 => r#"{"action":"find_references","symbol":"dangerous_sink"}"#.to_string(),
+            _ => r#"{"action":"final","status":"failed","severity":"high","description":"Scripted tool triad completed.","evidence":[{"path":"src/review.rs","line":3,"preview":"    dangerous_sink(input);"}]}"#.to_string(),
+        });
+    }
+
+    if test_id == "multi-turn" {
+        return Some(match turn {
+            1 => r#"{"action":"search_text","query":"TODO_KOOCHI_MULTI","kind":"source"}"#.to_string(),
+            2 => r#"{"action":"read_file","path":"src/review.rs"}"#.to_string(),
+            _ => r#"{"action":"final","status":"failed","severity":"medium","description":"Scripted multi-turn reasoning completed after observing search and file content.","evidence":[{"path":"src/review.rs","line":5,"preview":"    // TODO_KOOCHI_MULTI: retry policy is missing"}]}"#.to_string(),
+        });
+    }
+
+    None
+}
+
+fn fake_test_instruction(instruction: &str) -> &str {
+    let Some(start) = instruction.find("Agentic test:") else {
+        return instruction;
+    };
+    let subject = &instruction[start + "Agentic test:".len()..];
+    subject
+        .split("Repository context:")
+        .next()
+        .unwrap_or(subject)
+        .trim()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::TestStatus;
 
     #[tokio::test]
     async fn fake_bus_records_requests_and_flags_failures() {

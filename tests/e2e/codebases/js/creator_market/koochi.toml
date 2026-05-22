@@ -1,0 +1,20 @@
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+max_parallel_agents = 3
+max_parallel_llm_requests = 3
+
+[[test]]
+id = "creator-sql-injection"
+severity = "critical"
+instruction = "Review this JavaScript creator marketplace backend for SQL injection caused by template literals or string concatenation in SQL queries. First call search_text with query select * from invoices, read the matched file, then return failed with concrete evidence if user-controlled values are interpolated into SQL; otherwise return passed."
+
+[[test]]
+id = "creator-secret-logging"
+severity = "high"
+instruction = "Review this JavaScript creator marketplace backend for secret leakage in logs, including API keys, authorization headers, and cookies. First call search_text with query authorization, read the matched file, then return failed with concrete evidence if secrets are logged; otherwise return passed."
+
+[[test]]
+id = "creator-unsupervised-job"
+severity = "medium"
+instruction = "Review this JavaScript codebase for unsupervised repeated async work using intervals or timers without cancellation, error handling, backoff, or concurrency guard. First call search_text with query setInterval, read the matched file, then return failed with concrete evidence if found; otherwise return passed."

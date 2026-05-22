@@ -1,0 +1,20 @@
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+max_parallel_agents = 3
+max_parallel_llm_requests = 3
+
+[[test]]
+id = "clinic-missing-authorization"
+severity = "critical"
+instruction = "Review this Python clinic scheduler for missing authorization on org_id, patient_id, member_id, or similar healthcare-scoped identifiers. Return failed with concrete evidence if handlers trust scoped identifiers without checking ownership or permission; otherwise return passed."
+
+[[test]]
+id = "clinic-secret-logging"
+severity = "high"
+instruction = "Review this Python clinic scheduler for secret or credential leakage in logs, including passwords, authorization headers, and cookies. Return failed with concrete evidence if secrets are logged; otherwise return passed."
+
+[[test]]
+id = "clinic-path-traversal"
+severity = "high"
+instruction = "Review this Python clinic scheduler for path traversal risk where user-controlled report names or paths are joined into filesystem reads without validation. Return failed with concrete evidence if found; otherwise return passed."

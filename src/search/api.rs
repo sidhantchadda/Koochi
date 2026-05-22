@@ -114,6 +114,11 @@ pub trait CodeSearchApi: Send + Sync {
     async fn list_files(&self, request: ListFilesRequest)
     -> Result<ListFilesResponse, Self::Error>;
 
+    async fn list_review_files(
+        &self,
+        request: ListFilesRequest,
+    ) -> Result<ListFilesResponse, Self::Error>;
+
     async fn search_text(
         &self,
         request: SearchTextRequest,

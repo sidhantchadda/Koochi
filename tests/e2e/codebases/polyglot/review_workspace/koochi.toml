@@ -1,0 +1,50 @@
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+max_parallel_agents = 9
+max_parallel_llm_requests = 4
+
+[[test]]
+id = "sql-injection"
+severity = "critical"
+instruction = "Review the fulfillment, creator marketplace, and clinic scheduler code for SQL injection caused by string interpolation, template literals, format strings, or concatenation in SQL queries. First call search_text with query select * from invoices, read the matched file, then return failed with concrete evidence if user-controlled values are interpolated into SQL; otherwise return passed."
+
+[[test]]
+id = "secret-logging"
+severity = "high"
+instruction = "Review the repository for secret leakage in logs, including tokens, API keys, authorization headers, cookies, and passwords. First call search_text with query authorization, read the matched file, then return failed with concrete evidence if secrets are logged; otherwise return passed."
+
+[[test]]
+id = "cache-stampede"
+severity = "medium"
+instruction = "Review the repository for cache stampede risk where an expensive fetch happens on cache miss without single-flight, request coalescing, locking, or another in-flight guard. First call search_text with query fetch_profile, read the matched file, then return failed with concrete evidence if you find this pattern; otherwise return passed."
+
+[[test]]
+id = "missing-authorization"
+severity = "critical"
+instruction = "Review request handlers for missing authorization on account_id, org_id, project_id, user_id, or similar scoped identifiers. First call search_text with query fetch_delivery, read the matched file, then return failed with concrete evidence if handlers trust scoped identifiers without checking ownership or permission; otherwise return passed."
+
+[[test]]
+id = "payment-timeout-retry"
+severity = "high"
+instruction = "Review payment, courier, pricing, and insurance integrations for external calls that lack timeout or retry handling. First call search_text with query create_payout, read the matched file, then return failed with concrete evidence if an external call is awaited without timeout or retry handling; otherwise return passed."
+
+[[test]]
+id = "money-as-float"
+severity = "medium"
+instruction = "Review money or payout calculations for floating point currency representations such as f64, float, Number, or decimal-free arithmetic. First call search_text with query amount_usd, read the matched file, then return failed with concrete evidence if money is represented or calculated as a float; otherwise return passed."
+
+[[test]]
+id = "path-traversal"
+severity = "high"
+instruction = "Review file/report export code for path traversal risk where user-controlled names or paths are joined into filesystem reads without validation. First call search_text with query joinpath, read the matched file, then return failed with concrete evidence if this appears; otherwise return passed."
+
+[[test]]
+id = "unsupervised-background-job"
+severity = "medium"
+instruction = "Review background job or interval code for unsupervised repeated async work without cancellation, backoff, error handling, or concurrency guard. First call search_text with query setInterval, read the matched file, then return failed with concrete evidence if found; otherwise return passed."
+
+[[test]]
+id = "dead-code"
+severity = "low"
+instruction = "Review the repository for likely dead code: functions, helpers, experiments, or modules that are defined but have no apparent references or callers in the provided context. First call search_text with query unused_waitlist_priority, read the matched file, then return failed with concrete evidence if you find likely dead code; otherwise return passed."
