@@ -3,6 +3,7 @@ mod bus;
 mod fake;
 mod managed;
 mod openai;
+mod tools;
 mod types;
 mod verdict_parser;
 

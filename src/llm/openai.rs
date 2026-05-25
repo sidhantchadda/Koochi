@@ -1,11 +1,12 @@
 use super::bus::LlmBus;
 use super::bus::LlmBusError;
+use super::tools::default_status_for_test_id;
+use super::tools::parse_tool_action_from_json_str;
+use super::tools::tool_specs;
 use super::types::LlmAction;
 use super::types::LlmRequest;
 use super::types::LlmTextResponse;
 use super::types::LlmTokenUsage;
-use super::types::LlmToolCall;
-use super::verdict_parser::parse_verdict_with_default_status;
 use crate::config::KoochiConfig;
 use crate::prompts::verdict_system_prompt;
 use async_trait::async_trait;
@@ -284,240 +285,25 @@ fn parse_tool_call(
     tool_call: OpenAiToolCall,
     default_status: Option<super::types::TestStatus>,
 ) -> Result<LlmAction, LlmBusError> {
-    match tool_call.function.name.as_str() {
-        "list_files" => {
-            let args: KindArgs = parse_args(&tool_call.function.arguments)?;
-            Ok(LlmAction::Tool(LlmToolCall::ListFiles { kind: args.kind }))
-        }
-        "list_review_hunks" => Ok(LlmAction::Tool(LlmToolCall::ListReviewHunks)),
-        "get_hunk_context" => {
-            let args: HunkIdArgs = parse_args(&tool_call.function.arguments)?;
-            Ok(LlmAction::Tool(LlmToolCall::GetHunkContext {
-                hunk_id: args.hunk_id,
-            }))
-        }
-        "search_text" => {
-            let args: SearchTextArgs = parse_args(&tool_call.function.arguments)?;
-            Ok(LlmAction::Tool(LlmToolCall::SearchText {
-                query: args.query,
-                kind: args.kind,
-            }))
-        }
-        "read_file" => {
-            let args: PathArgs = parse_args(&tool_call.function.arguments)?;
-            Ok(LlmAction::Tool(LlmToolCall::ReadFile { path: args.path }))
-        }
-        "get_file_context" => {
-            let args: ContextArgs = parse_args(&tool_call.function.arguments)?;
-            Ok(LlmAction::Tool(LlmToolCall::GetFileContext {
-                path: args.path,
-                line: args.line,
-            }))
-        }
-        "find_definitions" => {
-            let args: SymbolArgs = parse_args(&tool_call.function.arguments)?;
-            Ok(LlmAction::Tool(LlmToolCall::FindDefinitions {
-                symbol: args.symbol,
-            }))
-        }
-        "find_references" => {
-            let args: SymbolArgs = parse_args(&tool_call.function.arguments)?;
-            Ok(LlmAction::Tool(LlmToolCall::FindReferences {
-                symbol: args.symbol,
-            }))
-        }
-        "final_verdict" => {
-            let response =
-                parse_verdict_with_default_status(&tool_call.function.arguments, default_status)?;
-            Ok(LlmAction::Final(response))
-        }
-        _ => Err(LlmBusError::InvalidVerdict(format!(
-            "unsupported OpenAI tool call `{}`",
-            tool_call.function.name
-        ))),
-    }
-}
-
-fn default_status_for_test_id(test_id: &str) -> Option<super::types::TestStatus> {
-    if test_id.starts_with("pass-") {
-        Some(super::types::TestStatus::Passed)
-    } else if test_id.starts_with("fail-") {
-        Some(super::types::TestStatus::Failed)
-    } else {
-        None
-    }
-}
-
-fn parse_args<T>(arguments: &str) -> Result<T, LlmBusError>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    serde_json::from_str(arguments).map_err(|_| LlmBusError::InvalidVerdict(arguments.to_string()))
-}
-
-#[derive(Debug, Deserialize)]
-struct KindArgs {
-    kind: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SearchTextArgs {
-    query: String,
-    kind: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PathArgs {
-    path: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HunkIdArgs {
-    hunk_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ContextArgs {
-    path: String,
-    line: u32,
-}
-
-#[derive(Debug, Deserialize)]
-struct SymbolArgs {
-    symbol: String,
+    parse_tool_action_from_json_str(
+        &tool_call.function.name,
+        &tool_call.function.arguments,
+        default_status,
+    )
 }
 
 fn tool_definitions() -> Vec<OpenAiTool> {
-    vec![
-        tool(
-            "list_files",
-            "List repo files by kind.",
-            object_schema(
-                vec![(
-                    "kind",
-                    string_enum_schema(&["source", "tests", "configs", "all"]),
-                )],
-                vec![],
-            ),
-        ),
-        tool(
-            "list_review_hunks",
-            "List changed review hunks with exact changed line numbers.",
-            object_schema(vec![], vec![]),
-        ),
-        tool(
-            "get_hunk_context",
-            "Read bounded surrounding code for a specific changed review hunk id.",
-            object_schema(vec![("hunk_id", json!({"type":"string"}))], vec!["hunk_id"]),
-        ),
-        tool(
-            "search_text",
-            "Search source text literally.",
-            object_schema(
-                vec![
-                    ("query", json!({"type":"string"})),
-                    (
-                        "kind",
-                        string_enum_schema(&["source", "tests", "configs", "all"]),
-                    ),
-                ],
-                vec!["query"],
-            ),
-        ),
-        tool(
-            "read_file",
-            "Read a complete repo-relative file.",
-            object_schema(vec![("path", json!({"type":"string"}))], vec!["path"]),
-        ),
-        tool(
-            "get_file_context",
-            "Read a fixed-radius context window around a line.",
-            object_schema(
-                vec![
-                    ("path", json!({"type":"string"})),
-                    ("line", json!({"type":"integer","minimum":1})),
-                ],
-                vec!["path", "line"],
-            ),
-        ),
-        tool(
-            "find_definitions",
-            "Find likely language-agnostic symbol definitions.",
-            object_schema(vec![("symbol", json!({"type":"string"}))], vec!["symbol"]),
-        ),
-        tool(
-            "find_references",
-            "Find likely language-agnostic symbol references.",
-            object_schema(vec![("symbol", json!({"type":"string"}))], vec!["symbol"]),
-        ),
-        tool(
-            "final_verdict",
-            "Return the final Koochi agentic test verdict.",
-            object_schema(
-                vec![
-                    ("status", string_enum_schema(&["passed", "failed"])),
-                    (
-                        "severity",
-                        string_enum_schema(&["low", "medium", "high", "critical"]),
-                    ),
-                    ("description", json!({"type":"string"})),
-                    (
-                        "evidence",
-                        json!({
-                            "type":"array",
-                            "items": {
-                                "type":"object",
-                                "properties": {
-                                    "path": {"type":"string"},
-                                    "line": {"type":"integer", "minimum":1},
-                                    "preview": {"type":"string"}
-                                },
-                                "required": ["path", "line", "preview"]
-                            }
-                        }),
-                    ),
-                ],
-                vec!["status", "description"],
-            ),
-        ),
-    ]
-}
-
-fn tool(
-    name: &'static str,
-    description: &'static str,
-    parameters: serde_json::Value,
-) -> OpenAiTool {
-    OpenAiTool {
-        kind: "function",
-        function: OpenAiToolFunction {
-            name,
-            description,
-            parameters,
-        },
-    }
-}
-
-fn object_schema(
-    properties: Vec<(&'static str, serde_json::Value)>,
-    required: Vec<&'static str>,
-) -> serde_json::Value {
-    let properties = properties
+    tool_specs()
         .into_iter()
-        .map(|(key, value)| (key.to_string(), value))
-        .collect::<serde_json::Map<_, _>>();
-    json!({
-        "type": "object",
-        "properties": properties,
-        "required": required,
-    })
-}
-
-fn string_enum_schema(values: &[&str]) -> serde_json::Value {
-    json!({
-        "type": "string",
-        "enum": values,
-    })
+        .map(|spec| OpenAiTool {
+            kind: "function",
+            function: OpenAiToolFunction {
+                name: spec.name,
+                description: spec.description,
+                parameters: spec.schema,
+            },
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -525,6 +311,7 @@ mod tests {
     use super::*;
     use crate::Evidence;
     use crate::LlmResponse;
+    use crate::LlmToolCall;
     use crate::Severity;
     use crate::TestStatus;
 
