@@ -249,6 +249,75 @@ async fn grounds_agent_instruction_with_small_changed_hunk_packet() {
 }
 
 #[tokio::test]
+async fn accepts_direct_final_when_full_changed_hunk_packet_is_sufficient() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("changed.rs"), "pub fn changed() {}\n").unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedActionBus::new(vec![Ok(LlmAction::Final(
+        LlmResponse {
+            status: TestStatus::Failed,
+            severity: Some(Severity::High),
+            description: "changed line is unsafe".to_string(),
+            evidence: vec![Evidence {
+                path: "changed.rs".to_string(),
+                line: 1,
+                preview: "pub fn changed() {}".to_string(),
+            }],
+        },
+    ))]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Find unsafe code with concrete evidence.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 1);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence.len(), 1);
+}
+
+#[tokio::test]
 async fn grounds_agent_instruction_with_large_hunk_summary() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("lib.rs"), "pub fn risky_call() {}\n").unwrap();
@@ -822,6 +891,59 @@ async fn malformed_provider_json_is_rejected_and_reprompted() {
     assert_eq!(verdicts[0].evidence.len(), 1);
 }
 
+#[tokio::test]
+async fn malformed_native_tool_arguments_are_rejected_and_reprompted() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn handler() {\n    log_token();\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let bus = Arc::new(ScriptedActionBus::new(vec![
+        Err(LlmBusError::InvalidVerdict(
+            "missing field `query`".to_string(),
+        )),
+        Ok(LlmAction::Tool(LlmToolCall::SearchText {
+            query: "log_token".to_string(),
+            kind: Some("source".to_string()),
+        })),
+        Ok(LlmAction::Tool(LlmToolCall::ReadFile {
+            path: "lib.rs".to_string(),
+        })),
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Failed,
+            severity: Some(Severity::High),
+            description: "token logging found".to_string(),
+            evidence: vec![Evidence {
+                path: "lib.rs".to_string(),
+                line: 2,
+                preview: "log_token();".to_string(),
+            }],
+        })),
+    ]));
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Find token logging.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 4);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence.len(), 1);
+}
+
 #[test]
 fn parses_search_text_tool_with_query_equals_typo() {
     let turn = parse_agent_turn(
@@ -1145,5 +1267,35 @@ impl LlmBus for ScriptedToolBus {
             .pop()
             .expect("scripted response");
         Ok(LlmTextResponse { content })
+    }
+}
+
+struct ScriptedActionBus {
+    actions: Mutex<Vec<Result<LlmAction, LlmBusError>>>,
+    requests: Mutex<usize>,
+}
+
+impl ScriptedActionBus {
+    fn new(actions: Vec<Result<LlmAction, LlmBusError>>) -> Self {
+        Self {
+            actions: Mutex::new(actions.into_iter().rev().collect()),
+            requests: Mutex::new(0),
+        }
+    }
+
+    async fn request_count(&self) -> usize {
+        *self.requests.lock().await
+    }
+}
+
+#[async_trait]
+impl LlmBus for ScriptedActionBus {
+    async fn complete_text(&self, _request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
+        unreachable!("ScriptedActionBus uses native actions")
+    }
+
+    async fn complete_action(&self, _request: LlmRequest) -> Result<LlmAction, LlmBusError> {
+        *self.requests.lock().await += 1;
+        self.actions.lock().await.pop().expect("scripted action")
     }
 }

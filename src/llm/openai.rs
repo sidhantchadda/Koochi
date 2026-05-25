@@ -71,6 +71,8 @@ impl LlmBus for OpenAiBus {
                     },
                 ],
                 temperature: temperature_for_model(&request.model),
+                reasoning_effort: reasoning_effort_for_model(&request.model),
+                max_completion_tokens: max_completion_tokens_for_model(&request.model),
                 tools: Vec::new(),
                 tool_choice: None,
             })
@@ -117,6 +119,8 @@ impl LlmBus for OpenAiBus {
                     },
                 ],
                 temperature: temperature_for_model(&request.model),
+                reasoning_effort: reasoning_effort_for_model(&request.model),
+                max_completion_tokens: max_completion_tokens_for_model(&request.model),
                 tools: tool_definitions(),
                 tool_choice: Some("auto"),
             })
@@ -157,6 +161,10 @@ struct OpenAiChatRequest {
     messages: Vec<OpenAiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     tools: Vec<OpenAiTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,6 +261,14 @@ fn temperature_for_model(model: &str) -> Option<f32> {
     (!model.starts_with("gpt-5")).then_some(0.0)
 }
 
+fn reasoning_effort_for_model(model: &str) -> Option<&'static str> {
+    model.starts_with("gpt-5").then_some("minimal")
+}
+
+fn max_completion_tokens_for_model(model: &str) -> Option<u32> {
+    model.starts_with("gpt-5").then_some(2048)
+}
+
 fn record_usage(
     stats: &OpenAiUsageStats,
     request: &LlmRequest,
@@ -321,6 +337,14 @@ mod tests {
         assert_eq!(temperature_for_model("gpt-5-mini"), None);
         assert_eq!(temperature_for_model("gpt-5.1"), None);
         assert_eq!(temperature_for_model("gpt-4o-mini"), Some(0.0));
+    }
+
+    #[test]
+    fn constrains_gpt_5_reasoning_for_json_tool_calls() {
+        assert_eq!(reasoning_effort_for_model("gpt-5-nano"), Some("minimal"));
+        assert_eq!(max_completion_tokens_for_model("gpt-5-nano"), Some(2048));
+        assert_eq!(reasoning_effort_for_model("gpt-4o-mini"), None);
+        assert_eq!(max_completion_tokens_for_model("gpt-4o-mini"), None);
     }
 
     #[test]

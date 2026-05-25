@@ -39,7 +39,9 @@ where
     let hunk_packet = format_review_hunk_packet(&hunks);
     let hunk_packet_tokens = estimate_tokens(&hunk_packet);
     let full_packet_tokens = estimate_tokens(&format!("{file_inventory}\n\n{hunk_packet}"));
-    let context = if !hunks.is_empty() && full_packet_tokens <= agent.initial_context_token_budget {
+    let allows_direct_verdict =
+        !hunks.is_empty() && full_packet_tokens <= agent.initial_context_token_budget;
+    let context = if allows_direct_verdict {
         format!(
             "{file_inventory}\n\n{hunk_packet}\n\nChanged lines above are the primary review evidence. You may return a final verdict immediately if the changed-line packet is sufficient. If surrounding code, helper behavior, definitions, references, or callers are needed, request tools and continue the loop. Prefer get_hunk_context with a hunk id for targeted surrounding code before whole-file reads. Final failed evidence should point to changed lines or review-scope context directly caused by the change."
         )
@@ -72,6 +74,7 @@ where
         review_paths,
         changed_lines,
         review_causal_terms,
+        allows_direct_verdict,
     })
 }
 

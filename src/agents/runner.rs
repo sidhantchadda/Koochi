@@ -332,6 +332,7 @@ struct GroundedRequest {
     review_paths: HashSet<String>,
     changed_lines: HashSet<(String, u32)>,
     review_causal_terms: HashSet<String>,
+    allows_direct_verdict: bool,
 }
 
 async fn run_agent_loop<S, B>(
@@ -384,13 +385,31 @@ where
             prompt: prompt.clone(),
         });
         llm_calls += 1;
-        let action = bus
+        let action = match bus
             .complete_action(LlmRequest {
                 test_id: agent.id.clone(),
                 model: agent.model.clone(),
                 instruction: prompt.clone(),
             })
-            .await?;
+            .await
+        {
+            Ok(action) => action,
+            Err(LlmBusError::InvalidVerdict(content)) => {
+                trace(AgentTraceEvent::InvalidResponse {
+                    step,
+                    content: content.trim().to_string(),
+                });
+                push_history(
+                    &mut history,
+                    format!(
+                        "\n\nStep {step} invalid model response rejected:\nThe provider returned `{}` which is not a valid Koochi tool call or final verdict. Return exactly one valid tool call or final_verdict with all required fields. For search_text, include a non-empty `query` string.",
+                        content.trim()
+                    ),
+                );
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         match &action {
             LlmAction::Tool(_) => native_tool_calls += 1,
             LlmAction::Final(_) => native_final_calls += 1,
@@ -423,7 +442,11 @@ where
             let final_response = investigation
                 .fixture_corrected_final(&agent.id, &final_response)
                 .unwrap_or(final_response);
-            if let Some(guidance) = investigation.final_guidance(&agent.id, &final_response) {
+            let direct_verdict_allowed = grounded.allows_direct_verdict
+                && direct_verdict_is_grounded(&final_response, &grounded.changed_lines);
+            if !direct_verdict_allowed
+                && let Some(guidance) = investigation.final_guidance(&agent.id, &final_response)
+            {
                 trace(AgentTraceEvent::PrematureFinal {
                     step,
                     guidance: guidance.clone(),
@@ -518,6 +541,19 @@ where
         native_final_calls,
         text_fallback_turns,
     })
+}
+
+fn direct_verdict_is_grounded(
+    response: &LlmResponse,
+    changed_lines: &HashSet<(String, u32)>,
+) -> bool {
+    match response.status {
+        TestStatus::Passed => true,
+        TestStatus::Failed => response
+            .evidence
+            .iter()
+            .any(|evidence| changed_lines.contains(&(evidence.path.clone(), evidence.line))),
+    }
 }
 
 fn action_to_turn(
@@ -719,9 +755,12 @@ Final verdict JSON form:
 
 Return only JSON. The user-facing test instruction is policy intent, not a tool plan. You decide which search tools to use.
 
-Before making a code-specific verdict, gather concrete evidence with tools:
+If Koochi included the full review-scope changed hunks above and those hunks answer the test, return a final verdict immediately. Do not call search_text just to rediscover code already shown in the changed-hunk packet.
+
+If the changed hunks are incomplete, ambiguous, or depend on surrounding/helper/caller behavior, gather concrete evidence with tools:
 - Derive search terms from the test id and instruction.
 - When Koochi gives review hunk ids, prefer get_hunk_context for targeted commit context before reading an entire file.
+- In commit-review mode, prefer list_review_hunks or get_hunk_context before broad list_files/search_text calls.
 - Prefer search_text first when the file location is not obvious, then read_file or get_file_context on promising matches.
 - Use find_definitions when the test depends on what a helper, wrapper, sanitizer, verifier, cache method, or authorization function does.
 - Use find_references when the test depends on whether code is called, dead, or used by a route/export/handler path.

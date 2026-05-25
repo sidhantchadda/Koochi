@@ -1,55 +1,55 @@
 provider = "openai"
 model = "gpt-5-nano"
 max_parallel_agents = 16
-max_parallel_llm_requests = 8
+max_parallel_llm_requests = 1
 max_agent_steps = 32
 
 [[test]]
 id = "no-secret-leakage"
-instruction = "Fail if API keys, auth tokens, provider credentials, request headers, or secret values can be printed, persisted, or included in debug logs. Passing evidence should show secrets are read from env/config and not logged."
+instruction = "Fail only if the current review changes introduce or worsen API key, auth token, provider credential, request header, or secret value leakage into logs, persisted files, traces, or debug output. Pass when the changed hunks do not add a concrete secret-leakage path."
 severity = "critical"
 
 [[test]]
 id = "provider-errors-are-actionable"
-instruction = "Fail if OpenAI or Anthropic provider errors can surface as vague parse failures when the real issue is an HTTP error, missing key, unsupported response shape, rate limit, or provider refusal. Error messages should help the user understand what to fix."
+instruction = "Fail only if the current review changes introduce or worsen vague provider error handling for HTTP errors, missing keys, unsupported response shapes, rate limits, or provider refusals. Pass when changed hunks preserve or improve actionable provider errors."
 severity = "high"
 
 [[test]]
 id = "no-unbounded-agent-loop"
-instruction = "Fail if an agent loop can continue without respecting max_agent_steps, or if repeated invalid/premature verdicts can cause excessive provider calls without a clear final infrastructure failure."
+instruction = "Fail only if the current review changes introduce or worsen an agent loop that can ignore max_agent_steps, repeatedly call the provider after invalid/premature verdicts, or avoid a clear final infrastructure failure. Pass when changed hunks preserve bounded loop behavior."
 severity = "high"
 
 [[test]]
 id = "search-cache-locks-clean-up-on-errors"
-instruction = "Fail if any search cache lock or in-flight cache entry can remain stuck after read, regex, path, or filesystem errors. Concurrent search failures should not poison future searches."
+instruction = "Fail only if the current review changes introduce or worsen stuck search cache locks or poisoned in-flight cache entries after read, regex, path, or filesystem errors. Pass when changed hunks are unrelated or preserve cleanup behavior."
 severity = "high"
 
 [[test]]
 id = "git-review-scope-is-change-focused"
-instruction = "Fail if review scope can accidentally expand to the whole repo when local changes or the HEAD commit can be identified. Findings should stay tied to changed files or changed hunks when possible."
+instruction = "Fail only if the current review changes introduce or worsen review-scope expansion beyond local changes or the HEAD commit. Pass when changed hunks keep findings tied to changed files or changed hunks."
 severity = "high"
 
 [[test]]
 id = "no-shell-access-for-agents"
-instruction = "Fail if individual review agents can execute arbitrary shell commands or mutate files. Agents should only use the read-only search/tool API."
+instruction = "Fail only if the current review changes introduce or worsen a path for individual review agents to execute arbitrary shell commands or mutate files. Pass when agents remain limited to the read-only search/tool API."
 severity = "critical"
 
 [[test]]
 id = "debug-output-does-not-overwhelm"
-instruction = "Fail if normal CLI output includes debug-only internals, excessive implementation detail, or noisy progress logs. Debug and trace details should stay behind --debug, --verbose, or --trace."
+instruction = "Fail only if the current review changes introduce or worsen normal CLI output that exposes debug-only internals, excessive implementation detail, or noisy progress logs. Pass when debug and trace details remain behind --debug, --verbose, or --trace."
 severity = "medium"
 
 [[test]]
 id = "provider-tool-contract-stays-shared"
-instruction = "Fail if OpenAI and Anthropic tool schemas or tool parsing drift apart. Shared tool names, argument shapes, and final verdict parsing should remain centralized."
+instruction = "Fail only if the current review changes introduce or worsen drift between OpenAI and Anthropic tool schemas, tool parsing, or final verdict parsing. Pass when changed hunks preserve shared tool names, argument shapes, and centralized parsing."
 severity = "high"
 
 [[test]]
 id = "evidence-must-be-review-scoped"
-instruction = "Fail if failed verdicts can be accepted with evidence outside the review scope unless the evidence is clearly causal context for a changed hunk. Failed results should not be based on unrelated repository code."
+instruction = "Fail only if the current review changes introduce or worsen acceptance of failed verdicts with evidence outside the review scope, except clearly causal context for a changed hunk. Pass when changed hunks keep failed evidence review-scoped."
 severity = "high"
 
 [[test]]
 id = "no-panics-in-runtime-paths"
-instruction = "Fail if runtime code uses unwrap, expect, panic, todo, or unimplemented in paths reachable from the CLI, provider adapters, search layer, scope builder, or agent runner. Tests may use unwrap freely."
+instruction = "Fail only if the current review changes introduce unwrap, expect, panic, todo, or unimplemented in runtime paths reachable from the CLI, provider adapters, search layer, scope builder, or agent runner. Tests may use unwrap freely."
 severity = "medium"
