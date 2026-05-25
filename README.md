@@ -6,15 +6,9 @@ It lets you turn the review rules your team cares about into fast, local, repeat
 
 Koochi is built around one idea: move context right.
 
-Give agents the smallest useful review scope first, then let them ask for more context only when they need it. Koochi scopes the repo once, caches code search aggressively, runs many isolated agents in parallel, and synthesizes deterministic pass/fail results without another LLM call.
+Moving context right means putting durable review knowledge next to the codebase, where it can run automatically. Instead of hoping every agent, reviewer, or prompt remembers the same security rules, reliability checks, and product invariants, Koochi makes those checks executable.
 
-The execution model has three phases:
-
-1. Scoping: define the repo revision, reachable repos, MCP servers, tools, and agents once.
-2. Agent execution: agents use a repo-scoped, read-only search API with cache-friendly requests.
-3. Synthesis: deterministic result aggregation with no LLM calls.
-
-Each agent runs in an isolated, bounded search loop. On each turn it may call one cached search tool or return a final pass/fail verdict, which lets agents chase down evidence without getting their own shell.
+Each check runs as its own isolated agent. Koochi scopes the relevant git change, gives agents read-only code search, shares cached file/search results across the run, and reports deterministic pass/fail results.
 
 That means you can run dozens or hundreds of narrow checks at once:
 
@@ -22,15 +16,7 @@ That means you can run dozens or hundreds of narrow checks at once:
 - reliability rules like missing retries, unbounded background work, cache stampedes, and unsafe file export
 - codebase-specific invariants that reviewers normally keep in their heads
 
-Koochi stays local, read-only, and fast. Agents do not get a shell. They get a focused code-search API backed by shared caching, so parallel review does not turn into hundreds of duplicate `grep`, `rg`, or file-read passes.
-
-By default Koochi scopes review to the smallest useful git change set:
-
-- if the worktree has local changes, broad search/list operations use those changed files
-- otherwise, broad search/list operations use the files changed by `HEAD`
-- outside a git repo, Koochi falls back to the whole repository tree
-
-Agents can still read a specific file path when a tool result points them there, but the starting inventory and broad searches stay focused on the review scope.
+Koochi stays local, read-only, and fast. Agents do not get a shell; they get a focused search API. By default, Koochi reviews local changes first, then falls back to the top commit, then to the full tree outside git.
 
 Run Koochi from a repository with a `koochi.toml` file:
 
@@ -89,69 +75,18 @@ model = "claude-sonnet-4-5"
 
 `provider = "fake"` remains the default so local runs and tests do not need network calls. `base_url` can be set for compatible gateways.
 
-LLM bus controls:
+Koochi currently supports the deterministic fake provider, OpenAI-compatible chat completions, and Anthropic messages.
 
-- `max_parallel_agents` controls how many agents are prepared and submitted per runner chunk.
-- `max_agent_steps` controls how many LLM turns each agent may take before it must return a final verdict. It defaults to `32`.
-- `max_parallel_llm_requests` controls how many provider requests the managed LLM bus may keep in flight at once. It defaults to `max_parallel_agents`.
-- `llm_max_retries` controls retry attempts for transient provider failures such as rate limits, server errors, and transport errors. It defaults to `2`.
-
-The agent-facing search API is deliberately boring:
-
-- `list_files`
-- `search_text`
-- `read_file`
-- `get_file_context`
-- `find_definitions`
-- `find_references`
-
-The repo is not repeated in every request. It lives in `ScopeConfig`, which is attached to a `KoochiSession`.
-
-The LLM layer is provider-agnostic behind a `LlmBus` trait. The current adapters cover the deterministic fake bus, OpenAI-compatible chat completions, and Anthropic messages.
-
-Source layout:
-
-```text
-src/agents/   agent execution and verdict domain types
-src/cli/      command-line runner
-src/config/   koochi.toml parsing and normalization
-src/llm/      provider-agnostic bus plus fake/OpenAI/Anthropic adapters
-src/prompts/  prompt builders
-src/scope/    repo/revision/session scope
-src/search/   cache-friendly search API and local implementation
-src/synthesis deterministic report aggregation
-```
-
-Run the default cheap test suite:
+For development, run the default local test suite:
 
 ```sh
 cargo test
 ```
 
-Run live-provider binary-boundary integration tests. These spend provider quota and require
-`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, or a local `.env.local` with the same key names:
+Live-provider integration tests spend provider quota and require `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`:
 
 ```sh
 cargo integration
-```
-
-They default to OpenAI, and can use Anthropic with `KOOCHI_E2E_PROVIDER=anthropic` and
-`ANTHROPIC_API_KEY`.
-
-Run focused live provider E2E tests:
-
-```sh
-cargo live-fulfillment-e2e
-cargo live-creator-e2e
-cargo live-clinic-e2e
-cargo live-loop-e2e
-```
-
-Run the live provider parallel E2E tests:
-
-```sh
-cargo live-parallel-e2e
-cargo live-stress-e2e
 ```
 
 Next steps:
