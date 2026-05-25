@@ -16,6 +16,16 @@ That means you can run hundreds of narrow checks quickly:
 
 Koochi stays local, read-only, and fast. Agents do not get a shell; they get a focused search API. By default, Koochi reviews local changes first, then falls back to the top commit, then to the full tree outside git.
 
+## Install
+
+Install Koochi with Cargo:
+
+```sh
+cargo install --git https://github.com/sidhantchadda/Koochi
+```
+
+Prebuilt binaries and Homebrew support are planned.
+
 Run Koochi from a repository with a `koochi.toml` file:
 
 ```sh
