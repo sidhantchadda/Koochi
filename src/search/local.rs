@@ -62,12 +62,17 @@ pub struct LocalSearchSession {
 #[derive(Debug, Default)]
 struct SearchCache {
     files: HashMap<FileKind, Vec<FilePath>>,
+    file_locks: HashMap<FileKind, Arc<Mutex<()>>>,
     review_files: HashMap<FileKind, Vec<FilePath>>,
+    review_file_locks: HashMap<FileKind, Arc<Mutex<()>>>,
     contents: HashMap<FilePath, ReadFileResponse>,
     read_locks: HashMap<FilePath, Arc<Mutex<()>>>,
     text: HashMap<SearchTextRequest, SearchTextResponse>,
+    text_locks: HashMap<SearchTextRequest, Arc<Mutex<()>>>,
     definitions: HashMap<String, FindDefinitionsResponse>,
+    definition_locks: HashMap<String, Arc<Mutex<()>>>,
     references: HashMap<String, FindReferencesResponse>,
+    reference_locks: HashMap<String, Arc<Mutex<()>>>,
 }
 
 #[derive(Debug, Default)]
@@ -147,17 +152,31 @@ impl CodeSearchApi for LocalSearchSession {
         &self,
         request: ListFilesRequest,
     ) -> Result<ListFilesResponse, Self::Error> {
+        let file_lock = {
+            let mut cache = self.cache.lock().await;
+            if let Some(files) = cache.files.get(&request.kind).cloned() {
+                self.stats.list_files_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(ListFilesResponse { files });
+            }
+            cache
+                .file_locks
+                .entry(request.kind)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = file_lock.lock().await;
         if let Some(files) = self.cache.lock().await.files.get(&request.kind).cloned() {
             self.stats.list_files_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(ListFilesResponse { files });
         }
+
         self.stats.list_files_misses.fetch_add(1, Ordering::Relaxed);
-        let files = collect_files(&self.scope.primary_repo.root, request.kind)?;
-        self.cache
-            .lock()
-            .await
-            .files
-            .insert(request.kind, files.clone());
+        let files_result = collect_files(&self.scope.primary_repo.root, request.kind);
+        let mut cache = self.cache.lock().await;
+        cache.file_locks.remove(&request.kind);
+        let files = files_result?;
+        cache.files.insert(request.kind, files.clone());
         Ok(ListFilesResponse { files })
     }
 
@@ -178,6 +197,22 @@ impl CodeSearchApi for LocalSearchSession {
             return self.list_files(request).await;
         }
 
+        let review_file_lock = {
+            let mut cache = self.cache.lock().await;
+            if let Some(files) = cache.review_files.get(&request.kind).cloned() {
+                self.stats
+                    .list_review_files_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(ListFilesResponse { files });
+            }
+            cache
+                .review_file_locks
+                .entry(request.kind)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = review_file_lock.lock().await;
         if let Some(files) = self
             .cache
             .lock()
@@ -204,11 +239,9 @@ impl CodeSearchApi for LocalSearchSession {
             .filter(|path| self.scope.primary_repo.root.join(path).is_file())
             .cloned()
             .collect();
-        self.cache
-            .lock()
-            .await
-            .review_files
-            .insert(request.kind, files.clone());
+        let mut cache = self.cache.lock().await;
+        cache.review_file_locks.remove(&request.kind);
+        cache.review_files.insert(request.kind, files.clone());
         Ok(ListFilesResponse { files })
     }
 
@@ -271,35 +304,55 @@ impl CodeSearchApi for LocalSearchSession {
             self.stats.search_text_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(response);
         }
+        let text_lock = {
+            let mut cache = self.cache.lock().await;
+            if let Some(response) = cache.text.get(&normalized).cloned() {
+                self.stats.search_text_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(response);
+            }
+            cache
+                .text_locks
+                .entry(normalized.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = text_lock.lock().await;
+        if let Some(response) = self.cache.lock().await.text.get(&normalized).cloned() {
+            self.stats.search_text_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(response);
+        }
         self.stats
             .search_text_misses
             .fetch_add(1, Ordering::Relaxed);
 
-        let files = self
-            .list_files(ListFilesRequest {
-                kind: normalized.kind,
-            })
-            .await?
-            .files;
-        let mut matches = Vec::new();
-        for path in files {
-            let file = self.read_file(ReadFileRequest { path }).await?;
-            for (index, line) in file.content.lines().enumerate() {
-                if line.contains(&normalized.query) {
-                    matches.push(TextMatch {
-                        path: file.path.clone(),
-                        line: (index + 1) as u32,
-                        preview: line.trim().to_string(),
-                    });
+        let response_result: Result<SearchTextResponse, SearchError> = async {
+            let files = self
+                .list_files(ListFilesRequest {
+                    kind: normalized.kind,
+                })
+                .await?
+                .files;
+            let mut matches = Vec::new();
+            for path in files {
+                let file = self.read_file(ReadFileRequest { path }).await?;
+                for (index, line) in file.content.lines().enumerate() {
+                    if line.contains(&normalized.query) {
+                        matches.push(TextMatch {
+                            path: file.path.clone(),
+                            line: (index + 1) as u32,
+                            preview: line.trim().to_string(),
+                        });
+                    }
                 }
             }
+            Ok(SearchTextResponse { matches })
         }
-        let response = SearchTextResponse { matches };
-        self.cache
-            .lock()
-            .await
-            .text
-            .insert(normalized, response.clone());
+        .await;
+        let mut cache = self.cache.lock().await;
+        cache.text_locks.remove(&normalized);
+        let response = response_result?;
+        cache.text.insert(normalized, response.clone());
         Ok(response)
     }
 
@@ -324,23 +377,28 @@ impl CodeSearchApi for LocalSearchSession {
             return Ok(response);
         }
 
-        let absolute = scoped_path(&self.scope.primary_repo.root, &path)?;
+        let absolute = match scoped_path(&self.scope.primary_repo.root, &path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.cache.lock().await.read_locks.remove(&path);
+                return Err(error);
+            }
+        };
         self.stats.read_file_misses.fetch_add(1, Ordering::Relaxed);
-        let content = tokio::fs::read_to_string(&absolute)
-            .await
-            .map_err(|source| SearchError::Read {
-                path: path.clone(),
-                source,
-            })?;
+        let content_result = tokio::fs::read_to_string(&absolute).await;
+        let mut cache = self.cache.lock().await;
+        cache.read_locks.remove(&path);
+        let content = content_result.map_err(|source| SearchError::Read {
+            path: path.clone(),
+            source,
+        })?;
         let line_count = content.lines().count() as u32;
         let response = ReadFileResponse {
             path: path.clone(),
             content,
             line_count,
         };
-        let mut cache = self.cache.lock().await;
         cache.contents.insert(path.clone(), response.clone());
-        cache.read_locks.remove(&path);
         Ok(response)
     }
 
@@ -392,42 +450,62 @@ impl CodeSearchApi for LocalSearchSession {
             self.stats.definition_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(response);
         }
-        self.stats.definition_misses.fetch_add(1, Ordering::Relaxed);
         if symbol.is_empty() {
             return Ok(FindDefinitionsResponse {
                 definitions: Vec::new(),
             });
         }
-        let regexes = definition_regexes(&symbol)?;
-        let files = self
-            .list_files(ListFilesRequest {
-                kind: FileKind::Source,
-            })
-            .await?
-            .files;
-        let mut definitions = Vec::new();
-        for path in files {
-            let file = self.read_file(ReadFileRequest { path }).await?;
-            for (index, line) in file.content.lines().enumerate() {
-                if let Some(kind) = regexes
-                    .iter()
-                    .find_map(|(kind, regex)| regex.is_match(line).then_some(*kind))
-                {
-                    definitions.push(DefinitionMatch {
-                        path: file.path.clone(),
-                        line: (index + 1) as u32,
-                        kind,
-                        preview: line.trim().to_string(),
-                    });
+        let definition_lock = {
+            let mut cache = self.cache.lock().await;
+            if let Some(response) = cache.definitions.get(&symbol).cloned() {
+                self.stats.definition_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(response);
+            }
+            cache
+                .definition_locks
+                .entry(symbol.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = definition_lock.lock().await;
+        if let Some(response) = self.cache.lock().await.definitions.get(&symbol).cloned() {
+            self.stats.definition_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(response);
+        }
+        self.stats.definition_misses.fetch_add(1, Ordering::Relaxed);
+        let response_result: Result<FindDefinitionsResponse, SearchError> = async {
+            let regexes = definition_regexes(&symbol)?;
+            let files = self
+                .list_files(ListFilesRequest {
+                    kind: FileKind::Source,
+                })
+                .await?
+                .files;
+            let mut definitions = Vec::new();
+            for path in files {
+                let file = self.read_file(ReadFileRequest { path }).await?;
+                for (index, line) in file.content.lines().enumerate() {
+                    if let Some(kind) = regexes
+                        .iter()
+                        .find_map(|(kind, regex)| regex.is_match(line).then_some(*kind))
+                    {
+                        definitions.push(DefinitionMatch {
+                            path: file.path.clone(),
+                            line: (index + 1) as u32,
+                            kind,
+                            preview: line.trim().to_string(),
+                        });
+                    }
                 }
             }
+            Ok(FindDefinitionsResponse { definitions })
         }
-        let response = FindDefinitionsResponse { definitions };
-        self.cache
-            .lock()
-            .await
-            .definitions
-            .insert(symbol, response.clone());
+        .await;
+        let mut cache = self.cache.lock().await;
+        cache.definition_locks.remove(&symbol);
+        let response = response_result?;
+        cache.definitions.insert(symbol, response.clone());
         Ok(response)
     }
 
@@ -440,38 +518,58 @@ impl CodeSearchApi for LocalSearchSession {
             self.stats.reference_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(response);
         }
-        self.stats.reference_misses.fetch_add(1, Ordering::Relaxed);
         if symbol.is_empty() {
             return Ok(FindReferencesResponse {
                 references: Vec::new(),
             });
         }
-        let regex = Regex::new(&format!(r"\b{}\b", regex::escape(&symbol)))?;
-        let files = self
-            .list_files(ListFilesRequest {
-                kind: FileKind::Source,
-            })
-            .await?
-            .files;
-        let mut references = Vec::new();
-        for path in files {
-            let file = self.read_file(ReadFileRequest { path }).await?;
-            for (index, line) in file.content.lines().enumerate() {
-                if regex.is_match(line) {
-                    references.push(ReferenceMatch {
-                        path: file.path.clone(),
-                        line: (index + 1) as u32,
-                        preview: line.trim().to_string(),
-                    });
+        let reference_lock = {
+            let mut cache = self.cache.lock().await;
+            if let Some(response) = cache.references.get(&symbol).cloned() {
+                self.stats.reference_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(response);
+            }
+            cache
+                .reference_locks
+                .entry(symbol.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = reference_lock.lock().await;
+        if let Some(response) = self.cache.lock().await.references.get(&symbol).cloned() {
+            self.stats.reference_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(response);
+        }
+        self.stats.reference_misses.fetch_add(1, Ordering::Relaxed);
+        let response_result: Result<FindReferencesResponse, SearchError> = async {
+            let regex = Regex::new(&format!(r"\b{}\b", regex::escape(&symbol)))?;
+            let files = self
+                .list_files(ListFilesRequest {
+                    kind: FileKind::Source,
+                })
+                .await?
+                .files;
+            let mut references = Vec::new();
+            for path in files {
+                let file = self.read_file(ReadFileRequest { path }).await?;
+                for (index, line) in file.content.lines().enumerate() {
+                    if regex.is_match(line) {
+                        references.push(ReferenceMatch {
+                            path: file.path.clone(),
+                            line: (index + 1) as u32,
+                            preview: line.trim().to_string(),
+                        });
+                    }
                 }
             }
+            Ok(FindReferencesResponse { references })
         }
-        let response = FindReferencesResponse { references };
-        self.cache
-            .lock()
-            .await
-            .references
-            .insert(symbol, response.clone());
+        .await;
+        let mut cache = self.cache.lock().await;
+        cache.reference_locks.remove(&symbol);
+        let response = response_result?;
+        cache.references.insert(symbol, response.clone());
         Ok(response)
     }
 }
@@ -481,13 +579,11 @@ fn collect_files(root: &Path, kind: FileKind) -> Result<Vec<FilePath>, SearchErr
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
+        .filter_entry(|entry| !is_git_metadata(entry.path()))
         .build();
     for entry in walker {
         let entry = entry.map_err(SearchError::Walk)?;
         let path = entry.path();
-        if is_git_metadata(path) {
-            continue;
-        }
         if !path.is_file() {
             continue;
         }

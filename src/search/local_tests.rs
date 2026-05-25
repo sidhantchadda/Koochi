@@ -243,6 +243,31 @@ async fn coalesces_concurrent_file_reads() {
 }
 
 #[tokio::test]
+async fn coalesces_concurrent_text_searches() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("a.rs"), "pub fn handler() {}\n").unwrap();
+    std::fs::write(temp.path().join("b.rs"), "pub fn handler_two() {}\n").unwrap();
+    let search = session(temp.path().to_path_buf());
+
+    let request = SearchTextRequest {
+        query: "handler".to_string(),
+        kind: FileKind::Source,
+    };
+    let (first, second, third) = tokio::join!(
+        search.search_text(request.clone()),
+        search.search_text(request.clone()),
+        search.search_text(request)
+    );
+
+    assert_eq!(first.unwrap().matches.len(), 2);
+    assert_eq!(second.unwrap().matches.len(), 2);
+    assert_eq!(third.unwrap().matches.len(), 2);
+    let stats = search.stats();
+    assert_eq!(stats.search_text_misses, 1);
+    assert_eq!(stats.search_text_hits, 2);
+}
+
+#[tokio::test]
 async fn clamps_file_context() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
