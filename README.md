@@ -1,14 +1,28 @@
 # Koochi
 
-Koochi is a small Rust project for experimenting with cache-friendly code search APIs for parallel code review agents.
+Koochi is a highly parallel agentic test runner for code review.
 
-The MVP has three phases:
+It lets you turn the review rules your team cares about into fast, local, repeatable agentic tests. Instead of burying important review context in `AGENTS.md` files, prompt notes, or tribal knowledge, put it in `koochi.toml` and run it directly against the code that changed.
+
+Koochi is built around one idea: move context right.
+
+Give agents the smallest useful review scope first, then let them ask for more context only when they need it. Koochi scopes the repo once, caches code search aggressively, runs many isolated agents in parallel, and synthesizes deterministic pass/fail results without another LLM call.
+
+The execution model has three phases:
 
 1. Scoping: define the repo revision, reachable repos, MCP servers, tools, and agents once.
 2. Agent execution: agents use a repo-scoped, read-only search API with cache-friendly requests.
 3. Synthesis: deterministic result aggregation with no LLM calls.
 
 Each agent runs in an isolated, bounded search loop. On each turn it may call one cached search tool or return a final pass/fail verdict, which lets agents chase down evidence without getting their own shell.
+
+That means you can run dozens or hundreds of narrow checks at once:
+
+- security rules like missing authorization, SQL injection, secret leakage, and tenant data leaks
+- reliability rules like missing retries, unbounded background work, cache stampedes, and unsafe file export
+- codebase-specific invariants that reviewers normally keep in their heads
+
+Koochi stays local, read-only, and fast. Agents do not get a shell. They get a focused code-search API backed by shared caching, so parallel review does not turn into hundreds of duplicate `grep`, `rg`, or file-read passes.
 
 By default Koochi scopes review to the smallest useful git change set:
 
@@ -23,6 +37,8 @@ Run Koochi from a repository with a `koochi.toml` file:
 ```sh
 koochi
 ```
+
+That is the main workflow: write the checks once, run them from any repo, and get a review result focused on the current local changes or top commit.
 
 Use verbose mode when you want config, scope, and per-batch progress details:
 
