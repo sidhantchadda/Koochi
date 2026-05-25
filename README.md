@@ -1,6 +1,6 @@
 # Koochi
 
-Koochi is a highly parallel agentic test runner for code review.
+Koochi is a highly parallel agentic test runner for the dev process.
 
 It lets you turn the review rules your team cares about into fast, local, repeatable agentic tests. Instead of burying important review context in `AGENTS.md` files, prompt notes, or tribal knowledge, put it in `koochi.toml` and run it directly against the code that changed.
 

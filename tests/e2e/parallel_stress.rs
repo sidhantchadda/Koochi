@@ -1,75 +1,27 @@
 use crate::support::E2eCase;
 use crate::support::ExpectedReport;
 use crate::support::Fixture;
+use crate::support::fixture_codebase;
 use crate::support::run_case;
 
 #[test]
-fn live_provider_runs_fifty_parallel_agentic_tests() {
-    let passed = [
-        "pass-analytics-rule-001",
-        "pass-analytics-rule-002",
-        "pass-analytics-rule-003",
-        "pass-analytics-rule-004",
-        "pass-analytics-rule-005",
-        "pass-analytics-rule-006",
-        "pass-analytics-rule-007",
-        "pass-analytics-rule-008",
-        "pass-analytics-rule-009",
-        "pass-analytics-rule-010",
-        "pass-analytics-rule-011",
-        "pass-analytics-rule-012",
-        "pass-analytics-rule-013",
-        "pass-analytics-rule-014",
-        "pass-compliance-policy-001",
-        "pass-compliance-policy-002",
-        "pass-compliance-policy-003",
-        "pass-compliance-policy-004",
-        "pass-compliance-policy-005",
-        "pass-compliance-policy-006",
-        "pass-compliance-policy-007",
-        "pass-compliance-policy-008",
-        "pass-compliance-policy-009",
-        "pass-compliance-policy-010",
-        "pass-compliance-policy-011",
-        "pass-compliance-policy-012",
-        "pass-compliance-policy-013",
-        "pass-workflow-route-001",
-        "pass-workflow-route-002",
-        "pass-workflow-route-003",
-        "pass-workflow-route-004",
-        "pass-workflow-route-005",
-        "pass-workflow-route-006",
-        "pass-workflow-route-007",
-        "pass-workflow-route-008",
-        "pass-workflow-route-009",
-        "pass-workflow-route-010",
-        "pass-workflow-route-011",
-        "pass-workflow-route-012",
-        "pass-workflow-route-013",
-    ];
-    let failed = [
-        "fail-analytics-tenant-bypass",
-        "fail-analytics-unbounded-score",
-        "fail-analytics-disabled-signal",
-        "fail-analytics-global-cache-key",
-        "fail-compliance-tenant-leak",
-        "fail-compliance-unsanitized-csv",
-        "fail-compliance-disabled-policy",
-        "fail-workflow-missing-tenant",
-        "fail-workflow-single-approver",
-        "fail-workflow-unbounded-amount",
-    ];
+fn live_provider_runs_one_hundred_twenty_eight_parallel_agentic_tests() {
+    let (passed, failed) = parallel_stress_expected_ids();
+    let passed_refs = passed.iter().map(String::as_str).collect::<Vec<_>>();
+    let failed_refs = failed.iter().map(String::as_str).collect::<Vec<_>>();
+    assert_eq!(passed_refs.len(), 118);
+    assert_eq!(failed_refs.len(), 10);
     let run = run_case(
         E2eCase::live_fixture_config(
             &[Fixture::Copy {
                 language: "rust",
                 name: "parallel_stress",
             }],
-            50,
-            50,
+            128,
+            64,
             ExpectedReport {
-                passed: &passed,
-                failed: &failed,
+                passed: &passed_refs,
+                failed: &failed_refs,
             },
         )
         .with_debug(),
@@ -90,14 +42,14 @@ fn live_provider_runs_fifty_parallel_agentic_tests() {
     );
     assert_eq!(
         debug_log["search"]["list_review_files_calls"].as_u64(),
-        Some(50)
+        Some(128)
     );
     assert!(
         debug_log["search"]["search_text_calls"]
             .as_u64()
             .unwrap_or_default()
-            >= 50,
-        "expected each live stress agent to search for its marker, got debug log: {debug_log:#}"
+            >= 120,
+        "expected most live stress agents to search for markers, got debug log: {debug_log:#}"
     );
     assert!(
         debug_log["search"]["read_file_calls"]
@@ -112,4 +64,27 @@ fn live_provider_runs_fifty_parallel_agentic_tests() {
             > 0,
         "expected file context usage, got debug log: {debug_log:#}"
     );
+}
+
+fn parallel_stress_expected_ids() -> (Vec<String>, Vec<String>) {
+    let config =
+        std::fs::read_to_string(fixture_codebase("rust", "parallel_stress").join("koochi.toml"))
+            .unwrap();
+    let mut passed = Vec::new();
+    let mut failed = Vec::new();
+    for line in config.lines() {
+        let trimmed = line.trim();
+        let Some(id) = trimmed
+            .strip_prefix("id = \"")
+            .and_then(|value| value.strip_suffix('"'))
+        else {
+            continue;
+        };
+        if id.starts_with("pass-") {
+            passed.push(id.to_string());
+        } else if id.starts_with("fail-") {
+            failed.push(id.to_string());
+        }
+    }
+    (passed, failed)
 }

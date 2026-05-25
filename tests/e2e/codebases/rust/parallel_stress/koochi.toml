@@ -1,257 +1,648 @@
 provider = "openai"
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-5-nano"
-max_parallel_agents = 50
-max_parallel_llm_requests = 50
+max_parallel_agents = 128
+max_parallel_llm_requests = 64
 max_agent_steps = 128
 initial_context_token_budget = 24000
 
 [[test]]
 id = "fail-analytics-tenant-bypass"
 severity = "critical"
-instruction = "Analytics findings must not be emitted for requests without tenant isolation. Fail if a changed analytics rule can score or emit findings without requiring tenant identity, with concrete evidence."
+instruction = "Analytics findings must require tenant isolation. Fail if analytics scoring or emission can proceed without tenant identity; pass only when the matching code is tenant scoped."
 
 [[test]]
 id = "fail-analytics-unbounded-score"
 severity = "high"
-instruction = "Analytics scoring must clamp or bound raw signal values before amplification. Fail if changed code multiplies or uses raw scores without a bound, with concrete evidence."
+instruction = "Analytics scoring must clamp or bound raw signal values before amplification. Fail if raw signal scores can be multiplied or used without a bound."
 
 [[test]]
 id = "fail-analytics-disabled-signal"
 severity = "medium"
-instruction = "Disabled analytics signals must not generate findings. Fail if changed code can emit findings for disabled signals, with concrete evidence."
+instruction = "Disabled analytics signals must not generate findings. Fail if disabled signals can still emit analytics findings."
 
 [[test]]
 id = "fail-analytics-global-cache-key"
 severity = "high"
-instruction = "Analytics cache keys must include tenant identity. Fail if changed code builds a reusable key from only signal name or global data, with concrete evidence."
+instruction = "Analytics cache keys must include tenant identity. Fail if a reusable cache key is built from only signal name or global data."
 
 [[test]]
 id = "fail-compliance-tenant-leak"
 severity = "critical"
-instruction = "Compliance exports must filter rows by tenant. Fail if changed export code can return another tenant's record, with concrete evidence."
+instruction = "Compliance exports must filter rows by tenant. Fail if export code can return another tenant's record."
 
 [[test]]
 id = "fail-compliance-unsanitized-csv"
 severity = "high"
-instruction = "Compliance CSV exports must sanitize commas and newlines before formatting rows. Fail if changed export code writes raw CSV cells, with concrete evidence."
+instruction = "Compliance CSV exports must sanitize commas and newlines before formatting rows. Fail if raw CSV cells are written."
 
 [[test]]
 id = "fail-compliance-disabled-policy"
 severity = "medium"
-instruction = "Compliance exports must omit disabled policies. Fail if changed code exports disabled policies, with concrete evidence."
+instruction = "Compliance exports must omit disabled policies. Fail if disabled policies are exported."
 
 [[test]]
 id = "fail-workflow-missing-tenant"
 severity = "critical"
-instruction = "Workflow approval routes must check tenant and actor identity before approval. Fail if changed workflow code can approve without tenant presence, with concrete evidence."
+instruction = "Workflow approval routes must check tenant and actor identity before approval. Fail if approval can proceed without tenant presence."
 
 [[test]]
 id = "fail-workflow-single-approver"
 severity = "high"
-instruction = "High-value workflow approvals must require at least two approvals. Fail if changed workflow code accepts a single approver, with concrete evidence."
+instruction = "High-value workflow approvals must require at least two approvals. Fail if a single approver can approve a high-value workflow."
 
 [[test]]
 id = "fail-workflow-unbounded-amount"
 severity = "high"
-instruction = "Workflow approval routes must have an amount ceiling. Fail if changed workflow code approves any amount once basic approvals exist, with concrete evidence."
-
-[[test]]
-id = "pass-analytics-rule-001"
-severity = "medium"
-instruction = "Verify analytics rule 001 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Workflow approval routes must enforce an amount ceiling. Fail if any amount can be approved once basic approvals exist."
 
 [[test]]
 id = "pass-analytics-rule-002"
 severity = "medium"
-instruction = "Verify analytics rule 002 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 002 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-003"
 severity = "medium"
-instruction = "Verify analytics rule 003 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 003 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-004"
 severity = "medium"
-instruction = "Verify analytics rule 004 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 004 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-005"
 severity = "medium"
-instruction = "Verify analytics rule 005 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 005 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-006"
 severity = "medium"
-instruction = "Verify analytics rule 006 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 006 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-007"
 severity = "medium"
-instruction = "Verify analytics rule 007 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 007 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-008"
 severity = "medium"
-instruction = "Verify analytics rule 008 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 008 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-009"
 severity = "medium"
-instruction = "Verify analytics rule 009 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 009 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-010"
 severity = "medium"
-instruction = "Verify analytics rule 010 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 010 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-011"
 severity = "medium"
-instruction = "Verify analytics rule 011 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 011 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-012"
 severity = "medium"
-instruction = "Verify analytics rule 012 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 012 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-013"
 severity = "medium"
-instruction = "Verify analytics rule 013 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 013 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-analytics-rule-014"
 severity = "medium"
-instruction = "Verify analytics rule 014 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+instruction = "Analytics rule 014 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-015"
+severity = "medium"
+instruction = "Analytics rule 015 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-016"
+severity = "medium"
+instruction = "Analytics rule 016 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-017"
+severity = "medium"
+instruction = "Analytics rule 017 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-018"
+severity = "medium"
+instruction = "Analytics rule 018 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-019"
+severity = "medium"
+instruction = "Analytics rule 019 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-020"
+severity = "medium"
+instruction = "Analytics rule 020 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-021"
+severity = "medium"
+instruction = "Analytics rule 021 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-022"
+severity = "medium"
+instruction = "Analytics rule 022 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-023"
+severity = "medium"
+instruction = "Analytics rule 023 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-024"
+severity = "medium"
+instruction = "Analytics rule 024 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-025"
+severity = "medium"
+instruction = "Analytics rule 025 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-026"
+severity = "medium"
+instruction = "Analytics rule 026 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-027"
+severity = "medium"
+instruction = "Analytics rule 027 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-028"
+severity = "medium"
+instruction = "Analytics rule 028 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-029"
+severity = "medium"
+instruction = "Analytics rule 029 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-030"
+severity = "medium"
+instruction = "Analytics rule 030 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-031"
+severity = "medium"
+instruction = "Analytics rule 031 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-032"
+severity = "medium"
+instruction = "Analytics rule 032 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-033"
+severity = "medium"
+instruction = "Analytics rule 033 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-034"
+severity = "medium"
+instruction = "Analytics rule 034 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-035"
+severity = "medium"
+instruction = "Analytics rule 035 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-036"
+severity = "medium"
+instruction = "Analytics rule 036 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-037"
+severity = "medium"
+instruction = "Analytics rule 037 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-038"
+severity = "medium"
+instruction = "Analytics rule 038 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-039"
+severity = "medium"
+instruction = "Analytics rule 039 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-040"
+severity = "medium"
+instruction = "Analytics rule 040 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-041"
+severity = "medium"
+instruction = "Analytics rule 041 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-042"
+severity = "medium"
+instruction = "Analytics rule 042 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-043"
+severity = "medium"
+instruction = "Analytics rule 043 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-044"
+severity = "medium"
+instruction = "Analytics rule 044 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-045"
+severity = "medium"
+instruction = "Analytics rule 045 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-046"
+severity = "medium"
+instruction = "Analytics rule 046 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-047"
+severity = "medium"
+instruction = "Analytics rule 047 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-048"
+severity = "medium"
+instruction = "Analytics rule 048 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-049"
+severity = "medium"
+instruction = "Analytics rule 049 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-050"
+severity = "medium"
+instruction = "Analytics rule 050 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-051"
+severity = "medium"
+instruction = "Analytics rule 051 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-052"
+severity = "medium"
+instruction = "Analytics rule 052 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-053"
+severity = "medium"
+instruction = "Analytics rule 053 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-054"
+severity = "medium"
+instruction = "Analytics rule 054 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-055"
+severity = "medium"
+instruction = "Analytics rule 055 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-056"
+severity = "medium"
+instruction = "Analytics rule 056 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-057"
+severity = "medium"
+instruction = "Analytics rule 057 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-058"
+severity = "medium"
+instruction = "Analytics rule 058 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-059"
+severity = "medium"
+instruction = "Analytics rule 059 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-analytics-rule-060"
+severity = "medium"
+instruction = "Analytics rule 060 should require tenant identity, ignore disabled signals, clamp score inputs, and emit only tenant-scoped findings. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-001"
 severity = "high"
-instruction = "Verify compliance policy 001 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 001 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-002"
 severity = "high"
-instruction = "Verify compliance policy 002 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 002 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-003"
 severity = "high"
-instruction = "Verify compliance policy 003 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 003 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-004"
 severity = "high"
-instruction = "Verify compliance policy 004 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 004 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-005"
 severity = "high"
-instruction = "Verify compliance policy 005 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 005 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-006"
 severity = "high"
-instruction = "Verify compliance policy 006 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 006 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-007"
 severity = "high"
-instruction = "Verify compliance policy 007 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 007 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-008"
 severity = "high"
-instruction = "Verify compliance policy 008 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 008 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-009"
 severity = "high"
-instruction = "Verify compliance policy 009 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 009 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-010"
 severity = "high"
-instruction = "Verify compliance policy 010 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 010 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-011"
 severity = "high"
-instruction = "Verify compliance policy 011 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 011 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-012"
 severity = "high"
-instruction = "Verify compliance policy 012 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 012 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
 id = "pass-compliance-policy-013"
 severity = "high"
-instruction = "Verify compliance policy 013 filters by tenant, requires enabled policies, and sanitizes CSV cells."
+instruction = "Compliance policy 013 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-001"
+id = "pass-compliance-policy-014"
 severity = "high"
-instruction = "Verify workflow route 001 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 014 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-002"
+id = "pass-compliance-policy-015"
 severity = "high"
-instruction = "Verify workflow route 002 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 015 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-003"
+id = "pass-compliance-policy-016"
 severity = "high"
-instruction = "Verify workflow route 003 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 016 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-004"
+id = "pass-compliance-policy-017"
 severity = "high"
-instruction = "Verify workflow route 004 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 017 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-005"
+id = "pass-compliance-policy-018"
 severity = "high"
-instruction = "Verify workflow route 005 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 018 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-006"
+id = "pass-compliance-policy-019"
 severity = "high"
-instruction = "Verify workflow route 006 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 019 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-007"
+id = "pass-compliance-policy-020"
 severity = "high"
-instruction = "Verify workflow route 007 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 020 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-008"
+id = "pass-compliance-policy-021"
 severity = "high"
-instruction = "Verify workflow route 008 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 021 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-009"
+id = "pass-compliance-policy-022"
 severity = "high"
-instruction = "Verify workflow route 009 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 022 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-010"
+id = "pass-compliance-policy-023"
 severity = "high"
-instruction = "Verify workflow route 010 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 023 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-011"
+id = "pass-compliance-policy-024"
 severity = "high"
-instruction = "Verify workflow route 011 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 024 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-012"
+id = "pass-compliance-policy-025"
 severity = "high"
-instruction = "Verify workflow route 012 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 025 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
 
 [[test]]
-id = "pass-workflow-route-013"
+id = "pass-compliance-policy-026"
 severity = "high"
-instruction = "Verify workflow route 013 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+instruction = "Compliance policy 026 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-027"
+severity = "high"
+instruction = "Compliance policy 027 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-028"
+severity = "high"
+instruction = "Compliance policy 028 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-029"
+severity = "high"
+instruction = "Compliance policy 029 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-030"
+severity = "high"
+instruction = "Compliance policy 030 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-031"
+severity = "high"
+instruction = "Compliance policy 031 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-032"
+severity = "high"
+instruction = "Compliance policy 032 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-033"
+severity = "high"
+instruction = "Compliance policy 033 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-034"
+severity = "high"
+instruction = "Compliance policy 034 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-035"
+severity = "high"
+instruction = "Compliance policy 035 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-036"
+severity = "high"
+instruction = "Compliance policy 036 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-037"
+severity = "high"
+instruction = "Compliance policy 037 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-038"
+severity = "high"
+instruction = "Compliance policy 038 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-039"
+severity = "high"
+instruction = "Compliance policy 039 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-040"
+severity = "high"
+instruction = "Compliance policy 040 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-041"
+severity = "high"
+instruction = "Compliance policy 041 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-042"
+severity = "high"
+instruction = "Compliance policy 042 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-043"
+severity = "high"
+instruction = "Compliance policy 043 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-044"
+severity = "high"
+instruction = "Compliance policy 044 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-045"
+severity = "high"
+instruction = "Compliance policy 045 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-046"
+severity = "high"
+instruction = "Compliance policy 046 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-047"
+severity = "high"
+instruction = "Compliance policy 047 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-048"
+severity = "high"
+instruction = "Compliance policy 048 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-049"
+severity = "high"
+instruction = "Compliance policy 049 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-050"
+severity = "high"
+instruction = "Compliance policy 050 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-051"
+severity = "high"
+instruction = "Compliance policy 051 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-052"
+severity = "high"
+instruction = "Compliance policy 052 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-053"
+severity = "high"
+instruction = "Compliance policy 053 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-054"
+severity = "high"
+instruction = "Compliance policy 054 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-055"
+severity = "high"
+instruction = "Compliance policy 055 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-056"
+severity = "high"
+instruction = "Compliance policy 056 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-057"
+severity = "high"
+instruction = "Compliance policy 057 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-058"
+severity = "high"
+instruction = "Compliance policy 058 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+
+[[test]]
+id = "pass-compliance-policy-059"
+severity = "high"
+instruction = "Compliance policy 059 should filter exports by tenant, require the policy to be enabled, and sanitize CSV cells before export. Pass when the matching safe implementation demonstrates those properties."
+

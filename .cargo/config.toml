@@ -6,4 +6,4 @@ live-creator-e2e = "test --features integration-tests --test e2e creator_market_
 live-clinic-e2e = "test --features integration-tests --test e2e clinic_scheduler_flags_python_privacy_and_path_issues -- --nocapture"
 live-parallel-e2e = "test --features integration-tests --test e2e polyglot_workspace_runs_parallel_review_agents -- --nocapture"
 live-loop-e2e = "test --features integration-tests --test e2e live_provider_uses_multiple_llm_requests_for_tool_observations -- --nocapture"
-live-stress-e2e = "test --features integration-tests --test e2e live_provider_runs_fifty_parallel_agentic_tests -- --nocapture"
+live-stress-e2e = "test --features integration-tests --test e2e live_provider_runs_one_hundred_twenty_eight_parallel_agentic_tests -- --nocapture"
