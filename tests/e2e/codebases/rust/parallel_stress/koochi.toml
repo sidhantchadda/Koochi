@@ -3,254 +3,255 @@ api_key_env = "OPENAI_API_KEY"
 model = "gpt-5-nano"
 max_parallel_agents = 50
 max_parallel_llm_requests = 50
-max_agent_steps = 32
+max_agent_steps = 128
+initial_context_token_budget = 24000
 
 [[test]]
-id = "fail-secret-logging"
+id = "fail-analytics-tenant-bypass"
 severity = "critical"
-instruction = "Do not log raw authorization headers, cookies, API keys, or bearer tokens. Fail if request logging exposes those secrets with concrete evidence."
+instruction = "Analytics findings must not be emitted for requests without tenant isolation. Fail if a changed analytics rule can score or emit findings without requiring tenant identity, with concrete evidence."
 
 [[test]]
-id = "fail-sql-interpolation"
+id = "fail-analytics-unbounded-score"
+severity = "high"
+instruction = "Analytics scoring must clamp or bound raw signal values before amplification. Fail if changed code multiplies or uses raw scores without a bound, with concrete evidence."
+
+[[test]]
+id = "fail-analytics-disabled-signal"
+severity = "medium"
+instruction = "Disabled analytics signals must not generate findings. Fail if changed code can emit findings for disabled signals, with concrete evidence."
+
+[[test]]
+id = "fail-analytics-global-cache-key"
+severity = "high"
+instruction = "Analytics cache keys must include tenant identity. Fail if changed code builds a reusable key from only signal name or global data, with concrete evidence."
+
+[[test]]
+id = "fail-compliance-tenant-leak"
 severity = "critical"
-instruction = "Do not build SQL by interpolating tenant, account, invoice, or user-controlled values into query strings. Fail if dynamic SQL is assembled unsafely with concrete evidence."
+instruction = "Compliance exports must filter rows by tenant. Fail if changed export code can return another tenant's record, with concrete evidence."
 
 [[test]]
-id = "fail-missing-org-auth"
+id = "fail-compliance-unsanitized-csv"
+severity = "high"
+instruction = "Compliance CSV exports must sanitize commas and newlines before formatting rows. Fail if changed export code writes raw CSV cells, with concrete evidence."
+
+[[test]]
+id = "fail-compliance-disabled-policy"
+severity = "medium"
+instruction = "Compliance exports must omit disabled policies. Fail if changed code exports disabled policies, with concrete evidence."
+
+[[test]]
+id = "fail-workflow-missing-tenant"
 severity = "critical"
-instruction = "Do not expose project or account data without checking the caller belongs to the same organization and has permission. Fail if a handler or helper skips that authorization check."
+instruction = "Workflow approval routes must check tenant and actor identity before approval. Fail if changed workflow code can approve without tenant presence, with concrete evidence."
 
 [[test]]
-id = "fail-cache-stampede"
+id = "fail-workflow-single-approver"
 severity = "high"
-instruction = "Do not run expensive cache-miss loaders without an in-flight guard, lock, or single-flight behavior. Fail if a cache can stampede under concurrent misses."
+instruction = "High-value workflow approvals must require at least two approvals. Fail if changed workflow code accepts a single approver, with concrete evidence."
 
 [[test]]
-id = "fail-no-timeout-payment-call"
+id = "fail-workflow-unbounded-amount"
 severity = "high"
-instruction = "Do not call external payment or billing integrations without a timeout and retry-aware wrapper. Fail if a direct client call bypasses that protection."
+instruction = "Workflow approval routes must have an amount ceiling. Fail if changed workflow code approves any amount once basic approvals exist, with concrete evidence."
 
 [[test]]
-id = "fail-money-as-float"
+id = "pass-analytics-rule-001"
+severity = "medium"
+instruction = "Verify analytics rule 001 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-002"
+severity = "medium"
+instruction = "Verify analytics rule 002 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-003"
+severity = "medium"
+instruction = "Verify analytics rule 003 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-004"
+severity = "medium"
+instruction = "Verify analytics rule 004 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-005"
+severity = "medium"
+instruction = "Verify analytics rule 005 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-006"
+severity = "medium"
+instruction = "Verify analytics rule 006 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-007"
+severity = "medium"
+instruction = "Verify analytics rule 007 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-008"
+severity = "medium"
+instruction = "Verify analytics rule 008 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-009"
+severity = "medium"
+instruction = "Verify analytics rule 009 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-010"
+severity = "medium"
+instruction = "Verify analytics rule 010 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-011"
+severity = "medium"
+instruction = "Verify analytics rule 011 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-012"
+severity = "medium"
+instruction = "Verify analytics rule 012 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-013"
+severity = "medium"
+instruction = "Verify analytics rule 013 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-analytics-rule-014"
+severity = "medium"
+instruction = "Verify analytics rule 014 requires tenant identity, ignores disabled signals, and bounds signal score before emitting findings."
+
+[[test]]
+id = "pass-compliance-policy-001"
 severity = "high"
-instruction = "Do not represent or calculate money with floating point values. Fail if currency totals use f32, f64, or equivalent float arithmetic."
+instruction = "Verify compliance policy 001 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "fail-path-traversal"
+id = "pass-compliance-policy-002"
 severity = "high"
-instruction = "Do not join user-controlled report names or paths into filesystem paths without validation or allowlisting. Fail if path traversal is possible."
+instruction = "Verify compliance policy 002 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "fail-unbounded-background-loop"
-severity = "medium"
-instruction = "Do not create background loops without cancellation, backoff, timeout, or attempt bounds. Fail if repeated work is unbounded."
-
-[[test]]
-id = "fail-dead-code"
-severity = "medium"
-instruction = "Do not leave private migration helpers or legacy functions with no apparent callers. Fail if likely dead code remains."
-
-[[test]]
-id = "fail-tenant-data-leak"
-severity = "critical"
-instruction = "Do not return records from multiple tenants when the caller requested one organization. Fail if tenant filtering is missing."
-
-[[test]]
-id = "pass-authorization-guard"
+id = "pass-compliance-policy-003"
 severity = "high"
-instruction = "Verify project access checks tenant ownership before returning project data."
+instruction = "Verify compliance policy 003 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "pass-billing-authorization"
+id = "pass-compliance-policy-004"
 severity = "high"
-instruction = "Verify billing changes require same-tenant access and a billing-capable role."
+instruction = "Verify compliance policy 004 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "pass-report-authorization"
+id = "pass-compliance-policy-005"
 severity = "high"
-instruction = "Verify report exports require same-tenant access and an export permission."
+instruction = "Verify compliance policy 005 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "pass-job-authorization"
-severity = "medium"
-instruction = "Verify job management requires same-tenant access and a job-management permission."
-
-[[test]]
-id = "pass-parameterized-sql"
-severity = "critical"
-instruction = "Verify the project lookup query builder uses parameterized SQL rather than string interpolation."
-
-[[test]]
-id = "pass-tenant-scoped-query"
+id = "pass-compliance-policy-006"
 severity = "high"
-instruction = "Verify invoice search queries include tenant scope and a bounded limit."
+instruction = "Verify compliance policy 006 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "pass-pagination-limit"
-severity = "medium"
-instruction = "Verify audit pagination clamps user-provided limits before querying."
-
-[[test]]
-id = "pass-idempotency-storage"
-severity = "medium"
-instruction = "Verify idempotency keys are stored with tenant scope and parameterized SQL."
-
-[[test]]
-id = "pass-redacted-logging"
+id = "pass-compliance-policy-007"
 severity = "high"
-instruction = "Verify request logs redact authorization headers, API keys, and cookies."
+instruction = "Verify compliance policy 007 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "pass-audit-redaction"
-severity = "medium"
-instruction = "Verify billing audit entries avoid bearer tokens, cookies, and other secret material."
-
-[[test]]
-id = "pass-integer-cents-money"
+id = "pass-compliance-policy-008"
 severity = "high"
-instruction = "Verify invoice totals use integer cents and checked arithmetic."
+instruction = "Verify compliance policy 008 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "pass-timeout-retry-payment"
+id = "pass-compliance-policy-009"
 severity = "high"
-instruction = "Verify payment charges go through an authorization check and retry-aware timeout wrapper."
+instruction = "Verify compliance policy 009 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "pass-discount-bounds"
-severity = "medium"
-instruction = "Verify coupon discounts use checked integer math and bounded basis points."
-
-[[test]]
-id = "pass-idempotency-key"
-severity = "medium"
-instruction = "Verify payment idempotency keys include tenant, account, and nonce components."
-
-[[test]]
-id = "pass-single-flight-cache"
+id = "pass-compliance-policy-010"
 severity = "high"
-instruction = "Verify rate-card cache misses use an in-flight guard or single-flight behavior."
+instruction = "Verify compliance policy 010 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "pass-tenant-cache-key"
-severity = "medium"
-instruction = "Verify feature cache keys include tenant identity and normalized feature names."
-
-[[test]]
-id = "pass-bounded-background-job"
-severity = "medium"
-instruction = "Verify export jobs are authorized and have retry and timeout bounds."
-
-[[test]]
-id = "pass-queue-retry-policy"
-severity = "medium"
-instruction = "Verify queue retry delays use bounded exponential backoff."
-
-[[test]]
-id = "pass-path-allowlist"
+id = "pass-compliance-policy-011"
 severity = "high"
-instruction = "Verify the safe report path builder constructs file paths from allowlisted report names."
+instruction = "Verify compliance policy 011 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "pass-safe-file-export"
+id = "pass-compliance-policy-012"
 severity = "high"
-instruction = "Verify report export combines tenant authorization with sanitized path construction."
+instruction = "Verify compliance policy 012 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "pass-http-auth-flow"
+id = "pass-compliance-policy-013"
 severity = "high"
-instruction = "Verify the project HTTP handler checks access before returning project data."
+instruction = "Verify compliance policy 013 filters by tenant, requires enabled policies, and sanitizes CSV cells."
 
 [[test]]
-id = "pass-list-auth-pagination"
-severity = "medium"
-instruction = "Verify list endpoints check tenant access and clamp pagination."
-
-[[test]]
-id = "pass-webhook-signature"
-severity = "critical"
-instruction = "Verify webhooks require a valid tenant-specific signature before acceptance."
-
-[[test]]
-id = "pass-external-timeout"
-severity = "medium"
-instruction = "Verify the safe external integration wrapper uses a bounded timeout value."
-
-[[test]]
-id = "pass-config-validation"
-severity = "medium"
-instruction = "Verify runtime configuration validates page size, timeout, rollout, and environment bounds."
-
-[[test]]
-id = "pass-feature-flag"
-severity = "low"
-instruction = "Verify feature flag rollout is tenant scoped and percentage bounded."
-
-[[test]]
-id = "pass-tenant-filter"
-severity = "critical"
-instruction = "Verify project collections are filtered by tenant before returning records."
-
-[[test]]
-id = "pass-referenced-helper"
-severity = "low"
-instruction = "Verify the reconciliation plan actually calls the referenced reconciliation helper."
-
-[[test]]
-id = "pass-support-role-check"
-severity = "medium"
-instruction = "Verify support-role access also checks tenant membership."
-
-[[test]]
-id = "pass-scope-check"
-severity = "medium"
-instruction = "Verify scope checks compare requested scope against caller scope membership."
-
-[[test]]
-id = "pass-audit-parameterized-sql"
-severity = "medium"
-instruction = "Verify audit-event queries use parameterized SQL and tenant scope."
-
-[[test]]
-id = "pass-delete-tenant-scoped"
-severity = "medium"
-instruction = "Verify expired session deletion is scoped to a tenant."
-
-[[test]]
-id = "pass-trace-field-filter"
-severity = "medium"
-instruction = "Verify trace field collection drops authorization and cookie values."
-
-[[test]]
-id = "pass-metric-normalization"
-severity = "low"
-instruction = "Verify metric names are normalized before emission."
-
-[[test]]
-id = "pass-cache-ttl"
-severity = "low"
-instruction = "Verify cache TTLs are bounded by known resource type."
-
-[[test]]
-id = "pass-feature-cache-key"
-severity = "medium"
-instruction = "Verify feature cache keys include tenant identity."
-
-[[test]]
-id = "pass-retry-backoff"
-severity = "medium"
-instruction = "Verify retry backoff is capped."
-
-[[test]]
-id = "pass-digest-enqueue-bound"
-severity = "medium"
-instruction = "Verify digest enqueue decisions are bounded by pending event count."
-
-[[test]]
-id = "pass-report-name-sanitizer"
+id = "pass-workflow-route-001"
 severity = "high"
-instruction = "Verify the safe report-name sanitizer rejects unsafe names before file access."
+instruction = "Verify workflow route 001 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
 
 [[test]]
-id = "pass-webhook-acceptance"
-severity = "critical"
-instruction = "Verify webhook acceptance delegates to signature verification."
+id = "pass-workflow-route-002"
+severity = "high"
+instruction = "Verify workflow route 002 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+
+[[test]]
+id = "pass-workflow-route-003"
+severity = "high"
+instruction = "Verify workflow route 003 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+
+[[test]]
+id = "pass-workflow-route-004"
+severity = "high"
+instruction = "Verify workflow route 004 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+
+[[test]]
+id = "pass-workflow-route-005"
+severity = "high"
+instruction = "Verify workflow route 005 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+
+[[test]]
+id = "pass-workflow-route-006"
+severity = "high"
+instruction = "Verify workflow route 006 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+
+[[test]]
+id = "pass-workflow-route-007"
+severity = "high"
+instruction = "Verify workflow route 007 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+
+[[test]]
+id = "pass-workflow-route-008"
+severity = "high"
+instruction = "Verify workflow route 008 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+
+[[test]]
+id = "pass-workflow-route-009"
+severity = "high"
+instruction = "Verify workflow route 009 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+
+[[test]]
+id = "pass-workflow-route-010"
+severity = "high"
+instruction = "Verify workflow route 010 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+
+[[test]]
+id = "pass-workflow-route-011"
+severity = "high"
+instruction = "Verify workflow route 011 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+
+[[test]]
+id = "pass-workflow-route-012"
+severity = "high"
+instruction = "Verify workflow route 012 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."
+
+[[test]]
+id = "pass-workflow-route-013"
+severity = "high"
+instruction = "Verify workflow route 013 checks tenant and actor presence, requires two approvals, and enforces an amount ceiling."

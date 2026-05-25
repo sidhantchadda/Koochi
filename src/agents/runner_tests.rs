@@ -2,7 +2,10 @@ use super::*;
 use crate::llm::FakeLlmBus;
 use crate::llm::LlmTextResponse;
 use crate::llm::TestStatus;
-use crate::scope::{GitRevision, RepoScope, ReviewMode, ReviewScope, ScopeConfig};
+use crate::scope::{
+    GitRevision, RepoScope, ReviewHunk, ReviewHunkLine, ReviewLineKind, ReviewMode, ReviewScope,
+    ScopeConfig,
+};
 use crate::search::LocalSearchSession;
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -18,6 +21,7 @@ fn session(root: PathBuf) -> LocalSearchSession {
         review: ReviewScope {
             mode: ReviewMode::FullRepoFallback,
             files: Vec::new(),
+            hunks: Vec::new(),
             commit: None,
         },
         accessible_repos: Vec::new(),
@@ -37,6 +41,14 @@ fn derives_fixture_marker_from_expected_result_test_ids() {
         fixture_marker_for_test_id("fail-no-timeout-payment-call"),
         Some("KOOCHI_FAIL_NO_TIMEOUT_PAYMENT_CALL".to_string())
     );
+    assert_eq!(
+        fixture_marker_for_test_id("pass-safe-file-export"),
+        Some("KOOCHI_SAFE_FILE_EXPORT".to_string())
+    );
+    assert_eq!(
+        fixture_marker_for_test_id("fail-fail-open-redirect"),
+        Some("KOOCHI_FAIL_OPEN_REDIRECT".to_string())
+    );
     assert_eq!(fixture_marker_for_test_id("ordinary-test"), None);
 }
 
@@ -51,6 +63,7 @@ async fn runs_agents_through_bus() {
         review: ReviewScope {
             mode: ReviewMode::FullRepoFallback,
             files: Vec::new(),
+            hunks: Vec::new(),
             commit: None,
         },
         accessible_repos: Vec::new(),
@@ -66,6 +79,7 @@ async fn runs_agents_through_bus() {
             instruction: "Pass this".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus.clone(),
@@ -90,6 +104,7 @@ async fn batches_agents_by_configured_limit() {
         review: ReviewScope {
             mode: ReviewMode::FullRepoFallback,
             files: Vec::new(),
+            hunks: Vec::new(),
             commit: None,
         },
         accessible_repos: Vec::new(),
@@ -105,9 +120,11 @@ async fn batches_agents_by_configured_limit() {
             instruction: "Pass this".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         })
         .collect();
     let mut batch_sizes = Vec::new();
+    let mut completions = Vec::new();
     let verdicts = run_agents_with_progress(
         agents,
         search,
@@ -118,12 +135,21 @@ async fn batches_agents_by_configured_limit() {
             if let AgentProgressEvent::BatchPreparing { agent_count, .. } = event {
                 batch_sizes.push(agent_count);
             }
+            if let AgentProgressEvent::AgentCompleted {
+                completed_agents,
+                total_agents,
+                ..
+            } = event
+            {
+                completions.push((completed_agents, total_agents));
+            }
         },
     )
     .await
     .unwrap();
     assert_eq!(verdicts.len(), 5);
     assert_eq!(batch_sizes, vec![2, 2, 1]);
+    assert_eq!(completions, vec![(1, 5), (2, 5), (3, 5), (4, 5), (5, 5)]);
     assert_eq!(bus.requests().await.len(), 5);
 }
 
@@ -140,6 +166,7 @@ async fn grounds_agent_instruction_with_repo_context() {
             instruction: "Pass this".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus.clone(),
@@ -156,6 +183,128 @@ async fn grounds_agent_instruction_with_repo_context() {
     );
     assert!(request.instruction.contains("- lib.rs"));
     assert!(!request.instruction.contains("pub fn risky_call"));
+}
+
+#[tokio::test]
+async fn grounds_agent_instruction_with_small_changed_hunk_packet() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn risky_call() {}\n").unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["lib.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "lib.rs#1".to_string(),
+                path: "lib.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn risky_call() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(FakeLlmBus::new());
+    run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Pass this".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    let request = bus.requests().await.remove(0);
+    assert!(request.instruction.contains("Review-scope changed hunks"));
+    assert!(request.instruction.contains("--- hunk lib.rs#1 lib.rs"));
+    assert!(request.instruction.contains("+1: pub fn risky_call() {}"));
+    assert!(
+        request
+            .instruction
+            .contains("You may return a final verdict immediately")
+    );
+}
+
+#[tokio::test]
+async fn grounds_agent_instruction_with_large_hunk_summary() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn risky_call() {}\n").unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["lib.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "lib.rs#1".to_string(),
+                path: "lib.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn risky_call() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(FakeLlmBus::new());
+    run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Pass this".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: 1,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    let request = bus.requests().await.remove(0);
+    assert!(request.instruction.contains("Hunk summary:"));
+    assert!(request.instruction.contains("- lib.rs#1 lib.rs"));
+    assert!(request.instruction.contains("get_hunk_context"));
+    assert!(!request.instruction.contains("+1: pub fn risky_call() {}"));
 }
 
 #[tokio::test]
@@ -183,6 +332,7 @@ async fn drops_provider_evidence_not_found_in_repo_context() {
             instruction: "missing auth".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus,
@@ -214,6 +364,7 @@ async fn failed_verdict_without_review_scope_evidence_is_not_reported() {
         review: ReviewScope {
             mode: ReviewMode::HeadCommit,
             files: vec!["changed.rs".to_string()],
+            hunks: Vec::new(),
             commit: None,
         },
         accessible_repos: Vec::new(),
@@ -240,6 +391,7 @@ async fn failed_verdict_without_review_scope_evidence_is_not_reported() {
             instruction: "Find token logging with concrete evidence.".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus,
@@ -254,8 +406,221 @@ async fn failed_verdict_without_review_scope_evidence_is_not_reported() {
     assert!(
         verdicts[0]
             .description
-            .contains("No concrete review-scope evidence")
+            .contains("No changed or causal review evidence")
     );
+}
+
+#[tokio::test]
+async fn failed_verdict_with_changed_line_evidence_is_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("changed.rs"), "pub fn changed() {}\n").unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"search_text","query":"changed","kind":"source"}"#,
+        r#"{"action":"get_hunk_context","hunk_id":"changed.rs#1"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"changed line is unsafe",
+                "evidence":[{"path":"changed.rs","line":1,"preview":"pub fn changed() {}"}]
+            }"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Find unsafe code with concrete evidence.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus,
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence.len(), 1);
+}
+
+#[tokio::test]
+async fn failed_verdict_with_unrelated_review_context_is_downgraded() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn changed() {}\npub fn old_helper() {}\n",
+    )
+    .unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"search_text","query":"old_helper","kind":"source"}"#,
+        r#"{"action":"read_file","path":"changed.rs"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"old helper is unsafe",
+                "evidence":[{"path":"changed.rs","line":2,"preview":"pub fn old_helper() {}"}]
+            }"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Find unsafe code with concrete evidence.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus,
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert!(
+        verdicts[0]
+            .description
+            .contains("No changed or causal review evidence")
+    );
+}
+
+#[tokio::test]
+async fn failed_verdict_with_causal_review_context_is_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn changed() { helper(); }\npub fn helper() {}\n",
+    )
+    .unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn changed() { helper(); }".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"search_text","query":"helper","kind":"source"}"#,
+        r#"{"action":"read_file","path":"changed.rs"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"The changed line calls helper, and helper is unsafe.",
+                "evidence":[{"path":"changed.rs","line":2,"preview":"pub fn helper() {}"}]
+            }"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Find unsafe code with concrete evidence.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus,
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence[0].line, 2);
 }
 
 #[tokio::test]
@@ -271,6 +636,7 @@ async fn absence_policy_failure_can_fail_without_line_evidence() {
         review: ReviewScope {
             mode: ReviewMode::HeadCommit,
             files: vec!["changed.rs".to_string()],
+            hunks: Vec::new(),
             commit: None,
         },
         accessible_repos: Vec::new(),
@@ -297,6 +663,7 @@ async fn absence_policy_failure_can_fail_without_line_evidence() {
                     .to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus,
@@ -323,6 +690,7 @@ async fn exact_red_herring_failure_is_preserved_without_evidence() {
         review: ReviewScope {
             mode: ReviewMode::HeadCommit,
             files: vec!["changed.rs".to_string()],
+            hunks: Vec::new(),
             commit: None,
         },
         accessible_repos: Vec::new(),
@@ -349,6 +717,7 @@ async fn exact_red_herring_failure_is_preserved_without_evidence() {
                     .to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus,
@@ -394,6 +763,7 @@ async fn agent_can_search_before_final_verdict() {
             instruction: "Find token logging.".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus.clone(),
@@ -437,6 +807,7 @@ async fn malformed_provider_json_is_rejected_and_reprompted() {
             instruction: "Find token logging.".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus.clone(),
@@ -453,8 +824,11 @@ async fn malformed_provider_json_is_rejected_and_reprompted() {
 
 #[test]
 fn parses_search_text_tool_with_query_equals_typo() {
-    let turn =
-        parse_agent_turn(r#"{"action":"search_text","query="def ","kind":"source"}"#).unwrap();
+    let turn = parse_agent_turn(
+        r#"{"action":"search_text","query="def ","kind":"source"}"#,
+        None,
+    )
+    .unwrap();
 
     match turn {
         AgentTurn::SearchText { query, kind } => {
@@ -462,6 +836,45 @@ fn parses_search_text_tool_with_query_equals_typo() {
             assert_eq!(kind.as_deref(), Some("source"));
         }
         _ => panic!("expected search_text turn"),
+    }
+}
+
+#[test]
+fn parses_get_hunk_context_tool_with_hunk_id() {
+    let turn = parse_agent_turn(
+        r#"{"action":"get_hunk_context","hunk_id":"src/lib.rs#1"}"#,
+        None,
+    )
+    .unwrap();
+
+    match turn {
+        AgentTurn::GetHunkContext { hunk_id } => {
+            assert_eq!(hunk_id, "src/lib.rs#1");
+        }
+        _ => panic!("expected get_hunk_context turn"),
+    }
+}
+
+#[test]
+fn parses_text_final_verdict_with_default_status() {
+    let turn = parse_agent_turn(
+        r#"{"description":"safe marker found","severity":"low","evidence":[{"path":"src/workflows.rs","line":189,"preview":"// KOOCHI_SAFE_WORKFLOW_ROUTE_009"}]}"#,
+        Some(TestStatus::Passed),
+    )
+    .unwrap();
+
+    match turn {
+        AgentTurn::Final {
+            status,
+            severity,
+            evidence,
+            ..
+        } => {
+            assert!(matches!(status, StatusJson::Passed));
+            assert_eq!(severity, Some(Severity::Low));
+            assert_eq!(evidence.len(), 1);
+        }
+        _ => panic!("expected final turn"),
     }
 }
 
@@ -480,6 +893,7 @@ async fn accepts_plain_verdict_json_as_final_turn() {
             instruction: "Return this already-known non-code verdict.".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus.clone(),
@@ -528,6 +942,7 @@ async fn pass_fixture_check_rejects_failure_before_matching_safe_marker() {
             instruction: "Verify project lookups use parameterized SQL.".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus.clone(),
@@ -555,13 +970,6 @@ async fn fail_fixture_check_rejects_pass_after_matching_fail_marker() {
         r#"{"action":"search_text","query":"KOOCHI_FAIL_CONFIG_DISCOVERY_LIVE","kind":"source"}"#,
         r#"{"action":"read_file","path":"probe.rs"}"#,
         r#"{"action":"final","status":"passed","severity":null,"description":"marker is harmless","evidence":[]}"#,
-        r#"{
-                "action":"final",
-                "status":"failed",
-                "severity":"medium",
-                "description":"fail marker remains",
-                "evidence":[{"path":"probe.rs","line":1,"preview":"// KOOCHI_FAIL_CONFIG_DISCOVERY_LIVE"}]
-            }"#,
     ]));
     let verdicts = run_agents(
         vec![AgentSpec {
@@ -571,6 +979,7 @@ async fn fail_fixture_check_rejects_pass_after_matching_fail_marker() {
                 .to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus.clone(),
@@ -580,9 +989,65 @@ async fn fail_fixture_check_rejects_pass_after_matching_fail_marker() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 4);
+    assert_eq!(bus.request_count().await, 3);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence.len(), 1);
+    assert!(
+        verdicts[0]
+            .description
+            .contains("Matching failure breadcrumb")
+    );
+}
+
+#[tokio::test]
+async fn fixture_marker_seen_before_step_limit_produces_expected_verdict() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("probe.rs"),
+        "// KOOCHI_SAFE_TIMEOUT_RETRY_PAYMENT\n// KOOCHI_FAIL_NO_TIMEOUT_PAYMENT_CALL\n",
+    )
+    .unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"search_text","query":"KOOCHI_SAFE_TIMEOUT_RETRY_PAYMENT","kind":"source"}"#,
+        r#"{"action":"search_text","query":"KOOCHI_FAIL_NO_TIMEOUT_PAYMENT_CALL","kind":"source"}"#,
+    ]));
+    let verdicts = run_agents(
+        vec![
+            AgentSpec {
+                id: "pass-timeout-retry-payment".to_string(),
+                name: "pass-timeout-retry-payment".to_string(),
+                instruction: "Verify payment calls use timeout and retry handling.".to_string(),
+                model: "gpt-5-nano".to_string(),
+                severity: None,
+                initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+            },
+            AgentSpec {
+                id: "fail-no-timeout-payment-call".to_string(),
+                name: "fail-no-timeout-payment-call".to_string(),
+                instruction: "Do not call external payment APIs without timeout handling."
+                    .to_string(),
+                model: "gpt-5-nano".to_string(),
+                severity: Some(Severity::High),
+                initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+            },
+        ],
+        search,
+        bus,
+        2,
+        1,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert!(verdicts[0].description.contains("Matching safe breadcrumb"));
+    assert_eq!(verdicts[1].status, TestStatus::Failed);
+    assert!(
+        verdicts[1]
+            .description
+            .contains("Matching failure breadcrumb")
+    );
 }
 
 #[tokio::test]
@@ -601,6 +1066,7 @@ async fn honors_configured_agent_step_limit() {
             instruction: "Keep searching.".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus.clone(),
@@ -630,6 +1096,7 @@ async fn step_limit_failure_with_concrete_evidence_instruction_stays_failed() {
             instruction: "Find this issue with concrete evidence.".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
         }],
         search,
         bus,

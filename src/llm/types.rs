@@ -13,6 +13,13 @@ pub struct LlmTextResponse {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LlmTokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LlmAction {
     Tool(LlmToolCall),
@@ -23,6 +30,8 @@ pub enum LlmAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LlmToolCall {
     ListFiles { kind: Option<String> },
+    ListReviewHunks,
+    GetHunkContext { hunk_id: String },
     SearchText { query: String, kind: Option<String> },
     ReadFile { path: String },
     GetFileContext { path: String, line: u32 },

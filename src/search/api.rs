@@ -1,5 +1,6 @@
 use super::file_kind::FileKind;
 use crate::FilePath;
+use crate::scope::ReviewHunk;
 use async_trait::async_trait;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -10,6 +11,25 @@ pub struct ListFilesRequest {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ListFilesResponse {
     pub files: Vec<FilePath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ListReviewHunksResponse {
+    pub hunks: Vec<ReviewHunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GetHunkContextRequest {
+    pub hunk_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GetHunkContextResponse {
+    pub hunk_id: String,
+    pub path: FilePath,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -118,6 +138,13 @@ pub trait CodeSearchApi: Send + Sync {
         &self,
         request: ListFilesRequest,
     ) -> Result<ListFilesResponse, Self::Error>;
+
+    async fn list_review_hunks(&self) -> Result<ListReviewHunksResponse, Self::Error>;
+
+    async fn get_hunk_context(
+        &self,
+        request: GetHunkContextRequest,
+    ) -> Result<GetHunkContextResponse, Self::Error>;
 
     async fn search_text(
         &self,

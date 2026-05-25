@@ -285,8 +285,15 @@ fn copy_dir(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).unwrap();
     for entry in fs::read_dir(source).unwrap() {
         let entry = entry.unwrap();
+        let file_name = entry.file_name();
+        if matches!(
+            file_name.to_str(),
+            Some("target" | ".koochi" | "Cargo.lock")
+        ) {
+            continue;
+        }
         let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
+        let destination_path = destination.join(file_name);
         if source_path.is_dir() {
             copy_dir(&source_path, &destination_path);
         } else {

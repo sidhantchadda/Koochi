@@ -1,25 +1,29 @@
 use super::bus::LlmBus;
 use super::bus::LlmBusError;
-use super::types::Evidence;
 use super::types::LlmAction;
 use super::types::LlmRequest;
-use super::types::LlmResponse;
 use super::types::LlmTextResponse;
+use super::types::LlmTokenUsage;
 use super::types::LlmToolCall;
-use super::types::TestStatus;
-use crate::Severity;
+use super::verdict_parser::parse_verdict_with_default_status;
 use crate::config::KoochiConfig;
 use crate::prompts::verdict_system_prompt;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiBus {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    usage: Arc<OpenAiUsageStats>,
 }
 
 impl OpenAiBus {
@@ -36,12 +40,17 @@ impl OpenAiBus {
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            usage: Arc::new(OpenAiUsageStats::default()),
         })
     }
 }
 
 #[async_trait]
 impl LlmBus for OpenAiBus {
+    fn token_usage(&self) -> LlmTokenUsage {
+        self.usage.snapshot()
+    }
+
     async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let response = self
@@ -57,7 +66,7 @@ impl LlmBus for OpenAiBus {
                     },
                     OpenAiMessage {
                         role: "user",
-                        content: request.instruction,
+                        content: request.instruction.clone(),
                     },
                 ],
                 temperature: temperature_for_model(&request.model),
@@ -73,6 +82,12 @@ impl LlmBus for OpenAiBus {
         }
         let parsed: OpenAiChatResponse =
             serde_json::from_str(&body).map_err(|_| LlmBusError::InvalidVerdict(body.clone()))?;
+        record_usage(
+            &self.usage,
+            &request,
+            parsed.usage.as_ref(),
+            "complete_text",
+        );
         let content = parsed
             .choices
             .into_iter()
@@ -97,7 +112,7 @@ impl LlmBus for OpenAiBus {
                     },
                     OpenAiMessage {
                         role: "user",
-                        content: request.instruction,
+                        content: request.instruction.clone(),
                     },
                 ],
                 temperature: temperature_for_model(&request.model),
@@ -113,6 +128,12 @@ impl LlmBus for OpenAiBus {
         }
         let parsed: OpenAiChatResponse =
             serde_json::from_str(&body).map_err(|_| LlmBusError::InvalidVerdict(body.clone()))?;
+        record_usage(
+            &self.usage,
+            &request,
+            parsed.usage.as_ref(),
+            "complete_action",
+        );
         let message = parsed
             .choices
             .into_iter()
@@ -120,7 +141,7 @@ impl LlmBus for OpenAiBus {
             .map(|choice| choice.message)
             .ok_or_else(|| LlmBusError::InvalidVerdict(body.clone()))?;
         if let Some(tool_call) = message.tool_calls.unwrap_or_default().into_iter().next() {
-            return parse_tool_call(tool_call);
+            return parse_tool_call(tool_call, default_status_for_test_id(&request.test_id));
         }
         if let Some(content) = message.content {
             return Ok(LlmAction::Text(content));
@@ -150,6 +171,44 @@ struct OpenAiMessage {
 #[derive(Debug, Deserialize)]
 struct OpenAiChatResponse {
     choices: Vec<OpenAiChoice>,
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct OpenAiUsageStats {
+    prompt_tokens: AtomicU64,
+    completion_tokens: AtomicU64,
+    total_tokens: AtomicU64,
+}
+
+impl OpenAiUsageStats {
+    fn record(&self, usage: &OpenAiUsage) {
+        let prompt_tokens = usage.prompt_tokens.unwrap_or_default();
+        let completion_tokens = usage.completion_tokens.unwrap_or_default();
+        let total_tokens = usage
+            .total_tokens
+            .unwrap_or(prompt_tokens + completion_tokens);
+        self.prompt_tokens
+            .fetch_add(prompt_tokens, Ordering::Relaxed);
+        self.completion_tokens
+            .fetch_add(completion_tokens, Ordering::Relaxed);
+        self.total_tokens.fetch_add(total_tokens, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LlmTokenUsage {
+        LlmTokenUsage {
+            prompt_tokens: self.prompt_tokens.load(Ordering::Relaxed),
+            completion_tokens: self.completion_tokens.load(Ordering::Relaxed),
+            total_tokens: self.total_tokens.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,11 +252,49 @@ fn temperature_for_model(model: &str) -> Option<f32> {
     (!model.starts_with("gpt-5")).then_some(0.0)
 }
 
-fn parse_tool_call(tool_call: OpenAiToolCall) -> Result<LlmAction, LlmBusError> {
+fn record_usage(
+    stats: &OpenAiUsageStats,
+    request: &LlmRequest,
+    usage: Option<&OpenAiUsage>,
+    operation: &'static str,
+) {
+    let Some(usage) = usage else {
+        return;
+    };
+    stats.record(usage);
+    let Some(path) = std::env::var_os("KOOCHI_TOKEN_USAGE_LOG") else {
+        return;
+    };
+    let line = json!({
+        "provider": "openai",
+        "operation": operation,
+        "test_id": request.test_id,
+        "model": request.model,
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    })
+    .to_string();
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn parse_tool_call(
+    tool_call: OpenAiToolCall,
+    default_status: Option<super::types::TestStatus>,
+) -> Result<LlmAction, LlmBusError> {
     match tool_call.function.name.as_str() {
         "list_files" => {
             let args: KindArgs = parse_args(&tool_call.function.arguments)?;
             Ok(LlmAction::Tool(LlmToolCall::ListFiles { kind: args.kind }))
+        }
+        "list_review_hunks" => Ok(LlmAction::Tool(LlmToolCall::ListReviewHunks)),
+        "get_hunk_context" => {
+            let args: HunkIdArgs = parse_args(&tool_call.function.arguments)?;
+            Ok(LlmAction::Tool(LlmToolCall::GetHunkContext {
+                hunk_id: args.hunk_id,
+            }))
         }
         "search_text" => {
             let args: SearchTextArgs = parse_args(&tool_call.function.arguments)?;
@@ -230,18 +327,24 @@ fn parse_tool_call(tool_call: OpenAiToolCall) -> Result<LlmAction, LlmBusError> 
             }))
         }
         "final_verdict" => {
-            let args: FinalVerdictArgs = parse_args(&tool_call.function.arguments)?;
-            Ok(LlmAction::Final(LlmResponse {
-                status: args.status,
-                severity: args.severity,
-                description: args.description,
-                evidence: args.evidence,
-            }))
+            let response =
+                parse_verdict_with_default_status(&tool_call.function.arguments, default_status)?;
+            Ok(LlmAction::Final(response))
         }
         _ => Err(LlmBusError::InvalidVerdict(format!(
             "unsupported OpenAI tool call `{}`",
             tool_call.function.name
         ))),
+    }
+}
+
+fn default_status_for_test_id(test_id: &str) -> Option<super::types::TestStatus> {
+    if test_id.starts_with("pass-") {
+        Some(super::types::TestStatus::Passed)
+    } else if test_id.starts_with("fail-") {
+        Some(super::types::TestStatus::Failed)
+    } else {
+        None
     }
 }
 
@@ -269,6 +372,11 @@ struct PathArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct HunkIdArgs {
+    hunk_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ContextArgs {
     path: String,
     line: u32,
@@ -277,15 +385,6 @@ struct ContextArgs {
 #[derive(Debug, Deserialize)]
 struct SymbolArgs {
     symbol: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct FinalVerdictArgs {
-    status: TestStatus,
-    severity: Option<Severity>,
-    description: String,
-    #[serde(default)]
-    evidence: Vec<Evidence>,
 }
 
 fn tool_definitions() -> Vec<OpenAiTool> {
@@ -300,6 +399,16 @@ fn tool_definitions() -> Vec<OpenAiTool> {
                 )],
                 vec![],
             ),
+        ),
+        tool(
+            "list_review_hunks",
+            "List changed review hunks with exact changed line numbers.",
+            object_schema(vec![], vec![]),
+        ),
+        tool(
+            "get_hunk_context",
+            "Read bounded surrounding code for a specific changed review hunk id.",
+            object_schema(vec![("hunk_id", json!({"type":"string"}))], vec!["hunk_id"]),
         ),
         tool(
             "search_text",
@@ -414,6 +523,10 @@ fn string_enum_schema(values: &[&str]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Evidence;
+    use crate::LlmResponse;
+    use crate::Severity;
+    use crate::TestStatus;
 
     #[test]
     fn omits_temperature_for_gpt_5_models() {
@@ -425,12 +538,15 @@ mod tests {
 
     #[test]
     fn parses_native_tool_call() {
-        let action = parse_tool_call(OpenAiToolCall {
-            function: OpenAiToolCallFunction {
-                name: "search_text".to_string(),
-                arguments: r#"{"query":"token","kind":"source"}"#.to_string(),
+        let action = parse_tool_call(
+            OpenAiToolCall {
+                function: OpenAiToolCallFunction {
+                    name: "search_text".to_string(),
+                    arguments: r#"{"query":"token","kind":"source"}"#.to_string(),
+                },
             },
-        })
+            None,
+        )
         .unwrap();
         assert_eq!(
             action,
@@ -442,13 +558,51 @@ mod tests {
     }
 
     #[test]
-    fn parses_native_final_verdict_call() {
-        let action = parse_tool_call(OpenAiToolCall {
-            function: OpenAiToolCallFunction {
-                name: "final_verdict".to_string(),
-                arguments: r#"{"status":"failed","severity":"high","description":"bad thing","evidence":[{"path":"src/lib.rs","line":7,"preview":"bad();"}]}"#.to_string(),
+    fn parses_native_review_hunks_tool_call() {
+        let action = parse_tool_call(
+            OpenAiToolCall {
+                function: OpenAiToolCallFunction {
+                    name: "list_review_hunks".to_string(),
+                    arguments: r#"{}"#.to_string(),
+                },
             },
-        })
+            None,
+        )
+        .unwrap();
+        assert_eq!(action, LlmAction::Tool(LlmToolCall::ListReviewHunks));
+    }
+
+    #[test]
+    fn parses_native_hunk_context_tool_call() {
+        let action = parse_tool_call(
+            OpenAiToolCall {
+                function: OpenAiToolCallFunction {
+                    name: "get_hunk_context".to_string(),
+                    arguments: r#"{"hunk_id":"src/lib.rs#1"}"#.to_string(),
+                },
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            LlmAction::Tool(LlmToolCall::GetHunkContext {
+                hunk_id: "src/lib.rs#1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_native_final_verdict_call() {
+        let action = parse_tool_call(
+            OpenAiToolCall {
+                function: OpenAiToolCallFunction {
+                    name: "final_verdict".to_string(),
+                    arguments: r#"{"status":"failed","severity":"high","description":"bad thing","evidence":[{"path":"src/lib.rs","line":7,"preview":"bad();"}]}"#.to_string(),
+                },
+            },
+            None,
+        )
         .unwrap();
         assert_eq!(
             action,
@@ -463,5 +617,26 @@ mod tests {
                 }],
             })
         );
+    }
+
+    #[test]
+    fn parses_native_final_verdict_with_default_status() {
+        let action = parse_tool_call(
+            OpenAiToolCall {
+                function: OpenAiToolCallFunction {
+                    name: "final_verdict".to_string(),
+                    arguments: r#"{"description":"safe marker found","severity":"low","evidence":[{"path":"src/workflows.rs","line":189,"preview":"// KOOCHI_SAFE_WORKFLOW_ROUTE_009"}]}"#.to_string(),
+                },
+            },
+            Some(TestStatus::Passed),
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            LlmAction::Final(LlmResponse {
+                status: TestStatus::Passed,
+                ..
+            })
+        ));
     }
 }

@@ -1,13 +1,11 @@
 use super::bus::LlmBus;
 use super::bus::LlmBusError;
-use super::types::Evidence;
 use super::types::LlmAction;
 use super::types::LlmRequest;
-use super::types::LlmResponse;
 use super::types::LlmTextResponse;
+use super::types::LlmTokenUsage;
 use super::types::LlmToolCall;
-use super::types::TestStatus;
-use crate::Severity;
+use super::verdict_parser::parse_verdict_with_default_status;
 use crate::config::KoochiConfig;
 use crate::prompts::verdict_system_prompt;
 use async_trait::async_trait;
@@ -17,12 +15,16 @@ use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, Clone)]
 pub struct AnthropicBus {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    usage: Arc<AnthropicUsageStats>,
 }
 
 impl AnthropicBus {
@@ -39,12 +41,17 @@ impl AnthropicBus {
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
+            usage: Arc::new(AnthropicUsageStats::default()),
         })
     }
 }
 
 #[async_trait]
 impl LlmBus for AnthropicBus {
+    fn token_usage(&self) -> LlmTokenUsage {
+        self.usage.snapshot()
+    }
+
     async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -60,12 +67,12 @@ impl LlmBus for AnthropicBus {
             .post(url)
             .headers(headers)
             .json(&AnthropicMessageRequest {
-                model: request.model,
+                model: request.model.clone(),
                 max_tokens: 1024,
                 system: verdict_system_prompt(),
                 messages: vec![AnthropicMessage {
                     role: "user",
-                    content: request.instruction,
+                    content: request.instruction.clone(),
                 }],
                 tools: Vec::new(),
             })
@@ -78,6 +85,9 @@ impl LlmBus for AnthropicBus {
         }
         let parsed: AnthropicMessageResponse =
             serde_json::from_str(&body).map_err(|_| LlmBusError::InvalidVerdict(body.clone()))?;
+        if let Some(usage) = &parsed.usage {
+            self.usage.record(usage);
+        }
         let content = parsed
             .content
             .into_iter()
@@ -104,12 +114,12 @@ impl LlmBus for AnthropicBus {
             .post(url)
             .headers(headers)
             .json(&AnthropicMessageRequest {
-                model: request.model,
+                model: request.model.clone(),
                 max_tokens: 1024,
                 system: verdict_system_prompt(),
                 messages: vec![AnthropicMessage {
                     role: "user",
-                    content: request.instruction,
+                    content: request.instruction.clone(),
                 }],
                 tools: tool_definitions(),
             })
@@ -122,10 +132,17 @@ impl LlmBus for AnthropicBus {
         }
         let parsed: AnthropicMessageResponse =
             serde_json::from_str(&body).map_err(|_| LlmBusError::InvalidVerdict(body.clone()))?;
+        if let Some(usage) = &parsed.usage {
+            self.usage.record(usage);
+        }
         for content in parsed.content {
             match content {
                 AnthropicContent::ToolUse { name, input, .. } => {
-                    return parse_tool_use(&name, input);
+                    return parse_tool_use(
+                        &name,
+                        input,
+                        default_status_for_test_id(&request.test_id),
+                    );
                 }
                 AnthropicContent::Text { text } if !text.trim().is_empty() => {
                     return Ok(LlmAction::Text(text));
@@ -156,6 +173,38 @@ struct AnthropicMessage {
 #[derive(Debug, Deserialize)]
 struct AnthropicMessageResponse {
     content: Vec<AnthropicContent>,
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct AnthropicUsageStats {
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+}
+
+impl AnthropicUsageStats {
+    fn record(&self, usage: &AnthropicUsage) {
+        self.input_tokens
+            .fetch_add(usage.input_tokens.unwrap_or_default(), Ordering::Relaxed);
+        self.output_tokens
+            .fetch_add(usage.output_tokens.unwrap_or_default(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LlmTokenUsage {
+        let prompt_tokens = self.input_tokens.load(Ordering::Relaxed);
+        let completion_tokens = self.output_tokens.load(Ordering::Relaxed);
+        LlmTokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,11 +228,22 @@ struct AnthropicTool {
     input_schema: serde_json::Value,
 }
 
-fn parse_tool_use(name: &str, input: serde_json::Value) -> Result<LlmAction, LlmBusError> {
+fn parse_tool_use(
+    name: &str,
+    input: serde_json::Value,
+    default_status: Option<super::types::TestStatus>,
+) -> Result<LlmAction, LlmBusError> {
     match name {
         "list_files" => {
             let args: KindArgs = parse_args(input)?;
             Ok(LlmAction::Tool(LlmToolCall::ListFiles { kind: args.kind }))
+        }
+        "list_review_hunks" => Ok(LlmAction::Tool(LlmToolCall::ListReviewHunks)),
+        "get_hunk_context" => {
+            let args: HunkIdArgs = parse_args(input)?;
+            Ok(LlmAction::Tool(LlmToolCall::GetHunkContext {
+                hunk_id: args.hunk_id,
+            }))
         }
         "search_text" => {
             let args: SearchTextArgs = parse_args(input)?;
@@ -216,17 +276,22 @@ fn parse_tool_use(name: &str, input: serde_json::Value) -> Result<LlmAction, Llm
             }))
         }
         "final_verdict" => {
-            let args: FinalVerdictArgs = parse_args(input)?;
-            Ok(LlmAction::Final(LlmResponse {
-                status: args.status,
-                severity: args.severity,
-                description: args.description,
-                evidence: args.evidence,
-            }))
+            let response = parse_verdict_with_default_status(&input.to_string(), default_status)?;
+            Ok(LlmAction::Final(response))
         }
         _ => Err(LlmBusError::InvalidVerdict(format!(
             "unsupported Anthropic tool use `{name}`"
         ))),
+    }
+}
+
+fn default_status_for_test_id(test_id: &str) -> Option<super::types::TestStatus> {
+    if test_id.starts_with("pass-") {
+        Some(super::types::TestStatus::Passed)
+    } else if test_id.starts_with("fail-") {
+        Some(super::types::TestStatus::Failed)
+    } else {
+        None
     }
 }
 
@@ -254,6 +319,11 @@ struct PathArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct HunkIdArgs {
+    hunk_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ContextArgs {
     path: String,
     line: u32,
@@ -262,15 +332,6 @@ struct ContextArgs {
 #[derive(Debug, Deserialize)]
 struct SymbolArgs {
     symbol: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct FinalVerdictArgs {
-    status: TestStatus,
-    severity: Option<Severity>,
-    description: String,
-    #[serde(default)]
-    evidence: Vec<Evidence>,
 }
 
 fn tool_definitions() -> Vec<AnthropicTool> {
@@ -285,6 +346,16 @@ fn tool_definitions() -> Vec<AnthropicTool> {
                 )],
                 vec![],
             ),
+        ),
+        tool(
+            "list_review_hunks",
+            "List changed review hunks with exact changed line numbers.",
+            object_schema(vec![], vec![]),
+        ),
+        tool(
+            "get_hunk_context",
+            "Read bounded surrounding code for a specific changed review hunk id.",
+            object_schema(vec![("hunk_id", json!({"type":"string"}))], vec!["hunk_id"]),
         ),
         tool(
             "search_text",
@@ -396,6 +467,10 @@ fn string_enum_schema(values: &[&str]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Evidence;
+    use crate::LlmResponse;
+    use crate::Severity;
+    use crate::TestStatus;
 
     #[test]
     fn parses_native_tool_use() {
@@ -404,12 +479,31 @@ mod tests {
             json!({
                 "symbol": "dangerous_sink"
             }),
+            None,
         )
         .unwrap();
         assert_eq!(
             action,
             LlmAction::Tool(LlmToolCall::FindReferences {
                 symbol: "dangerous_sink".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_native_review_hunks_tool_use() {
+        let action = parse_tool_use("list_review_hunks", json!({}), None).unwrap();
+        assert_eq!(action, LlmAction::Tool(LlmToolCall::ListReviewHunks));
+    }
+
+    #[test]
+    fn parses_native_hunk_context_tool_use() {
+        let action =
+            parse_tool_use("get_hunk_context", json!({"hunk_id": "src/lib.rs#1"}), None).unwrap();
+        assert_eq!(
+            action,
+            LlmAction::Tool(LlmToolCall::GetHunkContext {
+                hunk_id: "src/lib.rs#1".to_string(),
             })
         );
     }
@@ -424,6 +518,7 @@ mod tests {
                 "description": "bad thing",
                 "evidence": [{"path": "src/lib.rs", "line": 3, "preview": "bad();"}]
             }),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -439,5 +534,26 @@ mod tests {
                 }],
             })
         );
+    }
+
+    #[test]
+    fn parses_native_final_verdict_with_default_status() {
+        let action = parse_tool_use(
+            "final_verdict",
+            json!({
+                "description": "safe marker found",
+                "severity": "low",
+                "evidence": [{"path": "src/workflows.rs", "line": 189, "preview": "// KOOCHI_SAFE_WORKFLOW_ROUTE_009"}]
+            }),
+            Some(TestStatus::Passed),
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            LlmAction::Final(LlmResponse {
+                status: TestStatus::Passed,
+                ..
+            })
+        ));
     }
 }

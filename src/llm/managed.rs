@@ -4,6 +4,7 @@ use super::types::LlmAction;
 use super::types::LlmRequest;
 use super::types::LlmResponse;
 use super::types::LlmTextResponse;
+use super::types::LlmTokenUsage;
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -48,6 +49,7 @@ pub struct ManagedLlmBusStats {
 pub struct ManagedLlmBusStatsSnapshot {
     pub provider_calls: usize,
     pub retry_attempts: usize,
+    pub token_usage: LlmTokenUsage,
 }
 
 impl ManagedLlmBus {
@@ -68,6 +70,7 @@ impl ManagedLlmBus {
         ManagedLlmBusStatsSnapshot {
             provider_calls: self.stats.provider_calls.load(Ordering::Relaxed),
             retry_attempts: self.stats.retry_attempts.load(Ordering::Relaxed),
+            token_usage: self.inner.token_usage(),
         }
     }
 
@@ -112,6 +115,10 @@ impl ManagedLlmBus {
 
 #[async_trait]
 impl LlmBus for ManagedLlmBus {
+    fn token_usage(&self) -> LlmTokenUsage {
+        self.inner.token_usage()
+    }
+
     async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
         let _permit = self
             .semaphore
@@ -202,6 +209,7 @@ mod tests {
             ManagedLlmBusStatsSnapshot {
                 provider_calls: 2,
                 retry_attempts: 1,
+                token_usage: LlmTokenUsage::default(),
             }
         );
     }

@@ -1,5 +1,8 @@
 use super::*;
-use crate::scope::{GitRevision, RepoScope, ReviewMode, ReviewScope, ScopeConfig};
+use crate::scope::{
+    GitRevision, RepoScope, ReviewHunk, ReviewHunkLine, ReviewLineKind, ReviewMode, ReviewScope,
+    ScopeConfig,
+};
 use crate::search::SymbolKind;
 
 fn session(root: PathBuf) -> LocalSearchSession {
@@ -12,6 +15,7 @@ fn session(root: PathBuf) -> LocalSearchSession {
         review: ReviewScope {
             mode: ReviewMode::FullRepoFallback,
             files: Vec::new(),
+            hunks: Vec::new(),
             commit: None,
         },
         accessible_repos: Vec::new(),
@@ -47,6 +51,24 @@ async fn searches_and_reads_files() {
 }
 
 #[tokio::test]
+async fn file_listing_skips_git_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join(".git")).unwrap();
+    std::fs::write(temp.path().join(".git").join("index"), b"\xff\x00not utf8").unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn real_code() {}\n").unwrap();
+    let search = session(temp.path().to_path_buf());
+
+    let files = search
+        .list_files(ListFilesRequest {
+            kind: FileKind::All,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(files.files, vec!["lib.rs"]);
+}
+
+#[tokio::test]
 async fn list_review_files_uses_review_scope_when_present() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("changed.rs"), "fn changed() {}\n").unwrap();
@@ -60,6 +82,7 @@ async fn list_review_files_uses_review_scope_when_present() {
         review: ReviewScope {
             mode: ReviewMode::LocalChanges,
             files: vec!["changed.rs".to_string()],
+            hunks: Vec::new(),
             commit: None,
         },
         accessible_repos: Vec::new(),
@@ -83,6 +106,114 @@ async fn list_review_files_uses_review_scope_when_present() {
         .await
         .unwrap();
     assert_eq!(all_files.files, vec!["changed.rs", "unchanged.rs"]);
+}
+
+#[tokio::test]
+async fn list_review_hunks_uses_review_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let search = LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "test".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::LocalChanges,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "fn changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    });
+
+    let hunks = search.list_review_hunks().await.unwrap();
+    assert_eq!(hunks.hunks.len(), 1);
+    assert_eq!(hunks.hunks[0].id, "changed.rs#1");
+    assert_eq!(hunks.hunks[0].lines[0].content, "fn changed() {}");
+}
+
+#[tokio::test]
+async fn get_hunk_context_returns_context_around_hunk() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "one\ntwo\nthree\nfour\nfive\n",
+    )
+    .unwrap();
+    let search = LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "test".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::LocalChanges,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 3,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(3),
+                    content: "three".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    });
+
+    let context = search
+        .get_hunk_context(GetHunkContextRequest {
+            hunk_id: "changed.rs#1".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(context.hunk_id, "changed.rs#1");
+    assert_eq!(context.path, "changed.rs");
+    assert_eq!(context.start_line, 1);
+    assert_eq!(context.end_line, 5);
+    assert!(context.content.contains("three"));
+}
+
+#[tokio::test]
+async fn get_hunk_context_rejects_unknown_hunk() {
+    let temp = tempfile::tempdir().unwrap();
+    let search = session(temp.path().to_path_buf());
+
+    let error = search
+        .get_hunk_context(GetHunkContextRequest {
+            hunk_id: "missing#1".to_string(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "unknown review hunk id `missing#1`");
 }
 
 #[tokio::test]

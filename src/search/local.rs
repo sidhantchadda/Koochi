@@ -6,8 +6,11 @@ use super::api::FindReferencesRequest;
 use super::api::FindReferencesResponse;
 use super::api::GetFileContextRequest;
 use super::api::GetFileContextResponse;
+use super::api::GetHunkContextRequest;
+use super::api::GetHunkContextResponse;
 use super::api::ListFilesRequest;
 use super::api::ListFilesResponse;
+use super::api::ListReviewHunksResponse;
 use super::api::ReadFileRequest;
 use super::api::ReadFileResponse;
 use super::api::ReferenceMatch;
@@ -45,6 +48,8 @@ pub enum SearchError {
     },
     #[error("invalid regex used by heuristic search: {0}")]
     Regex(#[from] regex::Error),
+    #[error("unknown review hunk id `{0}`")]
+    UnknownHunk(String),
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +62,7 @@ pub struct LocalSearchSession {
 #[derive(Debug, Default)]
 struct SearchCache {
     files: HashMap<FileKind, Vec<FilePath>>,
+    review_files: HashMap<FileKind, Vec<FilePath>>,
     contents: HashMap<FilePath, ReadFileResponse>,
     read_locks: HashMap<FilePath, Arc<Mutex<()>>>,
     text: HashMap<SearchTextRequest, SearchTextResponse>,
@@ -72,6 +78,7 @@ struct SearchStats {
     list_review_files_misses: AtomicUsize,
     read_file_hits: AtomicUsize,
     read_file_misses: AtomicUsize,
+    get_hunk_context_calls: AtomicUsize,
     get_file_context_calls: AtomicUsize,
     search_text_hits: AtomicUsize,
     search_text_misses: AtomicUsize,
@@ -89,6 +96,7 @@ pub struct SearchStatsSnapshot {
     pub list_review_files_misses: usize,
     pub read_file_hits: usize,
     pub read_file_misses: usize,
+    pub get_hunk_context_calls: usize,
     pub get_file_context_calls: usize,
     pub search_text_hits: usize,
     pub search_text_misses: usize,
@@ -119,6 +127,7 @@ impl LocalSearchSession {
             list_review_files_misses: self.stats.list_review_files_misses.load(Ordering::Relaxed),
             read_file_hits: self.stats.read_file_hits.load(Ordering::Relaxed),
             read_file_misses: self.stats.read_file_misses.load(Ordering::Relaxed),
+            get_hunk_context_calls: self.stats.get_hunk_context_calls.load(Ordering::Relaxed),
             get_file_context_calls: self.stats.get_file_context_calls.load(Ordering::Relaxed),
             search_text_hits: self.stats.search_text_hits.load(Ordering::Relaxed),
             search_text_misses: self.stats.search_text_misses.load(Ordering::Relaxed),
@@ -169,10 +178,24 @@ impl CodeSearchApi for LocalSearchSession {
             return self.list_files(request).await;
         }
 
+        if let Some(files) = self
+            .cache
+            .lock()
+            .await
+            .review_files
+            .get(&request.kind)
+            .cloned()
+        {
+            self.stats
+                .list_review_files_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(ListFilesResponse { files });
+        }
+
         self.stats
             .list_review_files_misses
             .fetch_add(1, Ordering::Relaxed);
-        let files = self
+        let files: Vec<FilePath> = self
             .scope
             .review
             .files
@@ -181,7 +204,54 @@ impl CodeSearchApi for LocalSearchSession {
             .filter(|path| self.scope.primary_repo.root.join(path).is_file())
             .cloned()
             .collect();
+        self.cache
+            .lock()
+            .await
+            .review_files
+            .insert(request.kind, files.clone());
         Ok(ListFilesResponse { files })
+    }
+
+    async fn list_review_hunks(&self) -> Result<ListReviewHunksResponse, Self::Error> {
+        Ok(ListReviewHunksResponse {
+            hunks: self.scope.review.hunks.clone(),
+        })
+    }
+
+    async fn get_hunk_context(
+        &self,
+        request: GetHunkContextRequest,
+    ) -> Result<GetHunkContextResponse, Self::Error> {
+        self.stats
+            .get_hunk_context_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let hunk = self
+            .scope
+            .review
+            .hunks
+            .iter()
+            .find(|hunk| hunk.id == request.hunk_id)
+            .cloned()
+            .ok_or_else(|| SearchError::UnknownHunk(request.hunk_id.clone()))?;
+        let line = hunk
+            .lines
+            .iter()
+            .find_map(|line| line.new_line)
+            .or_else(|| hunk.lines.iter().find_map(|line| line.old_line))
+            .unwrap_or(hunk.new_start.max(1));
+        let context = self
+            .get_file_context(GetFileContextRequest {
+                path: hunk.path.clone(),
+                line,
+            })
+            .await?;
+        Ok(GetHunkContextResponse {
+            hunk_id: hunk.id,
+            path: context.path,
+            start_line: context.start_line,
+            end_line: context.end_line,
+            content: context.content,
+        })
     }
 
     async fn search_text(
@@ -415,6 +485,9 @@ fn collect_files(root: &Path, kind: FileKind) -> Result<Vec<FilePath>, SearchErr
     for entry in walker {
         let entry = entry.map_err(SearchError::Walk)?;
         let path = entry.path();
+        if is_git_metadata(path) {
+            continue;
+        }
         if !path.is_file() {
             continue;
         }
@@ -447,6 +520,11 @@ fn scoped_path(root: &Path, relative: &str) -> Result<PathBuf, SearchError> {
         return Err(SearchError::OutsideRepo(relative.to_string()));
     }
     Ok(path)
+}
+
+fn is_git_metadata(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == ".git")
 }
 
 fn path_to_unix(path: &Path) -> String {

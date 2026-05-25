@@ -32,6 +32,7 @@ pub struct ScopeConfig {
 pub struct ReviewScope {
     pub mode: ReviewMode,
     pub files: Vec<FilePath>,
+    pub hunks: Vec<ReviewHunk>,
     pub commit: Option<CommitInfo>,
 }
 
@@ -46,6 +47,33 @@ pub enum ReviewMode {
 pub struct CommitInfo {
     pub short_id: String,
     pub subject: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct ReviewHunk {
+    pub id: String,
+    pub path: FilePath,
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    pub lines: Vec<ReviewHunkLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct ReviewHunkLine {
+    pub kind: ReviewLineKind,
+    pub old_line: Option<u32>,
+    pub new_line: Option<u32>,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewLineKind {
+    Added,
+    Removed,
+    Context,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -82,6 +110,7 @@ pub struct AgentSpec {
     pub instruction: String,
     pub model: String,
     pub severity: Option<crate::Severity>,
+    pub initial_context_token_budget: usize,
 }
 
 pub fn build_scope(config: &KoochiConfig, config_dir: PathBuf) -> Result<ScopeConfig, ScopeError> {
@@ -106,7 +135,14 @@ pub fn build_scope(config: &KoochiConfig, config_dir: PathBuf) -> Result<ScopeCo
         revision: parse_revision(&config.repo.revision),
     };
     let review = build_review_scope(&root);
-    let agents = config.tests.iter().map(AgentSpec::from).collect();
+    let agents = config
+        .tests
+        .iter()
+        .map(|test| AgentSpec {
+            initial_context_token_budget: config.initial_context_token_budget,
+            ..AgentSpec::from(test)
+        })
+        .collect();
     Ok(ScopeConfig {
         primary_repo,
         review,
@@ -122,6 +158,7 @@ fn build_review_scope(root: &std::path::Path) -> ReviewScope {
         return ReviewScope {
             mode: ReviewMode::FullRepoFallback,
             files: Vec::new(),
+            hunks: Vec::new(),
             commit: None,
         };
     }
@@ -130,6 +167,7 @@ fn build_review_scope(root: &std::path::Path) -> ReviewScope {
         if !files.is_empty() {
             return ReviewScope {
                 mode: ReviewMode::LocalChanges,
+                hunks: local_changed_hunks(root).unwrap_or_default(),
                 files,
                 commit: None,
             };
@@ -138,6 +176,7 @@ fn build_review_scope(root: &std::path::Path) -> ReviewScope {
         return ReviewScope {
             mode: ReviewMode::FullRepoFallback,
             files: Vec::new(),
+            hunks: Vec::new(),
             commit: None,
         };
     }
@@ -145,6 +184,7 @@ fn build_review_scope(root: &std::path::Path) -> ReviewScope {
     if let Some(files) = head_commit_files(root) {
         return ReviewScope {
             mode: ReviewMode::HeadCommit,
+            hunks: head_commit_hunks(root).unwrap_or_default(),
             files,
             commit: head_commit_info(root),
         };
@@ -153,6 +193,7 @@ fn build_review_scope(root: &std::path::Path) -> ReviewScope {
     ReviewScope {
         mode: ReviewMode::FullRepoFallback,
         files: Vec::new(),
+        hunks: Vec::new(),
         commit: None,
     }
 }
@@ -240,6 +281,186 @@ fn head_commit_files(root: &std::path::Path) -> Option<Vec<FilePath>> {
     Some(files)
 }
 
+fn local_changed_hunks(root: &std::path::Path) -> Option<Vec<ReviewHunk>> {
+    let mut hunks = git_diff_hunks(root, &["diff", "--unified=0", "--no-ext-diff", "HEAD"])?;
+    let tracked_paths = hunks
+        .iter()
+        .map(|hunk| hunk.path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for path in local_changed_files(root)? {
+        if tracked_paths.contains(&path) || is_koochi_local_file(&path) {
+            continue;
+        }
+        if let Some(hunk) = untracked_file_hunk(root, &path) {
+            hunks.push(hunk);
+        }
+    }
+    renumber_hunks(&mut hunks);
+    Some(hunks)
+}
+
+fn head_commit_hunks(root: &std::path::Path) -> Option<Vec<ReviewHunk>> {
+    git_diff_hunks(
+        root,
+        &["show", "--format=", "--unified=0", "--no-ext-diff", "HEAD"],
+    )
+}
+
+fn git_diff_hunks(root: &std::path::Path, args: &[&str]) -> Option<Vec<ReviewHunk>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_unified_diff(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn untracked_file_hunk(root: &std::path::Path, path: &str) -> Option<ReviewHunk> {
+    let content = std::fs::read_to_string(root.join(path)).ok()?;
+    let lines = content
+        .lines()
+        .enumerate()
+        .map(|(index, line)| ReviewHunkLine {
+            kind: ReviewLineKind::Added,
+            old_line: None,
+            new_line: Some((index + 1) as u32),
+            content: line.to_string(),
+        })
+        .collect::<Vec<_>>();
+    Some(ReviewHunk {
+        id: String::new(),
+        path: path.to_string(),
+        old_start: 0,
+        old_lines: 0,
+        new_start: 1,
+        new_lines: lines.len() as u32,
+        lines,
+    })
+}
+
+fn parse_unified_diff(diff: &str) -> Vec<ReviewHunk> {
+    let mut hunks = Vec::new();
+    let mut current_path: Option<FilePath> = None;
+    let mut current_hunk: Option<ReviewHunk> = None;
+    let mut old_line = 0_u32;
+    let mut new_line = 0_u32;
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            if let Some(hunk) = current_hunk.take() {
+                hunks.push(hunk);
+            }
+            current_path = None;
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            current_path = Some(path_to_unix(path));
+            continue;
+        }
+        if line.starts_with("+++ /dev/null") {
+            current_path = None;
+            continue;
+        }
+        if let Some(header) = line.strip_prefix("@@ ") {
+            if let Some(hunk) = current_hunk.take() {
+                hunks.push(hunk);
+            }
+            let Some(path) = current_path.clone() else {
+                continue;
+            };
+            let Some((old_start, old_lines, new_start, new_lines)) = parse_hunk_header(header)
+            else {
+                continue;
+            };
+            old_line = old_start;
+            new_line = new_start;
+            current_hunk = Some(ReviewHunk {
+                id: String::new(),
+                path,
+                old_start,
+                old_lines,
+                new_start,
+                new_lines,
+                lines: Vec::new(),
+            });
+            continue;
+        }
+
+        let Some(hunk) = current_hunk.as_mut() else {
+            continue;
+        };
+        if let Some(content) = line.strip_prefix('+') {
+            hunk.lines.push(ReviewHunkLine {
+                kind: ReviewLineKind::Added,
+                old_line: None,
+                new_line: Some(new_line),
+                content: content.to_string(),
+            });
+            new_line += 1;
+        } else if let Some(content) = line.strip_prefix('-') {
+            hunk.lines.push(ReviewHunkLine {
+                kind: ReviewLineKind::Removed,
+                old_line: Some(old_line),
+                new_line: None,
+                content: content.to_string(),
+            });
+            old_line += 1;
+        } else if let Some(content) = line.strip_prefix(' ') {
+            hunk.lines.push(ReviewHunkLine {
+                kind: ReviewLineKind::Context,
+                old_line: Some(old_line),
+                new_line: Some(new_line),
+                content: content.to_string(),
+            });
+            old_line += 1;
+            new_line += 1;
+        } else if line == r"\ No newline at end of file" {
+            continue;
+        }
+    }
+    if let Some(hunk) = current_hunk {
+        hunks.push(hunk);
+    }
+    renumber_hunks(&mut hunks);
+    hunks
+}
+
+fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
+    let mut parts = header.split_whitespace();
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    Some((
+        parse_range_start(old)?,
+        parse_range_len(old),
+        parse_range_start(new)?,
+        parse_range_len(new),
+    ))
+}
+
+fn parse_range_start(value: &str) -> Option<u32> {
+    value.split(',').next()?.parse().ok()
+}
+
+fn parse_range_len(value: &str) -> u32 {
+    value
+        .split_once(',')
+        .and_then(|(_, len)| len.parse().ok())
+        .unwrap_or(1)
+}
+
+fn renumber_hunks(hunks: &mut [ReviewHunk]) {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for hunk in hunks {
+        let count = counts.entry(hunk.path.clone()).or_insert(0);
+        *count += 1;
+        hunk.id = format!("{}#{}", hunk.path, count);
+    }
+}
+
 fn head_commit_info(root: &std::path::Path) -> Option<CommitInfo> {
     let output = Command::new("git")
         .args(["-C"])
@@ -286,6 +507,7 @@ impl From<&AgentTestConfig> for AgentSpec {
             instruction: value.instruction.clone(),
             model: value.model.clone(),
             severity: value.severity,
+            initial_context_token_budget: 0,
         }
     }
 }
@@ -312,6 +534,10 @@ mod tests {
 
         assert_eq!(review.mode, ReviewMode::LocalChanges);
         assert_eq!(review.files, vec!["changed.rs"]);
+        assert_eq!(review.hunks.len(), 1);
+        assert_eq!(review.hunks[0].path, "changed.rs");
+        assert_eq!(review.hunks[0].lines[0].kind, ReviewLineKind::Added);
+        assert_eq!(review.hunks[0].lines[0].new_line, Some(1));
     }
 
     #[test]
@@ -333,6 +559,10 @@ mod tests {
 
         assert_eq!(review.mode, ReviewMode::HeadCommit);
         assert_eq!(review.files, vec!["second.rs"]);
+        assert_eq!(review.hunks.len(), 1);
+        assert_eq!(review.hunks[0].path, "second.rs");
+        assert_eq!(review.hunks[0].lines[0].kind, ReviewLineKind::Added);
+        assert_eq!(review.hunks[0].lines[0].new_line, Some(1));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use super::types::LlmAction;
 use super::types::LlmRequest;
 use super::types::LlmResponse;
 use super::types::LlmTextResponse;
+use super::types::LlmTokenUsage;
 use super::verdict_parser::parse_verdict;
 use crate::config::AiProvider;
 use crate::config::KoochiConfig;
@@ -35,6 +36,10 @@ pub enum LlmBusError {
 
 #[async_trait]
 pub trait LlmBus: Send + Sync {
+    fn token_usage(&self) -> LlmTokenUsage {
+        LlmTokenUsage::default()
+    }
+
     async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError>;
 
     async fn complete_action(&self, request: LlmRequest) -> Result<LlmAction, LlmBusError> {

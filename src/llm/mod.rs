@@ -20,6 +20,8 @@ pub use types::LlmAction;
 pub use types::LlmRequest;
 pub use types::LlmResponse;
 pub use types::LlmTextResponse;
+pub use types::LlmTokenUsage;
 pub use types::LlmToolCall;
 pub use types::TestStatus;
 pub use verdict_parser::parse_verdict;
+pub use verdict_parser::parse_verdict_with_default_status;
