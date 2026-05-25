@@ -36,6 +36,12 @@ pub struct ReviewScope {
     pub commit: Option<CommitInfo>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewChanges {
+    files: Vec<FilePath>,
+    hunks: Vec<ReviewHunk>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReviewMode {
     LocalChanges,
@@ -163,12 +169,12 @@ fn build_review_scope(root: &std::path::Path) -> ReviewScope {
         };
     }
 
-    if let Some(files) = local_changed_files(root) {
-        if !files.is_empty() {
+    if let Some(changes) = local_review_changes(root) {
+        if !changes.files.is_empty() {
             return ReviewScope {
                 mode: ReviewMode::LocalChanges,
-                hunks: local_changed_hunks(root).unwrap_or_default(),
-                files,
+                files: changes.files,
+                hunks: changes.hunks,
                 commit: None,
             };
         }
@@ -181,11 +187,11 @@ fn build_review_scope(root: &std::path::Path) -> ReviewScope {
         };
     }
 
-    if let Some(files) = head_commit_files(root) {
+    if let Some(changes) = head_commit_review(root) {
         return ReviewScope {
             mode: ReviewMode::HeadCommit,
-            hunks: head_commit_hunks(root).unwrap_or_default(),
-            files,
+            files: changes.files,
+            hunks: changes.hunks,
             commit: head_commit_info(root),
         };
     }
@@ -217,6 +223,18 @@ fn is_git_root(root: &std::path::Path) -> bool {
     root.canonicalize().is_ok_and(|root| root == top_level)
 }
 
+fn local_review_changes(root: &std::path::Path) -> Option<ReviewChanges> {
+    let files = local_changed_files(root)?;
+    let hunks = local_changed_hunks(root, &files)?;
+    Some(ReviewChanges { files, hunks })
+}
+
+fn head_commit_review(root: &std::path::Path) -> Option<ReviewChanges> {
+    let files = head_commit_files(root)?;
+    let hunks = head_commit_hunks(root).unwrap_or_default();
+    Some(ReviewChanges { files, hunks })
+}
+
 fn local_changed_files(root: &std::path::Path) -> Option<Vec<FilePath>> {
     let output = Command::new("git")
         .args(["-C"])
@@ -229,24 +247,26 @@ fn local_changed_files(root: &std::path::Path) -> Option<Vec<FilePath>> {
     }
 
     let mut files = Vec::new();
-    for entry in output
+    let entries = output
         .stdout
         .split(|byte| *byte == 0)
-        .filter(|e| !e.is_empty())
-    {
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    let mut index = 0;
+    while index < entries.len() {
+        let entry = entries[index];
+        index += 1;
         if entry.len() < 4 {
             continue;
         }
         let status = &entry[..2];
         let path = String::from_utf8_lossy(&entry[3..]).to_string();
+        if status.contains(&b'R') || status.contains(&b'C') {
+            index += 1;
+        }
         if status.contains(&b'D') {
             continue;
         }
-        let path = if let Some((_, new_path)) = path.split_once(" -> ") {
-            new_path.to_string()
-        } else {
-            path
-        };
         if root.join(&path).is_file() {
             let path = path_to_unix(&path);
             if !is_koochi_local_file(&path) {
@@ -281,17 +301,17 @@ fn head_commit_files(root: &std::path::Path) -> Option<Vec<FilePath>> {
     Some(files)
 }
 
-fn local_changed_hunks(root: &std::path::Path) -> Option<Vec<ReviewHunk>> {
+fn local_changed_hunks(root: &std::path::Path, files: &[FilePath]) -> Option<Vec<ReviewHunk>> {
     let mut hunks = git_diff_hunks(root, &["diff", "--unified=0", "--no-ext-diff", "HEAD"])?;
     let tracked_paths = hunks
         .iter()
         .map(|hunk| hunk.path.clone())
         .collect::<std::collections::HashSet<_>>();
-    for path in local_changed_files(root)? {
-        if tracked_paths.contains(&path) || is_koochi_local_file(&path) {
+    for path in files {
+        if tracked_paths.contains(path.as_str()) || is_koochi_local_file(path) {
             continue;
         }
-        if let Some(hunk) = untracked_file_hunk(root, &path) {
+        if let Some(hunk) = untracked_file_hunk(root, path) {
             hunks.push(hunk);
         }
     }
@@ -587,6 +607,28 @@ mod tests {
 
         assert_eq!(review.mode, ReviewMode::HeadCommit);
         assert_eq!(review.files, vec!["second.rs"]);
+    }
+
+    #[test]
+    fn review_scope_tracks_renamed_local_file_new_path() {
+        let temp = tempfile::tempdir().unwrap();
+        if !git(temp.path(), ["init"]) {
+            return;
+        }
+        git(temp.path(), ["config", "user.email", "koochi@example.test"]);
+        git(temp.path(), ["config", "user.name", "Koochi"]);
+        fs::write(temp.path().join("old.rs"), "fn old_name() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "initial"]);
+        fs::rename(temp.path().join("old.rs"), temp.path().join("new.rs")).unwrap();
+        fs::write(temp.path().join("new.rs"), "fn new_name() {}\n").unwrap();
+        git(temp.path(), ["add", "-A"]);
+
+        let review = build_review_scope(temp.path());
+
+        assert_eq!(review.mode, ReviewMode::LocalChanges);
+        assert_eq!(review.files, vec!["new.rs"]);
+        assert!(review.hunks.iter().all(|hunk| hunk.path == "new.rs"));
     }
 
     #[test]
