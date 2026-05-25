@@ -1,12 +1,10 @@
 # Koochi
 
-Koochi is a highly parallel agentic test runner for the dev process.
+Koochi is built around one core idea: Shift Context Right.
 
-It lets you turn the review rules your team cares about into fast, local, repeatable agentic tests. Instead of burying important review context in `AGENTS.md` files, prompt notes, or tribal knowledge, put it in `koochi.toml` and run it directly against the code that changed.
+It lets you turn the review rules your team cares about into fast, local, repeatable checks that can run across hundreds of parallel agents. Instead of burying important review context in `AGENTS.md` files, prompt notes, or tribal knowledge, put it in `koochi.toml` and run it directly against the code that changed.
 
-Koochi is built around one idea: move context right.
-
-Moving context right means putting durable review knowledge next to the codebase, where it can run automatically. Instead of hoping every agent, reviewer, or prompt remembers the same security rules, reliability checks, and product invariants, Koochi makes those checks executable.
+Shift Context Right means putting durable review knowledge next to the codebase, where it can run automatically. Instead of hoping every agent, reviewer, or prompt remembers the same security rules, reliability checks, and product invariants, Koochi makes those checks executable.
 
 Each check runs as its own isolated agent. Koochi scopes the relevant git change, gives agents read-only code search, shares cached file/search results across the run, and reports deterministic pass/fail results.
 
