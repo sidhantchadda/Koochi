@@ -10,7 +10,7 @@ Moving context right means putting durable review knowledge next to the codebase
 
 Each check runs as its own isolated agent. Koochi scopes the relevant git change, gives agents read-only code search, shares cached file/search results across the run, and reports deterministic pass/fail results.
 
-That means you can run dozens or hundreds of narrow checks at once:
+That means you can run hundreds of narrow checks quickly:
 
 - security rules like missing authorization, SQL injection, secret leakage, and tenant data leaks
 - reliability rules like missing retries, unbounded background work, cache stampedes, and unsafe file export
@@ -41,22 +41,22 @@ koochi --debug
 Example config:
 
 ```toml
-provider = "fake"
+provider = "openai"
 model = "gpt-5-nano"
 max_parallel_agents = 128
 max_agent_steps = 32
 max_parallel_llm_requests = 32
 llm_max_retries = 2
 
-tests = [
-  "Check whether API calls need retry handling.",
-  "Check for missing authorization checks on public handlers."
-]
+[[test]]
+id = "retry-api-calls"
+instruction = "Fail if newly changed API calls can hang or fail transiently without timeout, retry, or backoff handling."
+severity = "high"
 
 [[test]]
-id = "critical-paths"
-instruction = "Check critical paths for unhandled errors."
-severity = "high"
+id = "public-handler-auth"
+instruction = "Fail if changed public handlers can access account, org, project, or tenant data without an authorization check."
+severity = "critical"
 ```
 
 Provider config is intentionally small:
@@ -73,9 +73,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 model = "claude-sonnet-4-5"
 ```
 
-`provider = "fake"` remains the default so local runs and tests do not need network calls. `base_url` can be set for compatible gateways.
-
-Koochi currently supports the deterministic fake provider, OpenAI-compatible chat completions, and Anthropic messages.
+Use `base_url` with OpenAI-compatible gateways.
 
 For development, run the default local test suite:
 
