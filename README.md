@@ -95,3 +95,7 @@ Next steps:
   - `koochi --changed-only` to scope search and evidence to changed files.
 - Teach the search layer to read from git snapshots/diffs instead of only the current working tree.
 - Include changed-line metadata in agent context so findings can be tied to a code review diff.
+
+## License
+
+Koochi is released under the MIT License. See [LICENSE](LICENSE).
