@@ -16,6 +16,10 @@ pub enum ScopeError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(
+        "cannot review HEAD because its parent commit is not available locally. This usually means the repository is a shallow clone. Fetch enough history with `git fetch --depth=2` or use a full clone, then rerun Koochi."
+    )]
+    MissingHeadParent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -140,7 +144,7 @@ pub fn build_scope(config: &KoochiConfig, config_dir: PathBuf) -> Result<ScopeCo
         root: root.clone(),
         revision: parse_revision(&config.repo.revision),
     };
-    let review = build_review_scope(&root);
+    let review = build_review_scope(&root)?;
     let agents = config
         .tests
         .iter()
@@ -159,49 +163,53 @@ pub fn build_scope(config: &KoochiConfig, config_dir: PathBuf) -> Result<ScopeCo
     })
 }
 
-fn build_review_scope(root: &std::path::Path) -> ReviewScope {
+fn build_review_scope(root: &std::path::Path) -> Result<ReviewScope, ScopeError> {
     if !is_git_root(root) {
-        return ReviewScope {
+        return Ok(ReviewScope {
             mode: ReviewMode::FullRepoFallback,
             files: Vec::new(),
             hunks: Vec::new(),
             commit: None,
-        };
+        });
     }
 
     if let Some(changes) = local_review_changes(root) {
         if !changes.files.is_empty() {
-            return ReviewScope {
+            return Ok(ReviewScope {
                 mode: ReviewMode::LocalChanges,
                 files: changes.files,
                 hunks: changes.hunks,
                 commit: None,
-            };
+            });
         }
     } else {
-        return ReviewScope {
+        return Ok(ReviewScope {
             mode: ReviewMode::FullRepoFallback,
             files: Vec::new(),
             hunks: Vec::new(),
             commit: None,
-        };
+        });
+    }
+
+    if !head_parent_exists(root) {
+        return Err(ScopeError::MissingHeadParent);
     }
 
     if let Some(changes) = head_commit_review(root) {
-        return ReviewScope {
+        return Ok(ReviewScope {
             mode: ReviewMode::HeadCommit,
             files: changes.files,
             hunks: changes.hunks,
             commit: head_commit_info(root),
-        };
+        });
     }
 
-    ReviewScope {
+    Ok(ReviewScope {
         mode: ReviewMode::FullRepoFallback,
         files: Vec::new(),
         hunks: Vec::new(),
         commit: None,
-    }
+    })
 }
 
 fn is_git_root(root: &std::path::Path) -> bool {
@@ -233,6 +241,16 @@ fn head_commit_review(root: &std::path::Path) -> Option<ReviewChanges> {
     let files = head_commit_files(root)?;
     let hunks = head_commit_hunks(root).unwrap_or_default();
     Some(ReviewChanges { files, hunks })
+}
+
+fn head_parent_exists(root: &std::path::Path) -> bool {
+    Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD^"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn local_changed_files(root: &std::path::Path) -> Option<Vec<FilePath>> {
@@ -550,7 +568,7 @@ mod tests {
         git(temp.path(), ["commit", "-m", "initial"]);
         fs::write(temp.path().join("changed.rs"), "fn changed() {}\n").unwrap();
 
-        let review = build_review_scope(temp.path());
+        let review = build_review_scope(temp.path()).unwrap();
 
         assert_eq!(review.mode, ReviewMode::LocalChanges);
         assert_eq!(review.files, vec!["changed.rs"]);
@@ -575,7 +593,7 @@ mod tests {
         git(temp.path(), ["add", "."]);
         git(temp.path(), ["commit", "-m", "second"]);
 
-        let review = build_review_scope(temp.path());
+        let review = build_review_scope(temp.path()).unwrap();
 
         assert_eq!(review.mode, ReviewMode::HeadCommit);
         assert_eq!(review.files, vec!["second.rs"]);
@@ -603,7 +621,7 @@ mod tests {
         fs::create_dir_all(temp.path().join(".koochi/debug")).unwrap();
         fs::write(temp.path().join(".koochi/debug/run.json"), "{}\n").unwrap();
 
-        let review = build_review_scope(temp.path());
+        let review = build_review_scope(temp.path()).unwrap();
 
         assert_eq!(review.mode, ReviewMode::HeadCommit);
         assert_eq!(review.files, vec!["second.rs"]);
@@ -624,7 +642,7 @@ mod tests {
         fs::write(temp.path().join("new.rs"), "fn new_name() {}\n").unwrap();
         git(temp.path(), ["add", "-A"]);
 
-        let review = build_review_scope(temp.path());
+        let review = build_review_scope(temp.path()).unwrap();
 
         assert_eq!(review.mode, ReviewMode::LocalChanges);
         assert_eq!(review.files, vec!["new.rs"]);
@@ -644,10 +662,32 @@ mod tests {
         git(temp.path(), ["add", "."]);
         git(temp.path(), ["commit", "-m", "initial"]);
 
-        let review = build_review_scope(&temp.path().join("fixture"));
+        let review = build_review_scope(&temp.path().join("fixture")).unwrap();
 
         assert_eq!(review.mode, ReviewMode::FullRepoFallback);
         assert!(review.files.is_empty());
+    }
+
+    #[test]
+    fn review_scope_errors_when_head_parent_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        if !git(temp.path(), ["init"]) {
+            return;
+        }
+        git(temp.path(), ["config", "user.email", "koochi@example.test"]);
+        git(temp.path(), ["config", "user.name", "Koochi"]);
+        fs::write(temp.path().join("first.rs"), "fn first() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "initial"]);
+        fs::write(temp.path().join("second.rs"), "fn second() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "second"]);
+        let head = git_stdout(temp.path(), ["rev-parse", "HEAD"]).unwrap();
+        fs::write(temp.path().join(".git/shallow"), head).unwrap();
+
+        let err = build_review_scope(temp.path()).unwrap_err();
+
+        assert!(matches!(err, ScopeError::MissingHeadParent));
     }
 
     fn git<const N: usize>(root: &std::path::Path, args: [&str; N]) -> bool {
@@ -658,5 +698,18 @@ mod tests {
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
+    }
+
+    fn git_stdout<const N: usize>(root: &std::path::Path, args: [&str; N]) -> Option<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).to_string())
     }
 }
