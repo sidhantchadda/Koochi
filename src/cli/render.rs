@@ -20,7 +20,7 @@ pub(crate) fn print_agent_progress(event: &AgentProgressEvent) {
             total_agents,
             running_agent_ids,
         } => println!(
-            "{completed_agents}/{total_agents} test agents completed. Last finished: {test_id}. Still running: {}",
+            "{completed_agents}/{total_agents} invariant agents completed. Last finished: {test_id}. Still running: {}",
             running_agent_ids.join(", ")
         ),
         AgentProgressEvent::ProgressTick { .. } => {}
@@ -54,7 +54,8 @@ pub(crate) fn print_live_agent_progress(event: &AgentProgressEvent, verbose: boo
         _ => return,
     };
     let spinner = live_spinner();
-    let mut line = format!("{spinner} {completed_agents}/{total_agents} test agents completed.");
+    let mut line =
+        format!("{spinner} {completed_agents}/{total_agents} invariant agents completed.");
     if verbose && !running_agent_ids.is_empty() {
         let running = running_agent_ids
             .iter()

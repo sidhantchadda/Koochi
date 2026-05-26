@@ -5,7 +5,7 @@ use crate::support::fixture_codebase;
 use crate::support::run_case;
 
 #[test]
-fn live_provider_runs_one_hundred_twenty_eight_parallel_agentic_tests() {
+fn live_provider_runs_one_hundred_twenty_eight_parallel_agentic_invariants() {
     let (passed, failed) = parallel_stress_expected_ids();
     let passed_refs = passed.iter().map(String::as_str).collect::<Vec<_>>();
     let failed_refs = failed.iter().map(String::as_str).collect::<Vec<_>>();

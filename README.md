@@ -2,13 +2,13 @@
 
 Koochi is built around one core idea: Shift Context Right.
 
-It lets you turn the review rules your team cares about into fast, local, repeatable checks that can run across hundreds of parallel agents. Instead of burying important review context in `AGENTS.md` files, prompt notes, or tribal knowledge, put it in `koochi.toml` and run it directly against the code that changed.
+It lets you turn the review rules your team cares about into fast, local, repeatable invariants that can run across hundreds of parallel agents. Instead of burying important review context in `AGENTS.md` files, prompt notes, or tribal knowledge, put it in `koochi.toml` and run it directly against the code that changed.
 
-Shift Context Right means putting durable review knowledge next to the codebase, where it can run automatically. Instead of hoping every agent, reviewer, or prompt remembers the same security rules, reliability checks, and product invariants, Koochi makes those checks executable.
+Shift Context Right means putting durable review knowledge next to the codebase, where it can run automatically. Instead of hoping every agent, reviewer, or prompt remembers the same security rules, reliability checks, and product invariants, Koochi makes those invariants executable.
 
-Each check runs as its own isolated agent. Koochi scopes the relevant git change, gives agents read-only code search, shares cached file/search results across the run, and reports deterministic pass/fail results.
+Each invariant runs as its own isolated agent. Koochi scopes the relevant git change, gives agents read-only code search, shares cached file/search results across the run, and reports deterministic pass/fail results.
 
-That means you can run hundreds of narrow checks quickly:
+That means you can run hundreds of narrow invariants quickly:
 
 - security rules like missing authorization, SQL injection, secret leakage, and tenant data leaks
 - reliability rules like missing retries, unbounded background work, cache stampedes, and unsafe file export
@@ -32,7 +32,7 @@ Run Koochi from a repository with a `koochi.toml` file:
 koochi
 ```
 
-That is the main workflow: write the checks once, run them from any repo, and get a review result focused on the current local changes or top commit.
+That is the main workflow: write the invariants once, run them from any repo, and get a review result focused on the current local changes or top commit.
 
 Use verbose mode when you want config, scope, and per-batch progress details:
 
@@ -56,16 +56,18 @@ max_agent_steps = 32
 max_parallel_llm_requests = 32
 llm_max_retries = 2
 
-[[test]]
+[[invariant]]
 id = "retry-api-calls"
 instruction = "Fail if newly changed API calls can hang or fail transiently without timeout, retry, or backoff handling."
 severity = "high"
 
-[[test]]
+[[invariant]]
 id = "public-handler-auth"
 instruction = "Fail if changed public handlers can access account, org, project, or tenant data without an authorization check."
 severity = "critical"
 ```
+
+Existing configs that use `[[test]]` or `tests = [...]` still work. New configs can use `[[invariant]]` or `invariants = [...]` for the same behavior.
 
 Provider config is intentionally small:
 

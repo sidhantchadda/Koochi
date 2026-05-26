@@ -27,11 +27,11 @@ pub enum ConfigError {
     },
     #[error("no koochi.toml config found from `{0}`")]
     NotFound(PathBuf),
-    #[error("config must define at least one test")]
+    #[error("config must define at least one invariant")]
     NoTests,
-    #[error("test instruction must not be empty")]
+    #[error("invariant instruction must not be empty")]
     EmptyInstruction,
-    #[error("test id `{0}` is duplicated")]
+    #[error("invariant id `{0}` is duplicated")]
     DuplicateTestId(String),
 }
 
@@ -89,8 +89,12 @@ struct RawConfig {
     llm_max_retries: Option<usize>,
     #[serde(default)]
     tests: Vec<String>,
+    #[serde(default)]
+    invariants: Vec<String>,
     #[serde(default, rename = "test")]
     test_tables: Vec<RawAgentTestConfig>,
+    #[serde(default, rename = "invariant")]
+    invariant_tables: Vec<RawAgentTestConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,7 +139,12 @@ impl KoochiConfig {
         let model = raw.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let mut tests = Vec::new();
 
-        for (index, instruction) in raw.tests.into_iter().enumerate() {
+        for (index, instruction) in raw
+            .tests
+            .into_iter()
+            .chain(raw.invariants.into_iter())
+            .enumerate()
+        {
             let instruction = normalize_required(instruction)?;
             let id = format!("test-{}", index + 1);
             tests.push(AgentTestConfig {
@@ -147,7 +156,12 @@ impl KoochiConfig {
             });
         }
 
-        for (index, test) in raw.test_tables.into_iter().enumerate() {
+        for (index, test) in raw
+            .test_tables
+            .into_iter()
+            .chain(raw.invariant_tables.into_iter())
+            .enumerate()
+        {
             let instruction = normalize_required(test.instruction)?;
             let id = test
                 .id
@@ -311,6 +325,55 @@ mod tests {
         assert_eq!(config.tests[1].id, "retry");
         assert_eq!(config.tests[1].model, "override");
         assert_eq!(config.tests[1].severity, Some(Severity::High));
+    }
+
+    #[test]
+    fn parses_invariant_aliases_for_tests() {
+        let raw = toml::from_str::<RawConfig>(
+            r#"
+            tests = ["Simple test shorthand"]
+            invariants = ["Simple invariant shorthand"]
+
+            [[test]]
+            id = "legacy"
+            instruction = "Legacy table"
+
+            [[invariant]]
+            id = "new"
+            name = "New invariant"
+            instruction = "Invariant table"
+            severity = "critical"
+            "#,
+        )
+        .unwrap();
+        let config = KoochiConfig::from_raw(raw).unwrap();
+        assert_eq!(config.tests.len(), 4);
+        assert_eq!(config.tests[0].id, "test-1");
+        assert_eq!(config.tests[0].instruction, "Simple test shorthand");
+        assert_eq!(config.tests[1].id, "test-2");
+        assert_eq!(config.tests[1].instruction, "Simple invariant shorthand");
+        assert_eq!(config.tests[2].id, "legacy");
+        assert_eq!(config.tests[3].id, "new");
+        assert_eq!(config.tests[3].name, "New invariant");
+        assert_eq!(config.tests[3].severity, Some(Severity::Critical));
+    }
+
+    #[test]
+    fn rejects_duplicate_ids_across_test_and_invariant_tables() {
+        let raw = toml::from_str::<RawConfig>(
+            r#"
+            [[test]]
+            id = "same"
+            instruction = "Legacy table"
+
+            [[invariant]]
+            id = "same"
+            instruction = "Invariant table"
+            "#,
+        )
+        .unwrap();
+        let err = KoochiConfig::from_raw(raw).unwrap_err();
+        assert!(matches!(err, ConfigError::DuplicateTestId(id) if id == "same"));
     }
 
     #[test]

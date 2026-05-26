@@ -159,7 +159,7 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "final_verdict",
-            description: "Return the final Koochi agentic test verdict.",
+            description: "Return the final Koochi agentic invariant verdict.",
             schema: object_schema(
                 vec![
                     ("status", string_enum_schema(&["passed", "failed"])),

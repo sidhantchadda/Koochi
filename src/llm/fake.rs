@@ -102,10 +102,10 @@ async fn scripted_response(
 }
 
 fn fake_test_instruction(instruction: &str) -> &str {
-    let Some(start) = instruction.find("Agentic test:") else {
+    let Some(start) = instruction.find("Agentic invariant:") else {
         return instruction;
     };
-    let subject = &instruction[start + "Agentic test:".len()..];
+    let subject = &instruction[start + "Agentic invariant:".len()..];
     subject
         .split("Repository context:")
         .next()

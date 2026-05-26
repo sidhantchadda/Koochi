@@ -36,7 +36,10 @@ use render::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "koochi", about = "Run lightweight parallel agentic tests.")]
+#[command(
+    name = "koochi",
+    about = "Run lightweight parallel agentic invariants."
+)]
 pub struct Cli {
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -139,7 +142,7 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
             .find(|agent| &agent.id == test_id)
             .cloned()
             .ok_or_else(|| CliError::TraceTestNotFound(test_id.clone()))?;
-        println!("Tracing 1 agentic test: {}", agent.id);
+        println!("Tracing 1 agentic invariant: {}", agent.id);
         let mut trace_debug_stats = DebugRunStats::default();
         trace_debug_stats.agent_batches = 1;
         let trace_started = Instant::now();
@@ -169,7 +172,7 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
         });
     }
 
-    println!("Running {} agentic tests", scope.agents.len());
+    println!("Running {} agentic invariants", scope.agents.len());
     let mut debug_stats = DebugRunStats::default();
     let verdicts = run_agents_with_progress(
         scope.agents.clone(),

@@ -23,7 +23,7 @@ fn live_provider_discovers_config_writes_report_and_returns_failure_exit() {
     .run_with_config_name("KOOCHI.TOML");
 
     let stdout = String::from_utf8(run.output.stdout).unwrap();
-    assert!(stdout.contains("Running 1 agentic tests"));
+    assert!(stdout.contains("Running 1 agentic invariants"));
     assert!(stdout.contains("0/1 passed, 1 failed"));
 }
 

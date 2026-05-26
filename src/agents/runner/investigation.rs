@@ -231,7 +231,7 @@ impl InvestigationState {
                 .map(|symbol| format!(" A useful symbol may be `{symbol}`."))
                 .unwrap_or_default();
             return Some(format!(
-                "This code-review agentic test requires more investigation before verdict. Missing required tool family: {}.{}{}",
+                "This code-review agentic invariant requires more investigation before verdict. Missing required tool family: {}.{}{}",
                 missing.join(", "),
                 marker_hint,
                 symbol_hint,
@@ -250,7 +250,7 @@ impl InvestigationState {
             .map(|symbol| format!(" A useful symbol may be `{symbol}`."))
             .unwrap_or_default();
         Some(format!(
-            "This code-review agentic test requires more investigation before verdict. Missing required tool family: {}.{}{}",
+            "This code-review agentic invariant requires more investigation before verdict. Missing required tool family: {}.{}{}",
             missing.join(", "),
             marker_hint,
             symbol_hint,
