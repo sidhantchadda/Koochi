@@ -320,6 +320,7 @@ struct AgentLoopResult {
     review_paths: HashSet<String>,
     changed_lines: HashSet<(String, u32)>,
     review_causal_terms: HashSet<String>,
+    elapsed: Duration,
     llm_calls: usize,
     native_tool_calls: usize,
     native_final_calls: usize,
@@ -362,7 +363,37 @@ where
     B: LlmBus + ?Sized + 'static,
     F: FnMut(AgentTraceEvent),
 {
+    let agent_started = Instant::now();
     let grounded = build_grounded_request(agent, search.as_ref()).await?;
+    trace(AgentTraceEvent::Started {
+        test_id: agent.id.clone(),
+        max_steps: max_agent_steps.max(1),
+    });
+    if grounded.review_paths.is_empty() {
+        let response = LlmResponse {
+            status: TestStatus::Passed,
+            severity: None,
+            description: "No review-scope source files were found, so there is no code to evaluate for this invariant.".to_string(),
+            evidence: Vec::new(),
+        };
+        trace(AgentTraceEvent::FinalVerdict {
+            step: 0,
+            response: response.clone(),
+        });
+        trace(AgentTraceEvent::EvidenceClassified { items: Vec::new() });
+        return Ok(AgentLoopResult {
+            response,
+            evidence_index: grounded.evidence_index,
+            review_paths: grounded.review_paths,
+            changed_lines: grounded.changed_lines,
+            review_causal_terms: grounded.review_causal_terms,
+            elapsed: agent_started.elapsed(),
+            llm_calls: 0,
+            native_tool_calls: 0,
+            native_final_calls: 0,
+            text_fallback_turns: 0,
+        });
+    }
     let base_prompt = agent_loop_prompt(&agent.id, &grounded.request.instruction);
     let mut history = Vec::new();
     let mut seen_observations = HashSet::new();
@@ -372,10 +403,6 @@ where
     let mut native_tool_calls = 0;
     let mut native_final_calls = 0;
     let mut text_fallback_turns = 0;
-    trace(AgentTraceEvent::Started {
-        test_id: agent.id.clone(),
-        max_steps: max_agent_steps.max(1),
-    });
 
     for step in 1..=max_agent_steps.max(1) {
         let prompt = prompt_with_history(&base_prompt, &history);
@@ -477,6 +504,7 @@ where
                 review_paths: grounded.review_paths,
                 changed_lines: grounded.changed_lines,
                 review_causal_terms: grounded.review_causal_terms,
+                elapsed: agent_started.elapsed(),
                 llm_calls,
                 native_tool_calls,
                 native_final_calls,
@@ -536,6 +564,7 @@ where
         review_paths: grounded.review_paths,
         changed_lines: grounded.changed_lines,
         review_causal_terms: grounded.review_causal_terms,
+        elapsed: agent_started.elapsed(),
         llm_calls,
         native_tool_calls,
         native_final_calls,

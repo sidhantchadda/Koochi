@@ -342,7 +342,7 @@ fn indent_for_trace(value: &str) -> String {
 pub(crate) fn review_scope_line(review: &crate::scope::ReviewScope) -> String {
     let changed_loc = review_changed_loc(review);
     let changed_loc = format_changed_loc(changed_loc);
-    match review.mode {
+    match &review.mode {
         ReviewMode::HeadCommit => {
             if let Some(commit) = &review.commit {
                 format!(
@@ -351,6 +351,26 @@ pub(crate) fn review_scope_line(review: &crate::scope::ReviewScope) -> String {
                 )
             } else {
                 format!("Koochi: HEAD ({changed_loc})")
+            }
+        }
+        ReviewMode::Commit => {
+            if let Some(commit) = &review.commit {
+                format!(
+                    "Koochi: {} {} ({changed_loc})",
+                    commit.short_id, commit.subject
+                )
+            } else {
+                format!("Koochi: commit ({changed_loc})")
+            }
+        }
+        ReviewMode::DiffRange { base, head } => {
+            if let Some(commit) = &review.commit {
+                format!(
+                    "Koochi: {base}...{head} -> {} {} ({changed_loc})",
+                    commit.short_id, commit.subject
+                )
+            } else {
+                format!("Koochi: {base}...{head} ({changed_loc})")
             }
         }
         ReviewMode::LocalChanges => format!("Koochi: local changes ({changed_loc})"),
@@ -389,8 +409,11 @@ pub(crate) fn print_report(
     for verdict in &report.failed {
         let severity = severity_label(verdict.severity);
         println!(
-            "- [{}] {}: {}",
-            severity, verdict.test_id, verdict.description
+            "- [{}] {} ({}): {}",
+            severity,
+            verdict.test_id,
+            format_elapsed_ms(verdict.elapsed_ms),
+            verdict.description
         );
         if verdict.evidence.is_empty() {
             println!("  {} none returned", dim("evidence:"));
@@ -486,6 +509,11 @@ pub(crate) fn format_duration(duration: Duration) -> String {
     }
 }
 
+pub(crate) fn format_elapsed_ms(elapsed_ms: u128) -> String {
+    let millis = elapsed_ms.min(u64::MAX as u128) as u64;
+    format_duration(Duration::from_millis(millis))
+}
+
 pub(crate) fn green(text: &str) -> String {
     ansi("32", text)
 }
@@ -508,4 +536,15 @@ pub(crate) fn dim(text: &str) -> String {
 
 fn ansi(code: &str, text: &str) -> String {
     format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_agent_elapsed_ms() {
+        assert_eq!(format_elapsed_ms(42), "42ms");
+        assert_eq!(format_elapsed_ms(1234), "1.23s");
+    }
 }

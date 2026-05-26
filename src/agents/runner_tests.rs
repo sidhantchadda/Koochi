@@ -94,6 +94,37 @@ async fn runs_agents_through_bus() {
 }
 
 #[tokio::test]
+async fn empty_source_scope_passes_without_llm_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let bus = Arc::new(ScriptedToolBus::new(Vec::new()));
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Fail if changed code violates this invariant.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 0);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert!(
+        verdicts[0]
+            .description
+            .contains("No review-scope source files")
+    );
+}
+
+#[tokio::test]
 async fn batches_agents_by_configured_limit() {
     let search = Arc::new(LocalSearchSession::new(ScopeConfig {
         primary_repo: RepoScope {

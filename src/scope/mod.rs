@@ -20,6 +20,12 @@ pub enum ScopeError {
         "cannot review HEAD because its parent commit is not available locally. This usually means the repository is a shallow clone. Fetch enough history with `git fetch --depth=2` or use a full clone, then rerun Koochi."
     )]
     MissingHeadParent,
+    #[error("cannot review git ref `{0}` because it does not resolve to a commit")]
+    InvalidReviewRef(String),
+    #[error("`--commit` cannot be combined with `--base` or `--head`")]
+    ConflictingReviewOptions,
+    #[error("`--base` and `--head` must be provided together")]
+    IncompleteReviewRange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -50,6 +56,8 @@ struct ReviewChanges {
 pub enum ReviewMode {
     LocalChanges,
     HeadCommit,
+    Commit,
+    DiffRange { base: String, head: String },
     FullRepoFallback,
 }
 
@@ -101,6 +109,15 @@ pub enum GitRevision {
     Tag(String),
 }
 
+impl GitRevision {
+    pub fn as_ref(&self) -> &str {
+        match self {
+            GitRevision::Head => "HEAD",
+            GitRevision::Commit(rev) | GitRevision::Branch(rev) | GitRevision::Tag(rev) => rev,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct McpServerScope {
     pub name: String,
@@ -123,7 +140,18 @@ pub struct AgentSpec {
     pub initial_context_token_budget: usize,
 }
 
-pub fn build_scope(config: &KoochiConfig, config_dir: PathBuf) -> Result<ScopeConfig, ScopeError> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReviewTarget {
+    Auto,
+    Commit(String),
+    Range { base: String, head: String },
+}
+
+pub fn build_scope(
+    config: &KoochiConfig,
+    config_dir: PathBuf,
+    target: ReviewTarget,
+) -> Result<ScopeConfig, ScopeError> {
     let root = if config.repo.root.is_absolute() {
         config.repo.root.clone()
     } else {
@@ -139,12 +167,17 @@ pub fn build_scope(config: &KoochiConfig, config_dir: PathBuf) -> Result<ScopeCo
             source,
         })?;
     let repo_id = root.to_string_lossy().to_string();
+    let revision = match &target {
+        ReviewTarget::Auto => parse_revision(&config.repo.revision),
+        ReviewTarget::Commit(commit) => GitRevision::Commit(commit.clone()),
+        ReviewTarget::Range { head, .. } => GitRevision::Commit(head.clone()),
+    };
     let primary_repo = RepoScope {
         repo_id,
         root: root.clone(),
-        revision: parse_revision(&config.repo.revision),
+        revision,
     };
-    let review = build_review_scope(&root)?;
+    let review = build_review_scope(&root, &target)?;
     let agents = config
         .tests
         .iter()
@@ -163,14 +196,28 @@ pub fn build_scope(config: &KoochiConfig, config_dir: PathBuf) -> Result<ScopeCo
     })
 }
 
-fn build_review_scope(root: &std::path::Path) -> Result<ReviewScope, ScopeError> {
+fn build_review_scope(
+    root: &std::path::Path,
+    target: &ReviewTarget,
+) -> Result<ReviewScope, ScopeError> {
     if !is_git_root(root) {
+        if !matches!(target, ReviewTarget::Auto) {
+            return Err(ScopeError::InvalidReviewRef(
+                "explicit review target requires a git repository root".to_string(),
+            ));
+        }
         return Ok(ReviewScope {
             mode: ReviewMode::FullRepoFallback,
             files: Vec::new(),
             hunks: Vec::new(),
             commit: None,
         });
+    }
+
+    match target {
+        ReviewTarget::Auto => {}
+        ReviewTarget::Commit(commit) => return explicit_commit_review_scope(root, commit),
+        ReviewTarget::Range { base, head } => return diff_range_review_scope(root, base, head),
     }
 
     if let Some(changes) = local_review_changes(root) {
@@ -212,6 +259,22 @@ fn build_review_scope(root: &std::path::Path) -> Result<ReviewScope, ScopeError>
     })
 }
 
+pub fn review_target_from_options(
+    commit: Option<String>,
+    base: Option<String>,
+    head: Option<String>,
+) -> Result<ReviewTarget, ScopeError> {
+    if commit.is_some() && (base.is_some() || head.is_some()) {
+        return Err(ScopeError::ConflictingReviewOptions);
+    }
+    match (commit, base, head) {
+        (Some(commit), None, None) => Ok(ReviewTarget::Commit(commit)),
+        (None, Some(base), Some(head)) => Ok(ReviewTarget::Range { base, head }),
+        (None, None, None) => Ok(ReviewTarget::Auto),
+        _ => Err(ScopeError::IncompleteReviewRange),
+    }
+}
+
 fn is_git_root(root: &std::path::Path) -> bool {
     let output = Command::new("git")
         .args(["-C"])
@@ -243,14 +306,86 @@ fn head_commit_review(root: &std::path::Path) -> Option<ReviewChanges> {
     Some(ReviewChanges { files, hunks })
 }
 
+fn explicit_commit_review_scope(
+    root: &std::path::Path,
+    commit: &str,
+) -> Result<ReviewScope, ScopeError> {
+    ensure_commit_ref(root, commit)?;
+    if !commit_parent_exists(root, commit) {
+        return Err(ScopeError::MissingHeadParent);
+    }
+    let changes = commit_review(root, commit).unwrap_or_else(|| ReviewChanges {
+        files: Vec::new(),
+        hunks: Vec::new(),
+    });
+    Ok(ReviewScope {
+        mode: ReviewMode::Commit,
+        files: changes.files,
+        hunks: changes.hunks,
+        commit: commit_info(root, commit),
+    })
+}
+
+fn diff_range_review_scope(
+    root: &std::path::Path,
+    base: &str,
+    head: &str,
+) -> Result<ReviewScope, ScopeError> {
+    ensure_commit_ref(root, base)?;
+    ensure_commit_ref(root, head)?;
+    let changes = range_review(root, base, head).unwrap_or_else(|| ReviewChanges {
+        files: Vec::new(),
+        hunks: Vec::new(),
+    });
+    Ok(ReviewScope {
+        mode: ReviewMode::DiffRange {
+            base: base.to_string(),
+            head: head.to_string(),
+        },
+        files: changes.files,
+        hunks: changes.hunks,
+        commit: commit_info(root, head),
+    })
+}
+
+fn commit_review(root: &std::path::Path, commit: &str) -> Option<ReviewChanges> {
+    let files = commit_files(root, commit)?;
+    let hunks = commit_hunks(root, commit).unwrap_or_default();
+    Some(ReviewChanges { files, hunks })
+}
+
+fn range_review(root: &std::path::Path, base: &str, head: &str) -> Option<ReviewChanges> {
+    let files = range_files(root, base, head)?;
+    let hunks = range_hunks(root, base, head).unwrap_or_default();
+    Some(ReviewChanges { files, hunks })
+}
+
 fn head_parent_exists(root: &std::path::Path) -> bool {
+    commit_parent_exists(root, "HEAD")
+}
+
+fn commit_parent_exists(root: &std::path::Path, commit: &str) -> bool {
+    let parent = format!("{commit}^");
     Command::new("git")
         .args(["-C"])
         .arg(root)
-        .args(["rev-parse", "--verify", "--quiet", "HEAD^"])
+        .args(["rev-parse", "--verify", "--quiet", &parent])
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+fn ensure_commit_ref(root: &std::path::Path, rev: &str) -> Result<(), ScopeError> {
+    let spec = format!("{rev}^{{commit}}");
+    let ok = Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["rev-parse", "--verify", "--quiet", &spec])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    ok.then_some(())
+        .ok_or_else(|| ScopeError::InvalidReviewRef(rev.to_string()))
 }
 
 fn local_changed_files(root: &std::path::Path) -> Option<Vec<FilePath>> {
@@ -319,6 +454,52 @@ fn head_commit_files(root: &std::path::Path) -> Option<Vec<FilePath>> {
     Some(files)
 }
 
+fn commit_files(root: &std::path::Path, commit: &str) -> Option<Vec<FilePath>> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--diff-filter=ACMR",
+            "-r",
+            commit,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_changed_files(&output.stdout))
+}
+
+fn range_files(root: &std::path::Path, base: &str, head: &str) -> Option<Vec<FilePath>> {
+    let range = format!("{base}...{head}");
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["diff", "--name-only", "--diff-filter=ACMR", &range])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_changed_files(&output.stdout))
+}
+
+fn parse_changed_files(stdout: &[u8]) -> Vec<FilePath> {
+    let mut files = String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(path_to_unix)
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
+}
+
 fn local_changed_hunks(root: &std::path::Path, files: &[FilePath]) -> Option<Vec<ReviewHunk>> {
     let mut hunks = git_diff_hunks(root, &["diff", "--unified=0", "--no-ext-diff", "HEAD"])?;
     let tracked_paths = hunks
@@ -342,6 +523,18 @@ fn head_commit_hunks(root: &std::path::Path) -> Option<Vec<ReviewHunk>> {
         root,
         &["show", "--format=", "--unified=0", "--no-ext-diff", "HEAD"],
     )
+}
+
+fn commit_hunks(root: &std::path::Path, commit: &str) -> Option<Vec<ReviewHunk>> {
+    git_diff_hunks(
+        root,
+        &["show", "--format=", "--unified=0", "--no-ext-diff", commit],
+    )
+}
+
+fn range_hunks(root: &std::path::Path, base: &str, head: &str) -> Option<Vec<ReviewHunk>> {
+    let range = format!("{base}...{head}");
+    git_diff_hunks(root, &["diff", "--unified=0", "--no-ext-diff", &range])
 }
 
 fn git_diff_hunks(root: &std::path::Path, args: &[&str]) -> Option<Vec<ReviewHunk>> {
@@ -500,10 +693,14 @@ fn renumber_hunks(hunks: &mut [ReviewHunk]) {
 }
 
 fn head_commit_info(root: &std::path::Path) -> Option<CommitInfo> {
+    commit_info(root, "HEAD")
+}
+
+fn commit_info(root: &std::path::Path, rev: &str) -> Option<CommitInfo> {
     let output = Command::new("git")
         .args(["-C"])
         .arg(root)
-        .args(["log", "-1", "--format=%h%x00%s"])
+        .args(["log", "-1", "--format=%h%x00%s", rev])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -568,7 +765,7 @@ mod tests {
         git(temp.path(), ["commit", "-m", "initial"]);
         fs::write(temp.path().join("changed.rs"), "fn changed() {}\n").unwrap();
 
-        let review = build_review_scope(temp.path()).unwrap();
+        let review = build_review_scope(temp.path(), &ReviewTarget::Auto).unwrap();
 
         assert_eq!(review.mode, ReviewMode::LocalChanges);
         assert_eq!(review.files, vec!["changed.rs"]);
@@ -593,7 +790,7 @@ mod tests {
         git(temp.path(), ["add", "."]);
         git(temp.path(), ["commit", "-m", "second"]);
 
-        let review = build_review_scope(temp.path()).unwrap();
+        let review = build_review_scope(temp.path(), &ReviewTarget::Auto).unwrap();
 
         assert_eq!(review.mode, ReviewMode::HeadCommit);
         assert_eq!(review.files, vec!["second.rs"]);
@@ -601,6 +798,82 @@ mod tests {
         assert_eq!(review.hunks[0].path, "second.rs");
         assert_eq!(review.hunks[0].lines[0].kind, ReviewLineKind::Added);
         assert_eq!(review.hunks[0].lines[0].new_line, Some(1));
+    }
+
+    #[test]
+    fn review_scope_can_target_explicit_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        if !git(temp.path(), ["init"]) {
+            return;
+        }
+        git(temp.path(), ["config", "user.email", "koochi@example.test"]);
+        git(temp.path(), ["config", "user.name", "Koochi"]);
+        fs::write(temp.path().join("first.rs"), "fn first() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "initial"]);
+        fs::write(temp.path().join("second.rs"), "fn second() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "second"]);
+        let second = git_stdout(temp.path(), ["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        fs::write(temp.path().join("third.rs"), "fn third() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "third"]);
+
+        let review =
+            build_review_scope(temp.path(), &ReviewTarget::Commit(second.clone())).unwrap();
+
+        assert_eq!(review.mode, ReviewMode::Commit);
+        assert_eq!(review.files, vec!["second.rs"]);
+        assert_eq!(review.commit.as_ref().unwrap().subject, "second");
+    }
+
+    #[test]
+    fn review_scope_can_target_diff_range() {
+        let temp = tempfile::tempdir().unwrap();
+        if !git(temp.path(), ["init"]) {
+            return;
+        }
+        git(temp.path(), ["config", "user.email", "koochi@example.test"]);
+        git(temp.path(), ["config", "user.name", "Koochi"]);
+        fs::write(temp.path().join("first.rs"), "fn first() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "initial"]);
+        let base = git_stdout(temp.path(), ["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        fs::write(temp.path().join("second.rs"), "fn second() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "second"]);
+        fs::write(temp.path().join("third.rs"), "fn third() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "third"]);
+        let head = git_stdout(temp.path(), ["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let review = build_review_scope(
+            temp.path(),
+            &ReviewTarget::Range {
+                base: base.clone(),
+                head: head.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            review.mode,
+            ReviewMode::DiffRange {
+                base,
+                head: head.clone()
+            }
+        );
+        assert_eq!(review.files, vec!["second.rs", "third.rs"]);
+        assert_eq!(review.commit.as_ref().unwrap().subject, "third");
     }
 
     #[test]
@@ -621,7 +894,7 @@ mod tests {
         fs::create_dir_all(temp.path().join(".koochi/debug")).unwrap();
         fs::write(temp.path().join(".koochi/debug/run.json"), "{}\n").unwrap();
 
-        let review = build_review_scope(temp.path()).unwrap();
+        let review = build_review_scope(temp.path(), &ReviewTarget::Auto).unwrap();
 
         assert_eq!(review.mode, ReviewMode::HeadCommit);
         assert_eq!(review.files, vec!["second.rs"]);
@@ -642,7 +915,7 @@ mod tests {
         fs::write(temp.path().join("new.rs"), "fn new_name() {}\n").unwrap();
         git(temp.path(), ["add", "-A"]);
 
-        let review = build_review_scope(temp.path()).unwrap();
+        let review = build_review_scope(temp.path(), &ReviewTarget::Auto).unwrap();
 
         assert_eq!(review.mode, ReviewMode::LocalChanges);
         assert_eq!(review.files, vec!["new.rs"]);
@@ -662,7 +935,7 @@ mod tests {
         git(temp.path(), ["add", "."]);
         git(temp.path(), ["commit", "-m", "initial"]);
 
-        let review = build_review_scope(&temp.path().join("fixture")).unwrap();
+        let review = build_review_scope(&temp.path().join("fixture"), &ReviewTarget::Auto).unwrap();
 
         assert_eq!(review.mode, ReviewMode::FullRepoFallback);
         assert!(review.files.is_empty());
@@ -685,7 +958,7 @@ mod tests {
         let head = git_stdout(temp.path(), ["rev-parse", "HEAD"]).unwrap();
         fs::write(temp.path().join(".git/shallow"), head).unwrap();
 
-        let err = build_review_scope(temp.path()).unwrap_err();
+        let err = build_review_scope(temp.path(), &ReviewTarget::Auto).unwrap_err();
 
         assert!(matches!(err, ScopeError::MissingHeadParent));
     }

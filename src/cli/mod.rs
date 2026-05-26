@@ -13,6 +13,7 @@ use crate::llm::build_llm_bus;
 use crate::scope::ReviewMode;
 use crate::scope::ScopeError;
 use crate::scope::build_scope;
+use crate::scope::review_target_from_options;
 use crate::search::LocalSearchSession;
 use crate::search::SearchStatsSnapshot;
 use crate::synthesis::SynthesisReport;
@@ -45,6 +46,12 @@ pub struct Cli {
     pub config: Option<PathBuf>,
     #[arg(long)]
     pub json_output: Option<PathBuf>,
+    #[arg(long, conflicts_with_all = ["base", "head"])]
+    pub commit: Option<String>,
+    #[arg(long, requires = "head")]
+    pub base: Option<String>,
+    #[arg(long, requires = "base")]
+    pub head: Option<String>,
     #[arg(short, long)]
     pub verbose: bool,
     #[arg(short, long)]
@@ -119,7 +126,8 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let scope = build_scope(&config, config_dir)?;
+    let review_target = review_target_from_options(cli.commit, cli.base, cli.head)?;
+    let scope = build_scope(&config, config_dir, review_target)?;
     println!("{}", review_scope_line(&scope.review));
     if cli.verbose {
         println!(
@@ -256,6 +264,9 @@ mod tests {
         let exit = run(Cli {
             config: Some(temp.path().join("koochi.toml")),
             json_output: Some(output.clone()),
+            commit: None,
+            base: None,
+            head: None,
             verbose: false,
             debug: false,
             trace: None,
@@ -323,6 +334,9 @@ mod tests {
         let exit = run(Cli {
             config: Some(temp.path().join("koochi.toml")),
             json_output: None,
+            commit: None,
+            base: None,
+            head: None,
             verbose: false,
             debug: true,
             trace: None,
@@ -364,6 +378,9 @@ mod tests {
         let exit = run(Cli {
             config: Some(temp.path().join("koochi.toml")),
             json_output: None,
+            commit: None,
+            base: None,
+            head: None,
             verbose: false,
             debug: false,
             trace: Some("selected".to_string()),

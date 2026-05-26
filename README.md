@@ -46,6 +46,18 @@ Use debug mode when you want cache and LLM timing metrics:
 koochi --debug
 ```
 
+Review a specific commit without checking it out:
+
+```sh
+koochi --commit <sha>
+```
+
+Review a diff range:
+
+```sh
+koochi --base <ref> --head <ref>
+```
+
 Example config:
 
 ```toml
@@ -96,15 +108,6 @@ Live-provider integration tests spend provider quota and require `OPENAI_API_KEY
 ```sh
 cargo integration
 ```
-
-Next steps:
-
-- Add commit/diff-aware review modes:
-  - `koochi --commit <sha>` to review a specific committed snapshot.
-  - `koochi --base <ref> --head <ref>` to review a diff range.
-  - `koochi --changed-only` to scope search and evidence to changed files.
-- Teach the search layer to read from git snapshots/diffs instead of only the current working tree.
-- Include changed-line metadata in agent context so findings can be tied to a code review diff.
 
 ## License
 

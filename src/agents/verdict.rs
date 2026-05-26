@@ -9,4 +9,5 @@ pub struct AgentVerdict {
     pub severity: Option<Severity>,
     pub description: String,
     pub evidence: Vec<Evidence>,
+    pub elapsed_ms: u128,
 }

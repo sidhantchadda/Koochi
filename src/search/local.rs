@@ -21,6 +21,8 @@ use super::file_kind::FileKind;
 use super::file_kind::kind_matches;
 use super::symbols::definition_regexes;
 use crate::FilePath;
+use crate::scope::GitRevision;
+use crate::scope::RepoScope;
 use crate::scope::ScopeConfig;
 use async_trait::async_trait;
 use ignore::WalkBuilder;
@@ -50,6 +52,8 @@ pub enum SearchError {
     Regex(#[from] regex::Error),
     #[error("unknown review hunk id `{0}`")]
     UnknownHunk(String),
+    #[error("git command failed: {0}")]
+    Git(String),
 }
 
 #[derive(Debug, Clone)]
@@ -172,7 +176,7 @@ impl CodeSearchApi for LocalSearchSession {
         }
 
         self.stats.list_files_misses.fetch_add(1, Ordering::Relaxed);
-        let files_result = collect_files(&self.scope.primary_repo.root, request.kind);
+        let files_result = collect_files_for_repo(&self.scope.primary_repo, request.kind);
         let mut cache = self.cache.lock().await;
         cache.file_locks.remove(&request.kind);
         let files = files_result?;
@@ -236,7 +240,7 @@ impl CodeSearchApi for LocalSearchSession {
             .files
             .iter()
             .filter(|path| kind_matches(path, request.kind))
-            .filter(|path| self.scope.primary_repo.root.join(path).is_file())
+            .filter(|path| file_exists_for_repo(&self.scope.primary_repo, path))
             .cloned()
             .collect();
         let mut cache = self.cache.lock().await;
@@ -377,21 +381,16 @@ impl CodeSearchApi for LocalSearchSession {
             return Ok(response);
         }
 
-        let absolute = match scoped_path(&self.scope.primary_repo.root, &path) {
-            Ok(path) => path,
+        self.stats.read_file_misses.fetch_add(1, Ordering::Relaxed);
+        let content = match read_file_for_repo(&self.scope.primary_repo, &path).await {
+            Ok(content) => content,
             Err(error) => {
                 self.cache.lock().await.read_locks.remove(&path);
                 return Err(error);
             }
         };
-        self.stats.read_file_misses.fetch_add(1, Ordering::Relaxed);
-        let content_result = tokio::fs::read_to_string(&absolute).await;
         let mut cache = self.cache.lock().await;
         cache.read_locks.remove(&path);
-        let content = content_result.map_err(|source| SearchError::Read {
-            path: path.clone(),
-            source,
-        })?;
         let line_count = content.lines().count() as u32;
         let response = ReadFileResponse {
             path: path.clone(),
@@ -597,6 +596,80 @@ fn collect_files(root: &Path, kind: FileKind) -> Result<Vec<FilePath>, SearchErr
     }
     files.sort();
     Ok(files)
+}
+
+fn collect_files_for_repo(repo: &RepoScope, kind: FileKind) -> Result<Vec<FilePath>, SearchError> {
+    match &repo.revision {
+        GitRevision::Head => collect_files(&repo.root, kind),
+        revision => {
+            let rev = revision.as_ref();
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo.root)
+                .args(["ls-tree", "-r", "--name-only", rev])
+                .output()
+                .map_err(|source| SearchError::Git(source.to_string()))?;
+            if !output.status.success() {
+                return Err(SearchError::Git(
+                    String::from_utf8_lossy(&output.stderr).to_string(),
+                ));
+            }
+            let mut files = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .filter(|path| kind_matches(path, kind))
+                .collect::<Vec<_>>();
+            files.sort();
+            Ok(files)
+        }
+    }
+}
+
+fn file_exists_for_repo(repo: &RepoScope, path: &str) -> bool {
+    match &repo.revision {
+        GitRevision::Head => repo.root.join(path).is_file(),
+        revision => {
+            let spec = format!("{}:{path}", revision.as_ref());
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo.root)
+                .args(["cat-file", "-e", &spec])
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }
+    }
+}
+
+async fn read_file_for_repo(repo: &RepoScope, path: &str) -> Result<String, SearchError> {
+    match &repo.revision {
+        GitRevision::Head => {
+            let absolute = scoped_path(&repo.root, path)?;
+            tokio::fs::read_to_string(&absolute)
+                .await
+                .map_err(|source| SearchError::Read {
+                    path: path.to_string(),
+                    source,
+                })
+        }
+        revision => {
+            let spec = format!("{}:{path}", revision.as_ref());
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo.root)
+                .args(["show", &spec])
+                .output()
+                .map_err(|source| SearchError::Git(source.to_string()))?;
+            if !output.status.success() {
+                return Err(SearchError::Git(
+                    String::from_utf8_lossy(&output.stderr).to_string(),
+                ));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+    }
 }
 
 fn normalize_repo_path(path: &str) -> String {

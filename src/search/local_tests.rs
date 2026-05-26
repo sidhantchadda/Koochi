@@ -69,6 +69,54 @@ async fn file_listing_skips_git_metadata() {
 }
 
 #[tokio::test]
+async fn commit_revision_reads_files_from_git_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    if !git(temp.path(), ["init"]) {
+        return;
+    }
+    git(temp.path(), ["config", "user.email", "koochi@example.test"]);
+    git(temp.path(), ["config", "user.name", "Koochi"]);
+    std::fs::write(temp.path().join("lib.rs"), "pub fn old_name() {}\n").unwrap();
+    git(temp.path(), ["add", "."]);
+    git(temp.path(), ["commit", "-m", "old"]);
+    let old = git_stdout(temp.path(), ["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn new_name() {}\n").unwrap();
+    git(temp.path(), ["add", "."]);
+    git(temp.path(), ["commit", "-m", "new"]);
+
+    let search = LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "test".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Commit(old),
+        },
+        review: ReviewScope {
+            mode: ReviewMode::Commit,
+            files: vec!["lib.rs".to_string()],
+            hunks: Vec::new(),
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    });
+
+    let file = search
+        .read_file(ReadFileRequest {
+            path: "lib.rs".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert!(file.content.contains("old_name"));
+    assert!(!file.content.contains("new_name"));
+}
+
+#[tokio::test]
 async fn list_review_files_uses_review_scope_when_present() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("changed.rs"), "fn changed() {}\n").unwrap();
@@ -307,4 +355,27 @@ async fn finds_heuristic_definitions_and_references() {
         .await
         .unwrap();
     assert_eq!(references.references.len(), 2);
+}
+
+fn git<const N: usize>(root: &std::path::Path, args: [&str; N]) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn git_stdout<const N: usize>(root: &std::path::Path, args: [&str; N]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
 }

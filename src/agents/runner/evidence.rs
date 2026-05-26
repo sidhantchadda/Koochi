@@ -4,6 +4,7 @@ pub(super) fn verdict_from_loop_result(
     agent: &AgentSpec,
     loop_result: AgentLoopResult,
 ) -> AgentVerdict {
+    let elapsed_ms = loop_result.elapsed.as_millis();
     let response = loop_result.response;
     let evidence_index = loop_result.evidence_index;
     let review_paths = loop_result.review_paths;
@@ -72,6 +73,7 @@ pub(super) fn verdict_from_loop_result(
         severity: response_severity.or(agent.severity),
         description,
         evidence: accepted_evidence,
+        elapsed_ms,
     }
 }
 

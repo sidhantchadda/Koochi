@@ -66,6 +66,7 @@ mod tests {
                 severity: Some(Severity::Low),
                 description: "low".to_string(),
                 evidence: Vec::new(),
+                elapsed_ms: 10,
             },
             AgentVerdict {
                 test_id: "high".to_string(),
@@ -73,6 +74,7 @@ mod tests {
                 severity: Some(Severity::High),
                 description: "high".to_string(),
                 evidence: Vec::new(),
+                elapsed_ms: 20,
             },
             AgentVerdict {
                 test_id: "pass".to_string(),
@@ -80,6 +82,7 @@ mod tests {
                 severity: None,
                 description: "pass".to_string(),
                 evidence: Vec::new(),
+                elapsed_ms: 5,
             },
         ]);
         assert_eq!(report.passed.len(), 1);
