@@ -32,8 +32,9 @@ mod render;
 
 use debug::{DebugRunStats, print_debug_report, write_debug_log};
 use render::{
-    clear_live_agent_progress, print_agent_progress, print_live_agent_progress, print_report,
-    print_trace_event, review_scope_line,
+    clear_live_agent_progress, print_agent_progress, print_live_agent_progress,
+    print_no_source_changes_skip, print_report, print_trace_event, review_scope_line,
+    should_skip_no_source_changes,
 };
 
 #[derive(Debug, Parser)]
@@ -141,15 +142,50 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
             scope.review.files.len()
         );
     }
+    let trace_agent = match &cli.trace {
+        Some(test_id) => Some(
+            scope
+                .agents
+                .iter()
+                .find(|agent| &agent.id == test_id)
+                .cloned()
+                .ok_or_else(|| CliError::TraceTestNotFound(test_id.clone()))?,
+        ),
+        None => None,
+    };
+    if should_skip_no_source_changes(&scope.review) {
+        let skipped_agents = trace_agent.as_ref().map_or(scope.agents.len(), |_| 1);
+        print_no_source_changes_skip(skipped_agents, started.elapsed());
+        let report = SynthesisReport {
+            passed: Vec::new(),
+            failed: Vec::new(),
+        };
+        if cli.debug {
+            let debug_stats = DebugRunStats::default();
+            print_debug_report(
+                &debug_stats,
+                ManagedLlmBusStatsSnapshot::default(),
+                SearchStatsSnapshot::default(),
+            );
+            let debug_path = write_debug_log(
+                &scope.primary_repo.root,
+                &scope.review,
+                config.initial_context_token_budget,
+                &debug_stats,
+                ManagedLlmBusStatsSnapshot::default(),
+                SearchStatsSnapshot::default(),
+                &report,
+                started.elapsed(),
+            )
+            .await?;
+            println!("  debug log: {}", debug_path.display());
+        }
+        write_json_report(cli.json_output, &report, cli.verbose).await?;
+        return Ok(RunExit::Success);
+    }
     let search = Arc::new(LocalSearchSession::new(scope.clone()));
     let built_bus = build_llm_bus(&config)?;
-    if let Some(test_id) = &cli.trace {
-        let agent = scope
-            .agents
-            .iter()
-            .find(|agent| &agent.id == test_id)
-            .cloned()
-            .ok_or_else(|| CliError::TraceTestNotFound(test_id.clone()))?;
+    if let Some(agent) = trace_agent {
         println!("Tracing 1 agentic invariant: {}", agent.id);
         let mut trace_debug_stats = DebugRunStats::default();
         trace_debug_stats.agent_batches = 1;
@@ -228,15 +264,7 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
         println!("  debug log: {}", debug_path.display());
     }
 
-    if let Some(path) = cli.json_output {
-        if cli.verbose {
-            println!("Koochi: writing JSON report {}", path.display());
-        }
-        let json = serde_json::to_string_pretty(&report).map_err(CliError::Serialize)?;
-        tokio::fs::write(&path, json)
-            .await
-            .map_err(|source| CliError::WriteJson { path, source })?;
-    }
+    write_json_report(cli.json_output, &report, cli.verbose).await?;
 
     Ok(if report.has_failures() {
         RunExit::TestFailures
@@ -245,10 +273,32 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
     })
 }
 
+async fn write_json_report(
+    path: Option<PathBuf>,
+    report: &SynthesisReport,
+    verbose: bool,
+) -> Result<(), CliError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if verbose {
+        println!("Koochi: writing JSON report {}", path.display());
+    }
+    let json = serde_json::to_string_pretty(report).map_err(CliError::Serialize)?;
+    tokio::fs::write(&path, json)
+        .await
+        .map_err(|source| CliError::WriteJson { path, source })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scope::{CommitInfo, ReviewMode, ReviewScope};
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use std::process::Stdio;
 
     #[tokio::test]
     async fn run_writes_json_output() {
@@ -316,7 +366,107 @@ mod tests {
             }),
         });
 
-        assert_eq!(line, "Koochi: abc1234 tighten review scope (3 LOC changed)");
+        assert_eq!(
+            line,
+            "Koochi: abc1234 tighten review scope (3 reviewable source LOC changed)"
+        );
+    }
+
+    #[test]
+    fn formats_scope_line_with_non_source_loc() {
+        let review = ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec![".github/images/playwright-chromium/Dockerfile".to_string()],
+            hunks: vec![crate::scope::ReviewHunk {
+                id: ".github/images/playwright-chromium/Dockerfile#1".to_string(),
+                path: ".github/images/playwright-chromium/Dockerfile".to_string(),
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 2,
+                lines: vec![
+                    crate::scope::ReviewHunkLine {
+                        kind: crate::scope::ReviewLineKind::Removed,
+                        old_line: Some(1),
+                        new_line: None,
+                        content: "FROM node:22".to_string(),
+                    },
+                    crate::scope::ReviewHunkLine {
+                        kind: crate::scope::ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "FROM node:24".to_string(),
+                    },
+                    crate::scope::ReviewHunkLine {
+                        kind: crate::scope::ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(2),
+                        content: "RUN echo chromium".to_string(),
+                    },
+                ],
+            }],
+            commit: Some(CommitInfo {
+                short_id: "6582227".to_string(),
+                subject: "fix dockerfile".to_string(),
+            }),
+        };
+
+        assert_eq!(
+            review_scope_line(&review),
+            "Koochi: 6582227 fix dockerfile (0 reviewable source LOC changed, 3 total LOC changed)"
+        );
+        assert!(should_skip_no_source_changes(&review));
+    }
+
+    #[tokio::test]
+    async fn run_skips_non_source_review_scope_before_provider_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        if !git(temp.path(), ["init"]) {
+            return;
+        }
+        git(temp.path(), ["config", "user.email", "koochi@example.test"]);
+        git(temp.path(), ["config", "user.name", "Koochi"]);
+        let dockerfile_dir = temp.path().join(".github/images/playwright-chromium");
+        fs::create_dir_all(&dockerfile_dir).unwrap();
+        fs::write(dockerfile_dir.join("Dockerfile"), "FROM node:22\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "initial"]);
+        fs::write(
+            dockerfile_dir.join("Dockerfile"),
+            "FROM node:24\nRUN echo chromium\n",
+        )
+        .unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "fix dockerfile"]);
+        fs::write(
+            temp.path().join("koochi.toml"),
+            r#"
+            provider = "openai"
+            api_key_env = "KOOCHI_TEST_KEY_THAT_SHOULD_NOT_BE_REQUIRED"
+            tests = ["Simple pass"]
+            "#,
+        )
+        .unwrap();
+        let output = temp.path().join("report.json");
+
+        let exit = run(Cli {
+            config: Some(temp.path().join("koochi.toml")),
+            json_output: Some(output.clone()),
+            commit: None,
+            base: None,
+            head: None,
+            verbose: false,
+            debug: false,
+            trace: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(exit, RunExit::Success);
+        let report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(output).unwrap()).unwrap();
+        assert!(report["passed"].as_array().unwrap().is_empty());
+        assert!(report["failed"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -389,5 +539,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(exit, RunExit::Success);
+    }
+
+    fn git<const N: usize>(root: &Path, args: [&str; N]) -> bool {
+        Command::new("git")
+            .args(["-C"])
+            .arg(root)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }

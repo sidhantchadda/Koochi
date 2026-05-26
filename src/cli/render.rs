@@ -1,4 +1,5 @@
 use super::*;
+use crate::search::{FileKind, kind_matches};
 
 pub(crate) fn print_agent_progress(event: &AgentProgressEvent) {
     match event {
@@ -349,48 +350,82 @@ fn indent_for_trace(value: &str) -> String {
 }
 
 pub(crate) fn review_scope_line(review: &crate::scope::ReviewScope) -> String {
-    let changed_loc = review_changed_loc(review);
-    let changed_loc = format_changed_loc(changed_loc);
+    let loc_summary = format_review_loc_summary(review_loc_summary(review));
     match &review.mode {
         ReviewMode::HeadCommit => {
             if let Some(commit) = &review.commit {
                 format!(
-                    "Koochi: {} {} ({changed_loc})",
+                    "Koochi: {} {} ({loc_summary})",
                     commit.short_id, commit.subject
                 )
             } else {
-                format!("Koochi: HEAD ({changed_loc})")
+                format!("Koochi: HEAD ({loc_summary})")
             }
         }
         ReviewMode::Commit => {
             if let Some(commit) = &review.commit {
                 format!(
-                    "Koochi: {} {} ({changed_loc})",
+                    "Koochi: {} {} ({loc_summary})",
                     commit.short_id, commit.subject
                 )
             } else {
-                format!("Koochi: commit ({changed_loc})")
+                format!("Koochi: commit ({loc_summary})")
             }
         }
         ReviewMode::DiffRange { base, head } => {
             if let Some(commit) = &review.commit {
                 format!(
-                    "Koochi: {base}...{head} -> {} {} ({changed_loc})",
+                    "Koochi: {base}...{head} -> {} {} ({loc_summary})",
                     commit.short_id, commit.subject
                 )
             } else {
-                format!("Koochi: {base}...{head} ({changed_loc})")
+                format!("Koochi: {base}...{head} ({loc_summary})")
             }
         }
-        ReviewMode::LocalChanges => format!("Koochi: local changes ({changed_loc})"),
+        ReviewMode::LocalChanges => format!("Koochi: local changes ({loc_summary})"),
         ReviewMode::FullRepoFallback => format!("Koochi: full repo fallback"),
     }
 }
 
-fn review_changed_loc(review: &crate::scope::ReviewScope) -> usize {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReviewLocSummary {
+    pub(crate) reviewable_source: usize,
+    pub(crate) total: usize,
+}
+
+pub(crate) fn review_loc_summary(review: &crate::scope::ReviewScope) -> ReviewLocSummary {
+    let source_paths = review
+        .files
+        .iter()
+        .filter(|path| kind_matches(path, FileKind::Source))
+        .collect::<std::collections::HashSet<_>>();
+    let reviewable_source = review_changed_loc_matching(review, |path| source_paths.contains(path));
+    ReviewLocSummary {
+        reviewable_source,
+        total: review_changed_loc_matching(review, |_| true),
+    }
+}
+
+pub(crate) fn review_source_file_count(review: &crate::scope::ReviewScope) -> usize {
+    review
+        .files
+        .iter()
+        .filter(|path| kind_matches(path, FileKind::Source))
+        .count()
+}
+
+pub(crate) fn should_skip_no_source_changes(review: &crate::scope::ReviewScope) -> bool {
+    !matches!(review.mode, ReviewMode::FullRepoFallback) && review_source_file_count(review) == 0
+}
+
+fn review_changed_loc_matching<F>(review: &crate::scope::ReviewScope, mut path_matches: F) -> usize
+where
+    F: FnMut(&String) -> bool,
+{
     review
         .hunks
         .iter()
+        .filter(|hunk| path_matches(&hunk.path))
         .flat_map(|hunk| &hunk.lines)
         .filter(|line| {
             matches!(
@@ -401,11 +436,48 @@ fn review_changed_loc(review: &crate::scope::ReviewScope) -> usize {
         .count()
 }
 
-fn format_changed_loc(changed_loc: usize) -> String {
-    match changed_loc {
-        1 => "1 LOC changed".to_string(),
-        count => format!("{count} LOC changed"),
+fn format_review_loc_summary(summary: ReviewLocSummary) -> String {
+    let reviewable = format_reviewable_source_loc(summary.reviewable_source);
+    if summary.reviewable_source == summary.total {
+        reviewable
+    } else {
+        format!("{reviewable}, {}", format_total_loc(summary.total))
     }
+}
+
+fn format_reviewable_source_loc(changed_loc: usize) -> String {
+    match changed_loc {
+        1 => "1 reviewable source LOC changed".to_string(),
+        count => format!("{count} reviewable source LOC changed"),
+    }
+}
+
+fn format_total_loc(changed_loc: usize) -> String {
+    match changed_loc {
+        1 => "1 total LOC changed".to_string(),
+        count => format!("{count} total LOC changed"),
+    }
+}
+
+pub(crate) fn print_no_source_changes_skip(skipped_agents: usize, elapsed: Duration) {
+    let invariant_word = if skipped_agents == 1 {
+        "invariant"
+    } else {
+        "invariants"
+    };
+    println!(
+        "{}",
+        yellow(&format!(
+            "No source files changed in this review scope; Koochi did not run {skipped_agents} agentic {invariant_word}."
+        ))
+    );
+    println!(
+        "{}",
+        yellow(&format!(
+            "Finished in {}: 0/{skipped_agents} invariant agents run, {skipped_agents} skipped",
+            format_duration(elapsed)
+        ))
+    );
 }
 
 pub(crate) fn print_report(

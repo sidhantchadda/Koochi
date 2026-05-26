@@ -97,7 +97,7 @@ struct SearchStats {
     reference_misses: AtomicUsize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SearchStatsSnapshot {
     pub list_files_hits: usize,
     pub list_files_misses: usize,

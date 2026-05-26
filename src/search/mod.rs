@@ -24,6 +24,7 @@ pub use api::SearchTextResponse;
 pub use api::SymbolKind;
 pub use api::TextMatch;
 pub use file_kind::FileKind;
+pub use file_kind::kind_matches;
 pub use local::LocalSearchSession;
 pub use local::SearchError;
 pub use local::SearchStatsSnapshot;
