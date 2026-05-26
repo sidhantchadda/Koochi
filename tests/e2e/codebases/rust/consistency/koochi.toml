@@ -1,0 +1,157 @@
+provider = "openai"
+model = "gpt-5-nano"
+api_key_env = "OPENAI_API_KEY"
+max_parallel_agents = 30
+max_parallel_llm_requests = 30
+max_agent_steps = 12
+initial_context_token_budget = 12000
+
+[[invariant]]
+id = "pass-tenant-scoped-claim-export"
+severity = "medium"
+instruction = "Review `export_claims_for_tenant` in `src/claims/exports.rs`. Pass only when the changed code demonstrates that claim export path filters every row by the caller tenant before formatting export rows. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-csv-cell-sanitizer"
+severity = "high"
+instruction = "Review `export_claims_csv_safely` in `src/claims/exports.rs`. Pass only when the changed code demonstrates that CSV export path neutralizes spreadsheet auto-evaluation prefixes and removes embedded newlines before writing cells. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-webhook-signature-required"
+severity = "critical"
+instruction = "Review `accept_signed_claim_webhook` in `src/claims/webhooks.rs`. Pass only when the changed code demonstrates that webhook handler verifies the provider signature before accepting a claim event. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-idempotent-payment-retry"
+severity = "high"
+instruction = "Review `submit_claim_payment_safely` in `src/claims/payments.rs`. Pass only when the changed code demonstrates that payment submission includes a tenant-scoped idempotency key and retry budget. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-cache-key-includes-tenant"
+severity = "high"
+instruction = "Review `claim_cache_key` in `src/claims/cache.rs`. Pass only when the changed code demonstrates that claim cache key includes tenant identity before claim identity. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-audit-redacts-email"
+severity = "medium"
+instruction = "Review `record_claim_audit_safely` in `src/claims/audit.rs`. Pass only when the changed code demonstrates that claim audit event text redacts patient email addresses before returning the event. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-disabled-policy-skipped"
+severity = "medium"
+instruction = "Review `active_policy_exports` in `src/claims/policies.rs`. Pass only when the changed code demonstrates that policy export path omits disabled policies. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-workflow-two-approvers"
+severity = "high"
+instruction = "Review `approve_high_value_claim` in `src/claims/approvals.rs`. Pass only when the changed code demonstrates that high-value claim approval requires at least two distinct approvers. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-amount-limit-enforced"
+severity = "high"
+instruction = "Review `approve_claim_with_amount_limit` in `src/claims/approvals.rs`. Pass only when the changed code demonstrates that approval route enforces a maximum claim amount before approving. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-pagination-limit-bounded"
+severity = "medium"
+instruction = "Review `bounded_claim_page` in `src/claims/pagination.rs`. Pass only when the changed code demonstrates that claim listing clamps requested page size to a service maximum. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-feature-flag-tenant-check"
+severity = "medium"
+instruction = "Review `tenant_feature_enabled` in `src/claims/features.rs`. Pass only when the changed code demonstrates that feature flag lookup is scoped by tenant identity. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-report-path-allowlist"
+severity = "high"
+instruction = "Review `claim_report_path` in `src/claims/reports.rs`. Pass only when the changed code demonstrates that report path builder restricts output names to an allowlisted slug. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-job-dedupe-key-scoped"
+severity = "medium"
+instruction = "Review `claim_job_dedupe_key` in `src/claims/jobs.rs`. Pass only when the changed code demonstrates that background job dedupe key includes tenant and claim identity. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-metric-normalization"
+severity = "medium"
+instruction = "Review `claim_metric_labels` in `src/claims/metrics.rs`. Pass only when the changed code demonstrates that metrics normalize claim status into a small bounded label set. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "pass-refund-reason-required"
+severity = "medium"
+instruction = "Review `issue_claim_refund_safely` in `src/claims/refunds.rs`. Pass only when the changed code demonstrates that refund path requires a non-empty operator reason before issuing a refund. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-claim-export-tenant-leak"
+severity = "critical"
+instruction = "Review `export_claims_without_tenant_filter` in `src/claims/exports.rs`. Fail if the changed code demonstrates that claim export path returns rows without filtering by tenant. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-csv-raw-cell-export"
+severity = "high"
+instruction = "Review `export_claims_csv_raw` in `src/claims/exports.rs`. Fail if the changed code demonstrates that CSV export writes raw cells that can trigger spreadsheet auto-evaluation or contain newlines. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-webhook-unsigned-acceptance"
+severity = "critical"
+instruction = "Review `accept_unsigned_claim_webhook` in `src/claims/webhooks.rs`. Fail if the changed code demonstrates that webhook handler accepts claim events without checking a provider signature. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-payment-no-idempotency"
+severity = "high"
+instruction = "Review `submit_claim_payment_without_idempotency` in `src/claims/payments.rs`. Fail if the changed code demonstrates that payment submission lacks idempotency key and retry budget. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-cache-cross-tenant-key"
+severity = "high"
+instruction = "Review `claim_cache_key_without_tenant` in `src/claims/cache.rs`. Fail if the changed code demonstrates that claim cache key omits tenant identity and can collide across tenants. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-audit-logs-raw-email"
+severity = "medium"
+instruction = "Review `record_claim_audit_with_email` in `src/claims/audit.rs`. Fail if the changed code demonstrates that claim audit event text includes raw patient email addresses. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-disabled-policy-exported"
+severity = "medium"
+instruction = "Review `export_all_policies_including_disabled` in `src/claims/policies.rs`. Fail if the changed code demonstrates that policy export includes disabled policies. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-workflow-single-approver"
+severity = "high"
+instruction = "Review `approve_high_value_claim_with_one_approver` in `src/claims/approvals.rs`. Fail if the changed code demonstrates that high-value claim approval accepts a single approver. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-amount-unbounded-approval"
+severity = "high"
+instruction = "Review `approve_claim_without_amount_limit` in `src/claims/approvals.rs`. Fail if the changed code demonstrates that approval route has no maximum claim amount. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-pagination-unbounded"
+severity = "medium"
+instruction = "Review `unbounded_claim_page` in `src/claims/pagination.rs`. Fail if the changed code demonstrates that claim listing trusts caller supplied page size without a service maximum. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-feature-flag-global-default"
+severity = "medium"
+instruction = "Review `global_feature_enabled` in `src/claims/features.rs`. Fail if the named function ignores `_tenant_id` and reads a `global:{feature}` flag key without tenant identity; that pattern is the violation even if `tenant_feature_enabled` also exists. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-report-unchecked-path"
+severity = "high"
+instruction = "Review `claim_report_path_unchecked` in `src/claims/reports.rs`. Fail if the changed code demonstrates that report path builder joins caller controlled names that can escape the report directory. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-job-global-dedupe-key"
+severity = "medium"
+instruction = "Review `claim_job_dedupe_key_global` in `src/claims/jobs.rs`. Fail if the changed code demonstrates that background job dedupe key omits tenant identity. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-metric-raw-status-label"
+severity = "medium"
+instruction = "Review `claim_metric_labels_raw` in `src/claims/metrics.rs`. Fail if the named function returns the incoming `status` with `status.to_string()` as the metric label value instead of normalizing it. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."
+
+[[invariant]]
+id = "fail-refund-missing-reason"
+severity = "medium"
+instruction = "Review `issue_claim_refund_without_reason` in `src/claims/refunds.rs`. Fail if the named function returns a RefundCommand with `reason: None`, demonstrating a refund event without an operator reason. First inspect the named function in the named file. Use concrete evidence from this function or its immediate helpers. Do not let safe or unsafe sibling functions cancel out what the named function itself demonstrates unless the named function calls them."

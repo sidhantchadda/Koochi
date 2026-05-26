@@ -8,6 +8,9 @@ pub(crate) struct DebugRunStats {
     native_tool_calls: usize,
     native_final_calls: usize,
     text_fallback_turns: usize,
+    tool_cache_hits: usize,
+    tool_cache_misses: usize,
+    non_progress_terminations: usize,
     pub(crate) llm_elapsed: Duration,
 }
 
@@ -20,6 +23,9 @@ impl DebugRunStats {
                 native_tool_calls,
                 native_final_calls,
                 text_fallback_turns,
+                tool_cache_hits,
+                tool_cache_misses,
+                non_progress_terminations,
                 ..
             } => {
                 self.agent_batches += 1;
@@ -27,6 +33,9 @@ impl DebugRunStats {
                 self.native_tool_calls += native_tool_calls;
                 self.native_final_calls += native_final_calls;
                 self.text_fallback_turns += text_fallback_turns;
+                self.tool_cache_hits += tool_cache_hits;
+                self.tool_cache_misses += tool_cache_misses;
+                self.non_progress_terminations += non_progress_terminations;
                 self.llm_elapsed += *llm_elapsed;
             }
             AgentProgressEvent::BatchPreparing { .. }
@@ -46,6 +55,16 @@ impl DebugRunStats {
             } else if action.starts_with("text ") {
                 self.text_fallback_turns += 1;
             }
+        }
+        if let AgentTraceEvent::ToolExecuted { cache_hit, .. } = event {
+            if *cache_hit {
+                self.tool_cache_hits += 1;
+            } else {
+                self.tool_cache_misses += 1;
+            }
+        }
+        if matches!(event, AgentTraceEvent::NonProgressTerminated { .. }) {
+            self.non_progress_terminations += 1;
         }
     }
 }
@@ -90,6 +109,10 @@ pub(crate) fn print_debug_report(
     println!(
         "  LLM actions: {} native tool calls, {} native final verdicts, {} text fallback turns",
         debug.native_tool_calls, debug.native_final_calls, debug.text_fallback_turns
+    );
+    println!(
+        "  agent guardrails: {} tool-cache hits / {} misses, {} non-progress terminations",
+        debug.tool_cache_hits, debug.tool_cache_misses, debug.non_progress_terminations
     );
     println!(
         "  search tools: {} calls total (list_files {}, list_review_files {}, read_file {}, get_hunk_context {}, get_file_context {}, search_text {}, definitions {}, references {})",
@@ -152,6 +175,9 @@ struct DebugLlmLog {
     native_tool_calls: usize,
     native_final_calls: usize,
     text_fallback_turns: usize,
+    tool_cache_hits: usize,
+    tool_cache_misses: usize,
+    non_progress_terminations: usize,
     elapsed_ms: u128,
 }
 
@@ -253,6 +279,9 @@ fn build_debug_log(
             native_tool_calls: debug.native_tool_calls,
             native_final_calls: debug.native_final_calls,
             text_fallback_turns: debug.text_fallback_turns,
+            tool_cache_hits: debug.tool_cache_hits,
+            tool_cache_misses: debug.tool_cache_misses,
+            non_progress_terminations: debug.non_progress_terminations,
             elapsed_ms: debug.llm_elapsed.as_millis(),
         },
         search: DebugSearchLog {

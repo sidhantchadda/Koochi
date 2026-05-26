@@ -14,6 +14,7 @@ pub fn parse_verdict_with_default_status(
     let json = extract_json_object(content).unwrap_or(content).trim();
     let value: Value =
         serde_json::from_str(json).map_err(|_| LlmBusError::InvalidVerdict(content.to_string()))?;
+    let value = normalize_verdict_value(value);
     let status = value
         .get("status")
         .and_then(Value::as_str)
@@ -48,6 +49,26 @@ pub fn parse_verdict_with_default_status(
     })
 }
 
+fn normalize_verdict_value(mut value: Value) -> Value {
+    if let Some(evidence) = value.get_mut("evidence").and_then(Value::as_array_mut) {
+        for item in evidence {
+            let Some(object) = item.as_object_mut() else {
+                continue;
+            };
+            if object.contains_key("preview") {
+                continue;
+            }
+            for alias in ["line_preview", "linePreview", "code_preview", "codePreview"] {
+                if let Some(preview) = object.get(alias).cloned() {
+                    object.insert("preview".to_string(), preview);
+                    break;
+                }
+            }
+        }
+    }
+    value
+}
+
 fn parse_status(status: &str) -> Result<TestStatus, LlmBusError> {
     match status {
         "passed" => Ok(TestStatus::Passed),
@@ -58,8 +79,40 @@ fn parse_status(status: &str) -> Result<TestStatus, LlmBusError> {
 
 fn extract_json_object(content: &str) -> Option<&str> {
     let start = content.find('{')?;
-    let end = content.rfind('}')?;
-    (start <= end).then_some(&content[start..=end])
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in content[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(&content[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -135,5 +188,27 @@ mod tests {
         assert_eq!(response.status, TestStatus::Passed);
         assert_eq!(response.severity, Some(Severity::Low));
         assert_eq!(response.evidence.len(), 1);
+    }
+
+    #[test]
+    fn parses_provider_verdict_with_line_preview_alias() {
+        let response = parse_verdict(
+            r#"{"status":"failed","severity":"high","description":"bad","evidence":[{"path":"src/lib.rs","line":7,"line_preview":"bad();"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.status, TestStatus::Failed);
+        assert_eq!(response.evidence[0].preview, "bad();");
+    }
+
+    #[test]
+    fn parses_first_balanced_provider_verdict_before_trailing_junk() {
+        let response = parse_verdict(
+            r#"{"status":"failed","severity":"high","description":"bad","evidence":[{"path":"src/lib.rs","line":7,"preview":"if value == \"}\" { bad(); }"}]}]}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.status, TestStatus::Failed);
+        assert_eq!(response.evidence[0].preview, "if value == \"}\" { bad(); }");
     }
 }

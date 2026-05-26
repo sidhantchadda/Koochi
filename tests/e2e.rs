@@ -1,5 +1,7 @@
 #[path = "e2e/clinic_scheduler.rs"]
 mod clinic_scheduler;
+#[path = "e2e/consistency/mod.rs"]
+mod consistency;
 #[path = "e2e/creator_market.rs"]
 mod creator_market;
 #[path = "e2e/fulfillment_hub.rs"]

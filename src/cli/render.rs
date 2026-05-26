@@ -137,6 +137,9 @@ pub(crate) fn print_trace_event(event: AgentTraceEvent, verbose: bool) {
                 for item in items {
                     let label = match item.classification {
                         crate::agents::EvidenceClassification::Changed => green("changed-line"),
+                        crate::agents::EvidenceClassification::UnfocusedChanged => {
+                            yellow("unfocused-changed")
+                        }
                         crate::agents::EvidenceClassification::ReviewContext => {
                             yellow("review-context")
                         }
@@ -156,10 +159,16 @@ pub(crate) fn print_trace_event(event: AgentTraceEvent, verbose: bool) {
         AgentTraceEvent::ToolExecuted {
             step: _,
             tool,
+            cache_hit,
             observation,
         } => {
-            println!("  tool: {tool}");
+            let cache = if cache_hit { "cache hit" } else { "cache miss" };
+            println!("  tool: {tool} ({cache})");
             println!("  observation: {}", summarize_observation(&observation));
+        }
+        AgentTraceEvent::NonProgressTerminated { step: _, response } => {
+            println!("  non-progress termination: {:?}", response.status);
+            println!("    {}", response.description);
         }
         AgentTraceEvent::FinalVerdict { step: _, response } => {
             println!(

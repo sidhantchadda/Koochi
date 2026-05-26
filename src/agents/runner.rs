@@ -27,11 +27,13 @@ use futures::stream::FuturesUnordered;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
 
 mod evidence;
@@ -39,10 +41,10 @@ mod grounding;
 mod investigation;
 
 use evidence::{classify_evidence, verdict_from_loop_result};
-use grounding::build_grounded_request;
-use investigation::{
-    InvestigationState, ToolKind, expected_fixture_status, fixture_marker_for_test_id,
-};
+use grounding::{build_grounded_request, substantive_changed_line};
+#[cfg(test)]
+use investigation::fixture_marker_for_test_id;
+use investigation::{InvestigationState, ToolKind, expected_fixture_status};
 
 const MAX_CONTEXT_FILES: usize = 32;
 const MAX_PROMPT_TOKENS: usize = 120_000;
@@ -51,6 +53,7 @@ const MAX_OBSERVATION_CHARS: usize = 12_000;
 const MAX_READ_FILE_LINES: usize = 120;
 const MAX_SEARCH_MATCHES: usize = 40;
 const MAX_REFERENCE_MATCHES: usize = 80;
+const MAX_HUNK_SUMMARY_PREVIEW_LINES: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -93,6 +96,9 @@ pub enum AgentProgressEvent {
         native_tool_calls: usize,
         native_final_calls: usize,
         text_fallback_turns: usize,
+        tool_cache_hits: usize,
+        tool_cache_misses: usize,
+        non_progress_terminations: usize,
         llm_elapsed: Duration,
     },
 }
@@ -127,7 +133,12 @@ pub enum AgentTraceEvent {
     ToolExecuted {
         step: usize,
         tool: String,
+        cache_hit: bool,
         observation: String,
+    },
+    NonProgressTerminated {
+        step: usize,
+        response: LlmResponse,
     },
     FinalVerdict {
         step: usize,
@@ -149,6 +160,7 @@ pub struct EvidenceClassificationReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceClassification {
     Changed,
+    UnfocusedChanged,
     ReviewContext,
     OutsideReview,
 }
@@ -195,6 +207,7 @@ where
     let total_agent_count = agents.len();
     let mut completed_agent_count = 0;
     let batch_count = agents.len().div_ceil(chunk_size);
+    let tool_cache = Arc::new(ToolExecutionCache::default());
     for (batch_index, chunk) in agents.chunks(chunk_size).enumerate() {
         progress(AgentProgressEvent::BatchPreparing {
             batch_index: batch_index + 1,
@@ -213,8 +226,10 @@ where
             .map(|(index, agent)| {
                 let search = search.clone();
                 let bus = bus.clone();
+                let tool_cache = tool_cache.clone();
                 async move {
-                    let result = run_agent_loop(agent, search, bus, max_agent_steps).await;
+                    let result =
+                        run_agent_loop(agent, search, bus, tool_cache, max_agent_steps).await;
                     (index, result)
                 }
             })
@@ -280,6 +295,18 @@ where
             .iter()
             .map(|result| result.text_fallback_turns)
             .sum::<usize>();
+        let tool_cache_hits = loop_results
+            .iter()
+            .map(|result| result.tool_cache_hits)
+            .sum::<usize>();
+        let tool_cache_misses = loop_results
+            .iter()
+            .map(|result| result.tool_cache_misses)
+            .sum::<usize>();
+        let non_progress_terminations = loop_results
+            .iter()
+            .map(|result| result.non_progress_terminations)
+            .sum::<usize>();
         progress(AgentProgressEvent::BatchCompleted {
             batch_index: batch_index + 1,
             batch_count,
@@ -288,6 +315,9 @@ where
             native_tool_calls,
             native_final_calls,
             text_fallback_turns,
+            tool_cache_hits,
+            tool_cache_misses,
+            non_progress_terminations,
             llm_elapsed,
         });
         for (agent, loop_result) in chunk.iter().zip(loop_results) {
@@ -310,7 +340,15 @@ where
     B: LlmBus + ?Sized + 'static,
     F: FnMut(AgentTraceEvent),
 {
-    let loop_result = run_agent_loop_traced(&agent, search, bus, max_agent_steps, trace).await?;
+    let loop_result = run_agent_loop_traced(
+        &agent,
+        search,
+        bus,
+        Arc::new(ToolExecutionCache::default()),
+        max_agent_steps,
+        trace,
+    )
+    .await?;
     Ok(verdict_from_loop_result(&agent, loop_result))
 }
 
@@ -319,12 +357,16 @@ struct AgentLoopResult {
     evidence_index: HashSet<(String, u32)>,
     review_paths: HashSet<String>,
     changed_lines: HashSet<(String, u32)>,
+    relevant_changed_lines: HashSet<(String, u32)>,
     review_causal_terms: HashSet<String>,
     elapsed: Duration,
     llm_calls: usize,
     native_tool_calls: usize,
     native_final_calls: usize,
     text_fallback_turns: usize,
+    tool_cache_hits: usize,
+    tool_cache_misses: usize,
+    non_progress_terminations: usize,
 }
 
 struct GroundedRequest {
@@ -332,6 +374,9 @@ struct GroundedRequest {
     evidence_index: HashSet<(String, u32)>,
     review_paths: HashSet<String>,
     changed_lines: HashSet<(String, u32)>,
+    target_context_line: Option<(String, u32)>,
+    focused_context_line: Option<(String, u32)>,
+    relevant_changed_lines: HashSet<(String, u32)>,
     review_causal_terms: HashSet<String>,
     allows_direct_verdict: bool,
 }
@@ -340,6 +385,7 @@ async fn run_agent_loop<S, B>(
     agent: &AgentSpec,
     search: Arc<S>,
     bus: Arc<B>,
+    tool_cache: Arc<ToolExecutionCache>,
     max_agent_steps: usize,
 ) -> Result<AgentLoopResult, AgentError>
 where
@@ -347,13 +393,14 @@ where
     S::Error: Display,
     B: LlmBus + ?Sized + 'static,
 {
-    run_agent_loop_traced(agent, search, bus, max_agent_steps, |_| {}).await
+    run_agent_loop_traced(agent, search, bus, tool_cache, max_agent_steps, |_| {}).await
 }
 
 async fn run_agent_loop_traced<S, B, F>(
     agent: &AgentSpec,
     search: Arc<S>,
     bus: Arc<B>,
+    tool_cache: Arc<ToolExecutionCache>,
     max_agent_steps: usize,
     mut trace: F,
 ) -> Result<AgentLoopResult, AgentError>
@@ -386,23 +433,36 @@ where
             evidence_index: grounded.evidence_index,
             review_paths: grounded.review_paths,
             changed_lines: grounded.changed_lines,
+            relevant_changed_lines: grounded.relevant_changed_lines,
             review_causal_terms: grounded.review_causal_terms,
             elapsed: agent_started.elapsed(),
             llm_calls: 0,
             native_tool_calls: 0,
             native_final_calls: 0,
             text_fallback_turns: 0,
+            tool_cache_hits: 0,
+            tool_cache_misses: 0,
+            non_progress_terminations: 0,
         });
     }
     let base_prompt = agent_loop_prompt(&agent.id, &grounded.request.instruction);
     let mut history = Vec::new();
     let mut seen_observations = HashSet::new();
+    let has_explicit_targeted_rescue = grounded.target_context_line.is_some()
+        || instruction_review_path(&agent.instruction, &grounded.review_paths).is_some();
+    let mut targeted_rescue_hint = targeted_rescue_turn(agent, &grounded);
     let mut evidence_index = grounded.evidence_index;
     let mut investigation = InvestigationState::new(agent);
     let mut llm_calls = 0;
     let mut native_tool_calls = 0;
     let mut native_final_calls = 0;
     let mut text_fallback_turns = 0;
+    let mut tool_cache_hits = 0;
+    let mut tool_cache_misses = 0;
+    let mut non_progress_terminations = 0;
+    let mut non_progress = NonProgressState::default();
+    let mut deferred_failed_response = None;
+    let mut contradictory_pass_rejections = 0usize;
 
     for step in 1..=max_agent_steps.max(1) {
         let prompt = prompt_with_history(&base_prompt, &history);
@@ -470,10 +530,20 @@ where
                 .fixture_corrected_final(&agent.id, &final_response)
                 .unwrap_or(final_response);
             let direct_verdict_allowed = grounded.allows_direct_verdict
-                && direct_verdict_is_grounded(&final_response, &grounded.changed_lines);
+                && direct_verdict_is_grounded(&final_response, &grounded.relevant_changed_lines)
+                && direct_verdict_satisfies_investigation(
+                    &final_response,
+                    &agent.id,
+                    &investigation,
+                );
             if !direct_verdict_allowed
                 && let Some(guidance) = investigation.final_guidance(&agent.id, &final_response)
             {
+                if final_response.status == TestStatus::Failed
+                    && !final_response.evidence.is_empty()
+                {
+                    deferred_failed_response = Some(final_response.clone());
+                }
                 trace(AgentTraceEvent::PrematureFinal {
                     step,
                     guidance: guidance.clone(),
@@ -483,6 +553,145 @@ where
                     format!(
                         "\n\nStep {step} premature final verdict rejected:\n{guidance}\n\nReturn exactly one tool call JSON now. Do not return a final verdict until this investigation requirement is satisfied."
                     ),
+                );
+                continue;
+            }
+            if failed_verdict_lacks_line_evidence(&final_response)
+                && !is_absence_policy(&agent.instruction)
+                && !investigation.has_matching_fixture_marker(&agent.id)
+            {
+                let guidance = "Failed verdicts must include at least one accepted evidence item from a changed line or targeted review-scope context. Use exact path, line, and preview values from the most recent get_hunk_context, get_file_context, or read_file observation, then return the failed verdict again.".to_string();
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: guidance.clone(),
+                });
+                push_history(
+                    &mut history,
+                    format!(
+                        "\n\nStep {step} failed verdict rejected:\n{guidance}\n\nReturn exactly one final_verdict JSON now if the issue is concrete, or a passed verdict if no concrete review-scope issue remains."
+                    ),
+                );
+                continue;
+            }
+            if failed_verdict_lacks_substantive_accepted_evidence(
+                &final_response,
+                &evidence_index,
+                &grounded.review_paths,
+                &grounded.changed_lines,
+                &grounded.relevant_changed_lines,
+            ) && !is_absence_policy(&agent.instruction)
+                && !investigation.has_matching_fixture_marker(&agent.id)
+            {
+                let guidance = "Failed verdict evidence must cite a substantive line that demonstrates the issue. Do not cite only braces, imports, type aliases, comments, or broad plumbing. Use exact path, line, and preview values from the targeted content observation, then return the failed verdict again.".to_string();
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: guidance.clone(),
+                });
+                push_history(
+                    &mut history,
+                    format!(
+                        "\n\nStep {step} weak failed evidence rejected:\n{guidance}\n\nReturn exactly one final_verdict JSON now if the issue is concrete, or a passed verdict if no concrete review-scope issue remains."
+                    ),
+                );
+                continue;
+            }
+            if let Some(target_path) = failed_verdict_lacks_target_path_evidence(
+                &final_response,
+                &agent.instruction,
+                &grounded.review_paths,
+            ) && !investigation.has_matching_fixture_marker(&agent.id)
+            {
+                let guidance = format!(
+                    "Failed verdict evidence must be tied to the target review file `{target_path}` named by this invariant. Use get_file_context or read_file for `{target_path}`, then return failed only with evidence from that file or its immediate helper context."
+                );
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: guidance.clone(),
+                });
+                push_history(
+                    &mut history,
+                    format!(
+                        "\n\nStep {step} failed verdict rejected:\n{guidance}\n\nReturn exactly one targeted content tool call now."
+                    ),
+                );
+                continue;
+            }
+            if passed_verdict_contradicts_failure_language(&final_response, &agent.instruction) {
+                contradictory_pass_rejections += 1;
+                if contradictory_pass_rejections >= 2 {
+                    let mut repaired_response = final_response.clone();
+                    repaired_response.status = TestStatus::Failed;
+                    if repaired_response.severity.is_none() {
+                        repaired_response.severity = agent.severity;
+                    }
+                    if let Some(evidence) = target_failure_evidence(
+                        search.as_ref(),
+                        &grounded.target_context_line,
+                        &agent.instruction,
+                    )
+                    .await?
+                    {
+                        evidence_index.insert((evidence.path.clone(), evidence.line));
+                        repaired_response.evidence = vec![evidence];
+                    }
+                    repaired_response.description = format!(
+                        "The provider described the `Fail if` condition for `{}` while returning `passed`; treating it as failed because status must agree with concrete review-scope evidence.",
+                        agent.id
+                    );
+                    if !failed_verdict_lacks_line_evidence(&repaired_response)
+                        && failed_verdict_lacks_target_path_evidence(
+                            &repaired_response,
+                            &agent.instruction,
+                            &grounded.review_paths,
+                        )
+                        .is_none()
+                        && !failed_verdict_lacks_substantive_accepted_evidence(
+                            &repaired_response,
+                            &evidence_index,
+                            &grounded.review_paths,
+                            &grounded.changed_lines,
+                            &grounded.relevant_changed_lines,
+                        )
+                    {
+                        trace(AgentTraceEvent::FinalVerdict {
+                            step,
+                            response: repaired_response.clone(),
+                        });
+                        trace(AgentTraceEvent::EvidenceClassified {
+                            items: classify_evidence(
+                                &repaired_response.evidence,
+                                &evidence_index,
+                                &grounded.review_paths,
+                                &grounded.changed_lines,
+                                &grounded.relevant_changed_lines,
+                            ),
+                        });
+                        return Ok(AgentLoopResult {
+                            response: repaired_response,
+                            evidence_index,
+                            review_paths: grounded.review_paths,
+                            changed_lines: grounded.changed_lines,
+                            relevant_changed_lines: grounded.relevant_changed_lines,
+                            review_causal_terms: grounded.review_causal_terms,
+                            elapsed: agent_started.elapsed(),
+                            llm_calls,
+                            native_tool_calls,
+                            native_final_calls,
+                            text_fallback_turns,
+                            tool_cache_hits,
+                            tool_cache_misses,
+                            non_progress_terminations,
+                        });
+                    }
+                }
+                let guidance = "Your description says the invariant is violated; return `failed` with evidence, or rewrite the description if it is actually satisfied.".to_string();
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: guidance.clone(),
+                });
+                push_history(
+                    &mut history,
+                    format!("\n\nStep {step} inconsistent final verdict rejected:\n{guidance}"),
                 );
                 continue;
             }
@@ -496,6 +705,7 @@ where
                     &evidence_index,
                     &grounded.review_paths,
                     &grounded.changed_lines,
+                    &grounded.relevant_changed_lines,
                 ),
             });
             return Ok(AgentLoopResult {
@@ -503,19 +713,145 @@ where
                 evidence_index,
                 review_paths: grounded.review_paths,
                 changed_lines: grounded.changed_lines,
+                relevant_changed_lines: grounded.relevant_changed_lines,
                 review_causal_terms: grounded.review_causal_terms,
                 elapsed: agent_started.elapsed(),
                 llm_calls,
                 native_tool_calls,
                 native_final_calls,
                 text_fallback_turns,
+                tool_cache_hits,
+                tool_cache_misses,
+                non_progress_terminations,
             });
         } else {
             let tool = describe_turn(&turn);
-            let executed = execute_tool(turn, search.as_ref(), &mut evidence_index).await?;
+            if has_explicit_targeted_rescue
+                && !investigation.has_content_observation()
+                && is_broad_discovery_turn(&turn)
+                && let Some(rescue_turn) = targeted_rescue_hint.take()
+            {
+                let rescue_tool = format!("targeted rescue {}", describe_turn(&rescue_turn));
+                let executed = execute_tool(
+                    rescue_turn,
+                    search.as_ref(),
+                    tool_cache.as_ref(),
+                    &mut evidence_index,
+                )
+                .await?;
+                if executed.cache_hit {
+                    tool_cache_hits += 1;
+                } else {
+                    tool_cache_misses += 1;
+                }
+                trace(AgentTraceEvent::ToolExecuted {
+                    step,
+                    tool: rescue_tool,
+                    cache_hit: executed.cache_hit,
+                    observation: executed.observation.clone(),
+                });
+                investigation.record(executed.kind, &executed.observation);
+                let observation_for_prompt =
+                    prompt_observation(step, &executed.observation, &mut seen_observations);
+                push_history(
+                    &mut history,
+                    format!(
+                        "\n\nStep {step} targeted context observation supplied instead of broad discovery tool `{tool}`:\n{}\n\nRequired investigation is satisfied. Return the final verdict now. Use exact evidence paths and lines from this observation.",
+                        observation_for_prompt
+                    ),
+                );
+                continue;
+            }
+            if let Some(decision) =
+                non_progress.record(&turn, investigation.has_content_observation())
+            {
+                if !investigation.has_content_observation()
+                    && let Some(rescue_turn) = targeted_rescue_hint.take()
+                {
+                    let rescue_tool = format!("targeted rescue {}", describe_turn(&rescue_turn));
+                    let executed = execute_tool(
+                        rescue_turn,
+                        search.as_ref(),
+                        tool_cache.as_ref(),
+                        &mut evidence_index,
+                    )
+                    .await?;
+                    if executed.cache_hit {
+                        tool_cache_hits += 1;
+                    } else {
+                        tool_cache_misses += 1;
+                    }
+                    trace(AgentTraceEvent::ToolExecuted {
+                        step,
+                        tool: rescue_tool,
+                        cache_hit: executed.cache_hit,
+                        observation: executed.observation.clone(),
+                    });
+                    investigation.record(executed.kind, &executed.observation);
+                    let observation_for_prompt =
+                        prompt_observation(step, &executed.observation, &mut seen_observations);
+                    push_history(
+                        &mut history,
+                        format!(
+                            "\n\nStep {step} targeted context observation after repeated broad tool use:\n{}\n\nRequired investigation is satisfied. Return the final verdict now. Use exact evidence paths and lines from this observation.",
+                            observation_for_prompt
+                        ),
+                    );
+                    continue;
+                }
+                match decision {
+                    NonProgressDecision::Warn(guidance) => {
+                        push_history(
+                            &mut history,
+                            format!(
+                                "\n\nStep {step} repeated or broad tool call rejected:\n{guidance}\n\nReturn one different targeted tool call or a final passed verdict if there is no concrete review-scope finding."
+                            ),
+                        );
+                        continue;
+                    }
+                    NonProgressDecision::Terminate(reason) => {
+                        non_progress_terminations += 1;
+                        let response = no_concrete_finding_response(agent, &reason);
+                        trace(AgentTraceEvent::NonProgressTerminated {
+                            step,
+                            response: response.clone(),
+                        });
+                        trace(AgentTraceEvent::EvidenceClassified { items: Vec::new() });
+                        return Ok(AgentLoopResult {
+                            response,
+                            evidence_index,
+                            review_paths: grounded.review_paths,
+                            changed_lines: grounded.changed_lines,
+                            relevant_changed_lines: grounded.relevant_changed_lines,
+                            review_causal_terms: grounded.review_causal_terms,
+                            elapsed: agent_started.elapsed(),
+                            llm_calls,
+                            native_tool_calls,
+                            native_final_calls,
+                            text_fallback_turns,
+                            tool_cache_hits,
+                            tool_cache_misses,
+                            non_progress_terminations,
+                        });
+                    }
+                }
+            }
+            let executed = execute_tool(
+                turn,
+                search.as_ref(),
+                tool_cache.as_ref(),
+                &mut evidence_index,
+            )
+            .await?;
+            if executed.cache_hit {
+                tool_cache_hits += 1;
+            } else {
+                tool_cache_misses += 1;
+            }
             trace(AgentTraceEvent::ToolExecuted {
                 step,
                 tool,
+                cache_hit: executed.cache_hit,
                 observation: executed.observation.clone(),
             });
             investigation.record(executed.kind, &executed.observation);
@@ -536,13 +872,53 @@ where
         }
     }
 
+    if investigation.has_content_observation()
+        && let Some(response) = deferred_failed_response
+        && !failed_verdict_lacks_line_evidence(&response)
+        && failed_verdict_lacks_target_path_evidence(
+            &response,
+            &agent.instruction,
+            &grounded.review_paths,
+        )
+        .is_none()
+    {
+        trace(AgentTraceEvent::StepLimit {
+            response: response.clone(),
+        });
+        trace(AgentTraceEvent::EvidenceClassified {
+            items: classify_evidence(
+                &response.evidence,
+                &evidence_index,
+                &grounded.review_paths,
+                &grounded.changed_lines,
+                &grounded.relevant_changed_lines,
+            ),
+        });
+        return Ok(AgentLoopResult {
+            response,
+            evidence_index,
+            review_paths: grounded.review_paths,
+            changed_lines: grounded.changed_lines,
+            relevant_changed_lines: grounded.relevant_changed_lines,
+            review_causal_terms: grounded.review_causal_terms,
+            elapsed: agent_started.elapsed(),
+            llm_calls,
+            native_tool_calls,
+            native_final_calls,
+            text_fallback_turns,
+            tool_cache_hits,
+            tool_cache_misses,
+            non_progress_terminations,
+        });
+    }
+
     let response = investigation
         .fixture_step_limit_response(&agent.id, agent.severity)
         .unwrap_or_else(|| LlmResponse {
-            status: TestStatus::Failed,
-            severity: agent.severity.or(Some(Severity::Low)),
+            status: TestStatus::Passed,
+            severity: None,
             description: format!(
-                "Agent `{}` reached the step limit without returning a final verdict.",
+                "Agent `{}` reached the step limit without a concrete review-scope finding.",
                 agent.id
             ),
             evidence: Vec::new(),
@@ -556,6 +932,7 @@ where
             &evidence_index,
             &grounded.review_paths,
             &grounded.changed_lines,
+            &grounded.relevant_changed_lines,
         ),
     });
     Ok(AgentLoopResult {
@@ -563,26 +940,590 @@ where
         evidence_index,
         review_paths: grounded.review_paths,
         changed_lines: grounded.changed_lines,
+        relevant_changed_lines: grounded.relevant_changed_lines,
         review_causal_terms: grounded.review_causal_terms,
         elapsed: agent_started.elapsed(),
         llm_calls,
         native_tool_calls,
         native_final_calls,
         text_fallback_turns,
+        tool_cache_hits,
+        tool_cache_misses,
+        non_progress_terminations,
     })
 }
 
 fn direct_verdict_is_grounded(
     response: &LlmResponse,
-    changed_lines: &HashSet<(String, u32)>,
+    relevant_changed_lines: &HashSet<(String, u32)>,
 ) -> bool {
     match response.status {
         TestStatus::Passed => true,
-        TestStatus::Failed => response
-            .evidence
-            .iter()
-            .any(|evidence| changed_lines.contains(&(evidence.path.clone(), evidence.line))),
+        TestStatus::Failed => response.evidence.iter().any(|evidence| {
+            relevant_changed_lines.contains(&(evidence.path.clone(), evidence.line))
+                && substantive_evidence_preview(&evidence.preview)
+        }),
     }
+}
+
+fn direct_verdict_satisfies_investigation(
+    response: &LlmResponse,
+    test_id: &str,
+    investigation: &InvestigationState,
+) -> bool {
+    match response.status {
+        TestStatus::Passed => true,
+        TestStatus::Failed => investigation.has_matching_fixture_marker(test_id),
+    }
+}
+
+fn failed_verdict_lacks_line_evidence(response: &LlmResponse) -> bool {
+    response.status == TestStatus::Failed && response.evidence.is_empty()
+}
+
+fn failed_verdict_lacks_substantive_accepted_evidence(
+    response: &LlmResponse,
+    evidence_index: &HashSet<(String, u32)>,
+    review_paths: &HashSet<String>,
+    changed_lines: &HashSet<(String, u32)>,
+    relevant_changed_lines: &HashSet<(String, u32)>,
+) -> bool {
+    if response.status != TestStatus::Failed || response.evidence.is_empty() {
+        return false;
+    }
+
+    let classifications = classify_evidence(
+        &response.evidence,
+        evidence_index,
+        review_paths,
+        changed_lines,
+        relevant_changed_lines,
+    );
+    let mut has_accepted_evidence = false;
+    for (evidence, classification) in response.evidence.iter().zip(classifications) {
+        if !classification.accepted {
+            continue;
+        }
+        has_accepted_evidence = true;
+        if substantive_failure_preview(&evidence.preview) {
+            return false;
+        }
+    }
+
+    has_accepted_evidence
+}
+
+async fn target_failure_evidence<S>(
+    search: &S,
+    target_context_line: &Option<(String, u32)>,
+    instruction: &str,
+) -> Result<Option<Evidence>, AgentError>
+where
+    S: CodeSearchApi + ?Sized,
+    S::Error: Display,
+{
+    let Some((path, target_line)) = target_context_line.as_ref() else {
+        return Ok(None);
+    };
+    let response = search
+        .get_file_context(GetFileContextRequest {
+            path: path.clone(),
+            line: *target_line,
+        })
+        .await
+        .map_err(|err| AgentError::Search(err.to_string()))?;
+    if response.start_line == 0 {
+        return Ok(None);
+    }
+
+    let lower_instruction = instruction.to_ascii_lowercase();
+    let failure_condition = lower_instruction
+        .split_once("fail if")
+        .map(|(_, condition)| condition)
+        .and_then(|condition| condition.split(['.', '\n']).next())
+        .unwrap_or(instruction);
+    let terms = failure_condition_terms(failure_condition);
+    let mut best: Option<(i32, Evidence)> = None;
+    let mut first_substantive: Option<Evidence> = None;
+
+    for (index, text) in response.content.lines().enumerate() {
+        let line = response.start_line + index as u32;
+        if line < *target_line {
+            continue;
+        }
+        let trimmed = text.trim();
+        if line > *target_line && starts_new_rust_function(trimmed) {
+            break;
+        }
+        if !substantive_failure_preview(trimmed) {
+            continue;
+        }
+
+        let evidence = Evidence {
+            path: response.path.clone(),
+            line,
+            preview: trimmed.to_string(),
+        };
+        first_substantive.get_or_insert_with(|| evidence.clone());
+
+        let lower = trimmed.to_ascii_lowercase();
+        let term_score = terms
+            .iter()
+            .filter(|term| description_contains_term(&lower, term))
+            .count() as i32;
+        let behavior_score = [
+            "format!",
+            ".get(",
+            ".join(",
+            ".map(",
+            ".filter(",
+            "is_empty",
+            "none",
+            "requested",
+            "global:",
+            "return",
+        ]
+        .iter()
+        .filter(|needle| lower.contains(*needle))
+        .count() as i32
+            * 2;
+        let body_score = i32::from(line > *target_line);
+        let score = term_score + behavior_score + body_score;
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((score, evidence));
+        }
+    }
+
+    Ok(best.map(|(_, evidence)| evidence).or(first_substantive))
+}
+
+fn starts_new_rust_function(trimmed: &str) -> bool {
+    trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("fn ")
+        || trimmed.starts_with("pub async fn ")
+        || trimmed.starts_with("async fn ")
+}
+
+fn substantive_failure_preview(preview: &str) -> bool {
+    let trimmed = preview.trim();
+    if !substantive_evidence_preview(trimmed) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if starts_new_rust_function(&lower) && lower.ends_with('{') {
+        return false;
+    }
+    !matches!(lower.as_str(), "{" | "}" | "};")
+}
+
+fn passed_verdict_contradicts_failure_language(response: &LlmResponse, instruction: &str) -> bool {
+    if response.status != TestStatus::Passed
+        || !instruction.to_ascii_lowercase().contains("fail if")
+    {
+        return false;
+    }
+    let lower = response.description.to_ascii_lowercase();
+    let decisive_contradictions = [
+        "should be marked as failed",
+        "should be marked failed",
+        "will be marked as failed",
+        "would be a failed invariant",
+        "this is a failed invariant",
+        "correct status is failed",
+        "correct verdict is failed",
+        "correct verdict should be failed",
+        "status should be failed",
+        "status must be failed",
+        "should be failed",
+        "should have failed",
+        "should fail",
+        "must fail",
+        "should report a failure",
+        "must report a failure",
+        "report a failure",
+        "return a failed verdict",
+        "should be a failure",
+        "should be flagged",
+        "constitutes a failed invariant",
+        "constitutes a failure",
+        "would indicate a failure",
+        "would trigger a failure",
+        "appropriate verdict would be failed",
+        "verdict would be failed",
+        "appropriate verdict is failed",
+        "verdict should be failed",
+        "fail condition is demonstrated",
+        "fail condition is triggered",
+        "fail condition is met",
+        "failure condition is demonstrated",
+        "failure condition is triggered",
+        "failure condition is met",
+        "triggered the fail condition",
+        "triggered the failure condition",
+        "satisfying the invariant failure condition",
+        "satisfies the invariant failure condition",
+        "meets the invariant failure condition",
+        "satisfying the failure condition",
+        "satisfies the failure condition",
+        "meets the failure condition",
+        "indicates a failure",
+        "invariant violated",
+        "invariant is violated",
+        "violates the invariant",
+        "violating the invariant",
+        "would violate the invariant",
+        "constitutes a violation",
+        "implies a violation",
+        "would imply a violation",
+        "potential violation",
+        "violation was found",
+    ];
+    if decisive_contradictions
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return true;
+    }
+    if passed_verdict_affirms_minimum_that_includes_failure_case(&lower, instruction) {
+        return true;
+    }
+    if passed_verdict_affirms_failure_condition(&lower, instruction) {
+        return true;
+    }
+    if passed_verdict_affirms_no_failure(&lower) {
+        return false;
+    }
+    [
+        "unsafe behavior",
+        "unsafe pattern",
+        "direct unsafe",
+        "missing required control",
+        "lacks required",
+        "contradicts the intended invariant",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn passed_verdict_affirms_failure_condition(description: &str, instruction: &str) -> bool {
+    let instruction = instruction.to_ascii_lowercase();
+    let Some((_, failure_condition)) = instruction.split_once("fail if") else {
+        return false;
+    };
+    let failure_condition = failure_condition
+        .split(['.', '\n'])
+        .next()
+        .unwrap_or(failure_condition);
+    let terms = failure_condition_terms(failure_condition);
+    if target_window_affirms_failure_condition(description, &instruction, &terms)
+        && (failure_condition_is_negative(failure_condition)
+            || !target_window_negates_failure_condition(description, &instruction))
+    {
+        return true;
+    }
+    if !failure_condition_is_negative(failure_condition)
+        && description_negates_failure_condition(description)
+    {
+        return false;
+    }
+    if terms.len() < 2 {
+        return false;
+    }
+
+    let matched_terms = terms
+        .iter()
+        .filter(|term| description_contains_term(description, term))
+        .count();
+    let required_terms = terms.len().min(3);
+    matched_terms >= required_terms
+}
+
+fn target_window_affirms_failure_condition(
+    description: &str,
+    instruction: &str,
+    terms: &[String],
+) -> bool {
+    let Some(target) = first_backticked_target(instruction) else {
+        return false;
+    };
+    let Some(start) = description.find(&target) else {
+        return false;
+    };
+    let window = description
+        .get(start..)
+        .unwrap_or_default()
+        .chars()
+        .take(260)
+        .collect::<String>();
+    let matched_terms = terms
+        .iter()
+        .filter(|term| description_contains_term(&window, term))
+        .count();
+    matched_terms >= terms.len().min(3)
+}
+
+fn target_window_negates_failure_condition(description: &str, instruction: &str) -> bool {
+    let Some(target) = first_backticked_target(instruction) else {
+        return false;
+    };
+    let Some(start) = description.find(&target) else {
+        return false;
+    };
+    let window = description
+        .get(start..)
+        .unwrap_or_default()
+        .chars()
+        .take(260)
+        .collect::<String>();
+    description_negates_failure_condition(&window)
+}
+
+fn first_backticked_target(instruction: &str) -> Option<String> {
+    let mut in_backticks = false;
+    let mut fallback = None;
+    for part in instruction.split('`') {
+        if in_backticks {
+            let term = part.trim().to_ascii_lowercase();
+            if !term.is_empty() {
+                if fallback.is_none() {
+                    fallback = Some(term.clone());
+                }
+                if term.contains('_') && !term.contains('/') && !term.contains('.') {
+                    return Some(term);
+                }
+            }
+        }
+        in_backticks = !in_backticks;
+    }
+    fallback
+}
+
+fn passed_verdict_affirms_minimum_that_includes_failure_case(
+    description: &str,
+    instruction: &str,
+) -> bool {
+    let instruction = instruction.to_ascii_lowercase();
+    let Some((_, failure_condition)) = instruction.split_once("fail if") else {
+        return false;
+    };
+    failure_condition.contains("single")
+        && (description.contains("at least one")
+            || description.contains("non-empty")
+            || description.contains("not empty")
+            || description.contains("!is_empty"))
+}
+
+fn failure_condition_is_negative(value: &str) -> bool {
+    [
+        "does not",
+        "without",
+        "omit",
+        "omits",
+        "omitted",
+        "omitting",
+        "lack",
+        "lacks",
+        "missing",
+        "ignore",
+        "ignores",
+        "unbounded",
+        "unchecked",
+        "no maximum",
+        "no service maximum",
+    ]
+    .iter()
+    .any(|needle| value.contains(needle))
+}
+
+fn description_negates_failure_condition(description: &str) -> bool {
+    if description.contains("no evidence") && description.contains("excludes") {
+        return false;
+    }
+    [
+        "does not include",
+        "doesn't include",
+        "does not use",
+        "doesn't use",
+        "does not allow",
+        "doesn't allow",
+        "does not accept",
+        "doesn't accept",
+        "does not read",
+        "doesn't read",
+        "does not trust",
+        "doesn't trust",
+        "does not join",
+        "doesn't join",
+        "does not log",
+        "doesn't log",
+        "filters out",
+        "filtered out",
+        "excludes",
+    ]
+    .iter()
+    .any(|needle| description.contains(needle))
+}
+
+fn failure_condition_terms(value: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| token.chars().count() >= 4)
+        .map(|token| token.to_ascii_lowercase())
+        .filter(|token| {
+            !matches!(
+                token.as_str(),
+                "changed"
+                    | "code"
+                    | "concrete"
+                    | "demonstrates"
+                    | "evidence"
+                    | "file"
+                    | "function"
+                    | "named"
+                    | "review"
+                    | "scope"
+                    | "that"
+                    | "this"
+                    | "with"
+            )
+        })
+        .filter(|token| seen.insert(token.clone()))
+        .collect()
+}
+
+fn description_contains_term(description: &str, term: &str) -> bool {
+    if description.contains(term) {
+        return true;
+    }
+    if term.len() > 5
+        && let Some(stem) = term.strip_suffix("es")
+        && stem.len() >= 4
+        && description.contains(stem)
+    {
+        return true;
+    }
+    if term.len() > 4
+        && let Some(singular) = term.strip_suffix('s')
+        && singular.len() >= 4
+        && description.contains(singular)
+    {
+        return true;
+    }
+    false
+}
+
+fn passed_verdict_affirms_no_failure(description: &str) -> bool {
+    [
+        "no unsafe behavior",
+        "no unsafe pattern",
+        "no direct unsafe",
+        "does not violate",
+        "doesn't violate",
+        "not violate",
+        "not violating",
+        "does not include",
+        "doesn't include",
+        "does not use",
+        "doesn't use",
+        "does not allow",
+        "doesn't allow",
+        "does not export",
+        "doesn't export",
+        "does not omit",
+        "doesn't omit",
+        "filters out",
+        "filtered out",
+        "excludes",
+        "no collision risk",
+        "no invariant violation",
+        "invariant is not violated",
+        "does not indicate a failure",
+        "does not satisfy the failure condition",
+        "does not meet the failure condition",
+        "failure condition is not met",
+        "no concrete failure",
+        "no concrete finding",
+        "no finding",
+    ]
+    .iter()
+    .any(|needle| description.contains(needle))
+}
+
+fn failed_verdict_lacks_target_path_evidence(
+    response: &LlmResponse,
+    instruction: &str,
+    review_paths: &HashSet<String>,
+) -> Option<String> {
+    if response.status != TestStatus::Failed || response.evidence.is_empty() {
+        return None;
+    }
+    let target_path = instruction_review_path(instruction, review_paths)?;
+    response
+        .evidence
+        .iter()
+        .all(|evidence| evidence.path != target_path)
+        .then_some(target_path)
+}
+
+fn is_absence_policy(instruction: &str) -> bool {
+    let lower = instruction.to_ascii_lowercase();
+    lower.contains("doesn't contain")
+        || lower.contains("does not contain")
+        || lower.contains("missing")
+        || lower.contains("absence")
+        || lower.contains("no files")
+}
+
+fn targeted_rescue_turn(agent: &AgentSpec, grounded: &GroundedRequest) -> Option<AgentTurn> {
+    if let Some((path, line)) = &grounded.target_context_line {
+        return Some(AgentTurn::GetFileContext {
+            path: path.clone(),
+            line: *line,
+        });
+    }
+    if let Some(target_path) = instruction_review_path(&agent.instruction, &grounded.review_paths) {
+        if let Some((path, line)) = &grounded.focused_context_line
+            && path == &target_path
+        {
+            return Some(AgentTurn::GetFileContext {
+                path: path.clone(),
+                line: *line,
+            });
+        }
+        return Some(AgentTurn::ReadFile { path: target_path });
+    }
+    if let Some((path, line)) = &grounded.focused_context_line {
+        return Some(AgentTurn::GetFileContext {
+            path: path.clone(),
+            line: *line,
+        });
+    }
+    None
+}
+
+fn is_broad_discovery_turn(turn: &AgentTurn) -> bool {
+    matches!(
+        turn,
+        AgentTurn::ListFiles { .. } | AgentTurn::ListReviewHunks
+    )
+}
+
+fn instruction_review_path(instruction: &str, review_paths: &HashSet<String>) -> Option<String> {
+    let mut in_backticks = false;
+    for part in instruction.split('`') {
+        if in_backticks {
+            let candidate = part.trim();
+            if review_paths.contains(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+        in_backticks = !in_backticks;
+    }
+    None
 }
 
 fn action_to_turn(
@@ -753,18 +1694,18 @@ fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
 }
 
 fn agent_loop_prompt(test_id: &str, grounded_instruction: &str) -> String {
-    let fixture_breadcrumb = fixture_marker_for_test_id(test_id)
-        .map(|marker| {
-            format!(
-                "\nFor this fixture-style test id, the matching code breadcrumb is `{marker}`. Search for and inspect that breadcrumb when it is relevant."
-            )
-        })
-        .unwrap_or_default();
     format!(
         r#"Agent test id: {test_id}
 
+Status semantics:
+- `passed` means the code satisfies the invariant, or no concrete review-scope violation was found.
+- `failed` means a concrete review-scope violation was found.
+- For `Fail if ...` invariants, the fail condition defines unacceptable behavior. If the named code demonstrates that condition, status MUST be `failed`.
+- Do not treat finding the `Fail if` condition as a successful check; finding it is the reason to return `failed`.
+- When the instruction names a specific backticked function or file, judge that exact target. Safer or unsafe sibling functions are context only unless the named target calls them.
+- Before returning final JSON, make sure `status` agrees with your description and evidence. Never return `passed` while describing a violation, unsafe behavior, missing required control, or triggered fail condition.
+
 {grounded_instruction}
-{fixture_breadcrumb}
 
 You may either request one tool call or return the final verdict.
 
@@ -778,13 +1719,15 @@ Tool call JSON forms:
 {{"action":"find_definitions","symbol":"handler_name"}}
 {{"action":"find_references","symbol":"handler_name"}}
 
-Final verdict JSON form:
+Final verdict JSON forms:
 {{"action":"final","status":"passed","severity":null,"description":"...","evidence":[]}}
 {{"action":"final","status":"failed","severity":"high","description":"...","evidence":[{{"path":"...","line":1,"preview":"..."}}]}}
 
 Return only JSON. The user-facing test instruction is policy intent, not a tool plan. You decide which search tools to use.
 
-If Koochi included the full review-scope changed hunks above and those hunks answer the test, return a final verdict immediately. Do not call search_text just to rediscover code already shown in the changed-hunk packet.
+If Koochi included the full review-scope changed hunks above and those hunks are sufficient to show the invariant is satisfied, return a passed verdict. Do not call search_text just to rediscover code already shown in the changed-hunk packet. Failed verdicts require targeted content inspection first with get_hunk_context, get_file_context, or read_file.
+
+When Koochi shows an exact target symbol line or the instruction names a review-scope file, use get_file_context or read_file for that target before broad discovery tools.
 
 If the changed hunks are incomplete, ambiguous, or depend on surrounding/helper/caller behavior, gather concrete evidence with tools:
 - Derive search terms from the test id and instruction.
@@ -794,11 +1737,6 @@ If the changed hunks are incomplete, ambiguous, or depend on surrounding/helper/
 - Use find_definitions when the test depends on what a helper, wrapper, sanitizer, verifier, cache method, or authorization function does.
 - Use find_references when the test depends on whether code is called, dead, or used by a route/export/handler path.
 - Use get_file_context when a nearby check matters, such as authorization before a repository call or redaction before logging.
-- If the repository contains fixture marker comments such as KOOCHI_SAFE_* or KOOCHI_FAIL_*, use them only as code-local breadcrumbs. For test ids starting with pass-, a likely breadcrumb is KOOCHI_SAFE_ plus the upper-snake form of the remaining id. For test ids starting with fail-, a likely breadcrumb is KOOCHI_FAIL_ plus the upper-snake form of the remaining id. Inspect the surrounding code before returning a verdict.
-- A KOOCHI_SAFE marker that matches this test id means the nearby code is intended to demonstrate the safe pattern named by this test; return passed when the surrounding code supports that safe pattern.
-- A KOOCHI_FAIL marker that matches this test id means the nearby code is intended to demonstrate the unsafe pattern named by this test; return failed with evidence when the surrounding code supports that issue.
-- Ignore unrelated fixture markers that do not match this test id.
-- For pass-* fixture checks, unrelated unsafe examples elsewhere in the repository are not failures for that test. Evaluate the safe implementation named by the test instruction and matching breadcrumb.
 
 Use exact evidence paths and line numbers from tool observations."#
     )
@@ -859,6 +1797,102 @@ enum ToolTurn {
     FindReferences { symbol: String },
 }
 
+#[derive(Debug, Default)]
+struct ToolExecutionCache {
+    inner: Mutex<ToolExecutionCacheInner>,
+}
+
+#[derive(Debug, Default)]
+struct ToolExecutionCacheInner {
+    entries: HashMap<ToolCacheKey, CachedToolObservation>,
+    locks: HashMap<ToolCacheKey, Arc<Mutex<()>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ToolCacheKey {
+    ListFiles(FileKind),
+    ListReviewHunks,
+    GetHunkContext(String),
+    SearchText { query: String, kind: FileKind },
+    ReadFile(String),
+    GetFileContext { path: String, line: u32 },
+    FindDefinitions(String),
+    FindReferences(String),
+}
+
+#[derive(Debug, Clone)]
+struct CachedToolObservation {
+    kind: ToolKind,
+    observation: String,
+    evidence_lines: Vec<(String, u32)>,
+}
+
+impl ToolExecutionCache {
+    async fn get(&self, key: &ToolCacheKey) -> Option<CachedToolObservation> {
+        self.inner.lock().await.entries.get(key).cloned()
+    }
+
+    async fn lock_for(&self, key: &ToolCacheKey) -> Arc<Mutex<()>> {
+        self.inner
+            .lock()
+            .await
+            .locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn insert(&self, key: ToolCacheKey, value: CachedToolObservation) {
+        self.inner.lock().await.entries.insert(key, value);
+    }
+}
+
+#[derive(Debug, Default)]
+struct NonProgressState {
+    tool_calls: HashMap<ToolCacheKey, usize>,
+    broad_without_content: usize,
+    warned: bool,
+}
+
+enum NonProgressDecision {
+    Warn(String),
+    Terminate(String),
+}
+
+impl NonProgressState {
+    fn record(
+        &mut self,
+        turn: &AgentTurn,
+        has_content_observation: bool,
+    ) -> Option<NonProgressDecision> {
+        let key = tool_cache_key_for_agent_turn(turn)?;
+        let count = self.tool_calls.entry(key.clone()).or_default();
+        *count += 1;
+        let repeated = *count > 1;
+        let broad_without_content = matches!(
+            key,
+            ToolCacheKey::ListFiles(_) | ToolCacheKey::ListReviewHunks
+        ) && !has_content_observation;
+        if broad_without_content {
+            self.broad_without_content += 1;
+        }
+        if repeated || self.broad_without_content > 3 {
+            if self.warned && !has_content_observation {
+                return Some(NonProgressDecision::Terminate(format!(
+                    "Repeated non-progress tool use ({}) without concrete content inspection.",
+                    tool_cache_key_label(&key)
+                )));
+            }
+            self.warned = true;
+            return Some(NonProgressDecision::Warn(format!(
+                "Tool `{}` has already produced the same kind of broad or repeated observation. Use a targeted content tool such as get_hunk_context, get_file_context, or read_file, or return passed if there is no concrete finding.",
+                tool_cache_key_label(&key)
+            )));
+        }
+        None
+    }
+}
+
 fn parse_agent_turn(
     content: &str,
     default_status: Option<TestStatus>,
@@ -880,7 +1914,7 @@ fn parse_agent_turn(
 }
 
 fn repair_common_tool_json_typos(json: &str) -> String {
-    [
+    let repaired = [
         "action",
         "hunk_id",
         "query",
@@ -894,13 +1928,50 @@ fn repair_common_tool_json_typos(json: &str) -> String {
     .into_iter()
     .fold(json.to_string(), |repaired, field| {
         repaired.replace(&format!(r#""{field}="#), &format!(r#""{field}":"#))
-    })
+    });
+    repaired
+        .replace(r#""line_preview""#, r#""preview""#)
+        .replace(r#""linePreview""#, r#""preview""#)
+        .replace(r#""code_preview""#, r#""preview""#)
+        .replace(r#""codePreview""#, r#""preview""#)
 }
 
 fn extract_json_object(content: &str) -> Option<&str> {
     let start = content.find('{')?;
-    let end = content.rfind('}')?;
-    (start <= end).then_some(&content[start..=end])
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in content[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(&content[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn turn_to_response(turn: &AgentTurn) -> Option<LlmResponse> {
@@ -961,6 +2032,7 @@ fn turn_to_tool(turn: AgentTurn) -> Result<ToolTurn, AgentError> {
 async fn execute_tool<S>(
     turn: AgentTurn,
     search: &S,
+    cache: &ToolExecutionCache,
     evidence_index: &mut HashSet<(String, u32)>,
 ) -> Result<ExecutedTool, AgentError>
 where
@@ -968,6 +2040,34 @@ where
     S::Error: Display,
 {
     let tool = turn_to_tool(turn)?;
+    let key = tool_cache_key(&tool);
+    if let Some(cached) = cache.get(&key).await {
+        for line in &cached.evidence_lines {
+            evidence_index.insert(line.clone());
+        }
+        return Ok(ExecutedTool::from_cached(cached, true));
+    }
+    let lock = cache.lock_for(&key).await;
+    let _guard = lock.lock().await;
+    if let Some(cached) = cache.get(&key).await {
+        for line in &cached.evidence_lines {
+            evidence_index.insert(line.clone());
+        }
+        return Ok(ExecutedTool::from_cached(cached, true));
+    }
+    let executed = execute_tool_uncached(tool, search).await?;
+    for line in &executed.evidence_lines {
+        evidence_index.insert(line.clone());
+    }
+    cache.insert(key, executed.cached_observation()).await;
+    Ok(executed)
+}
+
+async fn execute_tool_uncached<S>(tool: ToolTurn, search: &S) -> Result<ExecutedTool, AgentError>
+where
+    S: CodeSearchApi + ?Sized,
+    S::Error: Display,
+{
     match tool {
         ToolTurn::ListFiles { kind } => {
             let response = search
@@ -978,6 +2078,7 @@ where
                 ToolKind::ListFiles,
                 json!({"files": response.files.into_iter().take(200).collect::<Vec<_>>()})
                     .to_string(),
+                Vec::new(),
             ))
         }
         ToolTurn::ListReviewHunks => {
@@ -985,16 +2086,18 @@ where
                 .list_review_hunks()
                 .await
                 .map_err(|err| AgentError::Search(err.to_string()))?;
+            let mut evidence_lines = Vec::new();
             for hunk in &response.hunks {
                 for line in &hunk.lines {
                     if let Some(line) = line.new_line.or(line.old_line) {
-                        evidence_index.insert((hunk.path.clone(), line));
+                        evidence_lines.push((hunk.path.clone(), line));
                     }
                 }
             }
             Ok(ExecutedTool::new(
                 ToolKind::ListReviewHunks,
                 json!({"hunks": review_hunk_summaries(&response.hunks)}).to_string(),
+                evidence_lines,
             ))
         }
         ToolTurn::GetHunkContext { hunk_id } => {
@@ -1007,12 +2110,14 @@ where
                     return Ok(ExecutedTool::new(
                         ToolKind::GetHunkContext,
                         json!({"error": err.to_string()}).to_string(),
+                        Vec::new(),
                     ));
                 }
             };
+            let mut evidence_lines = Vec::new();
             if response.start_line > 0 {
                 for line in response.start_line..=response.end_line {
-                    evidence_index.insert((response.path.clone(), line));
+                    evidence_lines.push((response.path.clone(), line));
                 }
             }
             Ok(ExecutedTool::new(
@@ -1025,6 +2130,7 @@ where
                     "content": response.content
                 })
                 .to_string(),
+                evidence_lines,
             ))
         }
         ToolTurn::SearchText { query, kind } => {
@@ -1032,13 +2138,15 @@ where
                 .search_text(SearchTextRequest { query, kind })
                 .await
                 .map_err(|err| AgentError::Search(err.to_string()))?;
+            let mut evidence_lines = Vec::new();
             for m in &response.matches {
-                evidence_index.insert((m.path.clone(), m.line));
+                evidence_lines.push((m.path.clone(), m.line));
             }
             Ok(ExecutedTool::new(
                 ToolKind::SearchText,
                 json!({"matches": response.matches.into_iter().take(MAX_SEARCH_MATCHES).collect::<Vec<_>>()})
                     .to_string(),
+                evidence_lines,
             ))
         }
         ToolTurn::ReadFile { path } => {
@@ -1046,9 +2154,9 @@ where
                 .read_file(ReadFileRequest { path })
                 .await
                 .map_err(|err| AgentError::Search(err.to_string()))?;
-            for line in 1..=response.line_count {
-                evidence_index.insert((response.path.clone(), line));
-            }
+            let evidence_lines = (1..=response.line_count)
+                .map(|line| (response.path.clone(), line))
+                .collect::<Vec<_>>();
             Ok(ExecutedTool::new(
                 ToolKind::ReadFile,
                 json!({
@@ -1057,6 +2165,7 @@ where
                     "content": response.content.lines().take(MAX_READ_FILE_LINES).collect::<Vec<_>>().join("\n")
                 })
                 .to_string(),
+                evidence_lines,
             ))
         }
         ToolTurn::GetFileContext { path, line } => {
@@ -1064,9 +2173,10 @@ where
                 .get_file_context(GetFileContextRequest { path, line })
                 .await
                 .map_err(|err| AgentError::Search(err.to_string()))?;
+            let mut evidence_lines = Vec::new();
             if response.start_line > 0 {
                 for line in response.start_line..=response.end_line {
-                    evidence_index.insert((response.path.clone(), line));
+                    evidence_lines.push((response.path.clone(), line));
                 }
             }
             Ok(ExecutedTool::new(
@@ -1078,6 +2188,7 @@ where
                     "content": response.content
                 })
                 .to_string(),
+                evidence_lines,
             ))
         }
         ToolTurn::FindDefinitions { symbol } => {
@@ -1085,12 +2196,14 @@ where
                 .find_definitions(FindDefinitionsRequest { symbol })
                 .await
                 .map_err(|err| AgentError::Search(err.to_string()))?;
+            let mut evidence_lines = Vec::new();
             for m in &response.definitions {
-                evidence_index.insert((m.path.clone(), m.line));
+                evidence_lines.push((m.path.clone(), m.line));
             }
             Ok(ExecutedTool::new(
                 ToolKind::FindDefinitions,
                 json!({"definitions": response.definitions}).to_string(),
+                evidence_lines,
             ))
         }
         ToolTurn::FindReferences { symbol } => {
@@ -1098,13 +2211,15 @@ where
                 .find_references(FindReferencesRequest { symbol })
                 .await
                 .map_err(|err| AgentError::Search(err.to_string()))?;
+            let mut evidence_lines = Vec::new();
             for m in &response.references {
-                evidence_index.insert((m.path.clone(), m.line));
+                evidence_lines.push((m.path.clone(), m.line));
             }
             Ok(ExecutedTool::new(
                 ToolKind::FindReferences,
                 json!({"references": response.references.into_iter().take(MAX_REFERENCE_MATCHES).collect::<Vec<_>>()})
                     .to_string(),
+                evidence_lines,
             ))
         }
     }
@@ -1122,19 +2237,68 @@ fn review_hunk_summaries(hunks: &[ReviewHunk]) -> Vec<serde_json::Value> {
                 "new_start": hunk.new_start,
                 "new_lines": hunk.new_lines,
                 "line_count": hunk.lines.len(),
+                "preview_lines": review_hunk_preview_lines(hunk),
             })
         })
+        .collect()
+}
+
+fn review_hunk_preview_lines(hunk: &ReviewHunk) -> Vec<serde_json::Value> {
+    hunk.lines
+        .iter()
+        .filter(|line| substantive_changed_line(&line.content))
+        .filter_map(|line| {
+            let line_number = match line.kind {
+                ReviewLineKind::Added | ReviewLineKind::Context => line.new_line,
+                ReviewLineKind::Removed => line.old_line,
+            }?;
+            let kind = match line.kind {
+                ReviewLineKind::Added => "added",
+                ReviewLineKind::Removed => "removed",
+                ReviewLineKind::Context => "context",
+            };
+            Some(json!({
+                "kind": kind,
+                "line": line_number,
+                "content": line.content.trim(),
+            }))
+        })
+        .take(MAX_HUNK_SUMMARY_PREVIEW_LINES)
         .collect()
 }
 
 struct ExecutedTool {
     kind: ToolKind,
     observation: String,
+    evidence_lines: Vec<(String, u32)>,
+    cache_hit: bool,
 }
 
 impl ExecutedTool {
-    fn new(kind: ToolKind, observation: String) -> Self {
-        Self { kind, observation }
+    fn new(kind: ToolKind, observation: String, evidence_lines: Vec<(String, u32)>) -> Self {
+        Self {
+            kind,
+            observation,
+            evidence_lines,
+            cache_hit: false,
+        }
+    }
+
+    fn from_cached(cached: CachedToolObservation, cache_hit: bool) -> Self {
+        Self {
+            kind: cached.kind,
+            observation: cached.observation,
+            evidence_lines: cached.evidence_lines,
+            cache_hit,
+        }
+    }
+
+    fn cached_observation(&self) -> CachedToolObservation {
+        CachedToolObservation {
+            kind: self.kind,
+            observation: self.observation.clone(),
+            evidence_lines: self.evidence_lines.clone(),
+        }
     }
 }
 
@@ -1144,6 +2308,95 @@ fn parse_file_kind(kind: Option<String>) -> FileKind {
         "tests" => FileKind::Tests,
         "configs" => FileKind::Configs,
         _ => FileKind::Source,
+    }
+}
+
+fn tool_cache_key(tool: &ToolTurn) -> ToolCacheKey {
+    match tool {
+        ToolTurn::ListFiles { kind } => ToolCacheKey::ListFiles(*kind),
+        ToolTurn::ListReviewHunks => ToolCacheKey::ListReviewHunks,
+        ToolTurn::GetHunkContext { hunk_id } => ToolCacheKey::GetHunkContext(hunk_id.clone()),
+        ToolTurn::SearchText { query, kind } => ToolCacheKey::SearchText {
+            query: query.trim().to_string(),
+            kind: *kind,
+        },
+        ToolTurn::ReadFile { path } => ToolCacheKey::ReadFile(normalize_tool_path(path)),
+        ToolTurn::GetFileContext { path, line } => ToolCacheKey::GetFileContext {
+            path: normalize_tool_path(path),
+            line: *line,
+        },
+        ToolTurn::FindDefinitions { symbol } => {
+            ToolCacheKey::FindDefinitions(symbol.trim().to_string())
+        }
+        ToolTurn::FindReferences { symbol } => {
+            ToolCacheKey::FindReferences(symbol.trim().to_string())
+        }
+    }
+}
+
+fn tool_cache_key_for_agent_turn(turn: &AgentTurn) -> Option<ToolCacheKey> {
+    match turn {
+        AgentTurn::ListFiles { kind } => {
+            Some(ToolCacheKey::ListFiles(parse_file_kind(kind.clone())))
+        }
+        AgentTurn::ListReviewHunks => Some(ToolCacheKey::ListReviewHunks),
+        AgentTurn::GetHunkContext { hunk_id } => {
+            Some(ToolCacheKey::GetHunkContext(hunk_id.clone()))
+        }
+        AgentTurn::SearchText { query, kind } => Some(ToolCacheKey::SearchText {
+            query: query.trim().to_string(),
+            kind: parse_file_kind(kind.clone()),
+        }),
+        AgentTurn::ReadFile { path } => Some(ToolCacheKey::ReadFile(normalize_tool_path(path))),
+        AgentTurn::GetFileContext { path, line } => Some(ToolCacheKey::GetFileContext {
+            path: normalize_tool_path(path),
+            line: *line,
+        }),
+        AgentTurn::FindDefinitions { symbol } => {
+            Some(ToolCacheKey::FindDefinitions(symbol.trim().to_string()))
+        }
+        AgentTurn::FindReferences { symbol } => {
+            Some(ToolCacheKey::FindReferences(symbol.trim().to_string()))
+        }
+        AgentTurn::Final { .. } => None,
+    }
+}
+
+fn tool_cache_key_label(key: &ToolCacheKey) -> String {
+    match key {
+        ToolCacheKey::ListFiles(kind) => format!("list_files({kind:?})"),
+        ToolCacheKey::ListReviewHunks => "list_review_hunks".to_string(),
+        ToolCacheKey::GetHunkContext(hunk_id) => format!("get_hunk_context({hunk_id})"),
+        ToolCacheKey::SearchText { query, kind } => format!("search_text({query:?}, {kind:?})"),
+        ToolCacheKey::ReadFile(path) => format!("read_file({path})"),
+        ToolCacheKey::GetFileContext { path, line } => {
+            format!("get_file_context({path}:{line})")
+        }
+        ToolCacheKey::FindDefinitions(symbol) => format!("find_definitions({symbol})"),
+        ToolCacheKey::FindReferences(symbol) => format!("find_references({symbol})"),
+    }
+}
+
+fn normalize_tool_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
+}
+
+fn substantive_evidence_preview(preview: &str) -> bool {
+    grounding::substantive_changed_line(preview)
+}
+
+fn no_concrete_finding_response(agent: &AgentSpec, reason: &str) -> LlmResponse {
+    LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: format!(
+            "No concrete review-scope finding for `{}`: {reason}",
+            agent.id
+        ),
+        evidence: Vec::new(),
     }
 }
 

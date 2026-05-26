@@ -41,11 +41,7 @@ pub(super) enum ToolKind {
 #[derive(Debug)]
 pub(super) struct InvestigationState {
     observed: HashSet<ToolKind>,
-    require_search: bool,
     require_content: bool,
-    require_definition: bool,
-    require_reference: bool,
-    require_context: bool,
     target_marker: Option<String>,
     target_marker_seen: bool,
     target_marker_evidence: Option<Evidence>,
@@ -53,18 +49,10 @@ pub(super) struct InvestigationState {
 
 impl InvestigationState {
     pub(super) fn new(agent: &AgentSpec) -> Self {
-        let lower_id = agent.id.to_ascii_lowercase();
         let lower_instruction = agent.instruction.to_ascii_lowercase();
-        let require_definition = requires_definition_follow(&lower_id, &lower_instruction);
-        let require_reference = requires_reference_follow(&lower_id, &lower_instruction);
-        let require_context = requires_context_window(&lower_id, &lower_instruction);
         Self {
             observed: HashSet::new(),
-            require_search: is_code_review_instruction(&lower_instruction),
             require_content: is_code_review_instruction(&lower_instruction),
-            require_definition,
-            require_reference,
-            require_context,
             target_marker: fixture_marker_for_test_id(&agent.id),
             target_marker_seen: false,
             target_marker_evidence: None,
@@ -156,43 +144,47 @@ impl InvestigationState {
         {
             return None;
         }
-        if let Some(guidance) = self.missing_tool_guidance(test_id) {
-            return Some(guidance);
-        }
 
         if test_id.starts_with("pass-")
             && response.status == TestStatus::Failed
             && !self.target_marker_seen
             && let Some(marker) = &self.target_marker
+            && response_mentions_fixture_failure(response)
         {
             return Some(format!(
                 "This fixture pass-check produced a failed verdict before inspecting its matching safe breadcrumb `{marker}`. Search for `{marker}`, inspect the surrounding code, and ignore unrelated KOOCHI_FAIL_* breadcrumbs for other tests."
             ));
         }
 
-        if test_id.starts_with("fail-")
-            && response.status == TestStatus::Passed
-            && let Some(marker) = &self.target_marker
-        {
-            if self.target_marker_seen {
-                return Some(format!(
-                    "This fixture fail-check observed its matching failure breadcrumb `{marker}` but returned passed. Inspect the surrounding code if needed, then return failed with concrete evidence for the breadcrumbed unsafe pattern."
-                ));
+        if response.status == TestStatus::Failed {
+            if !self.has_content_observation() {
+                return Some(
+                    "Failed verdicts require targeted content inspection first. Use get_hunk_context for the most relevant changed hunk, get_file_context for a specific review-scope line, or read_file for the review-scope file, then return failed only if that concrete content demonstrates the issue. list_review_hunks, list_files, and search_text do not satisfy this failed-verdict grounding requirement.".to_string(),
+                );
             }
-            return Some(format!(
-                "This fixture fail-check produced a passed verdict before inspecting its matching failure breadcrumb `{marker}`. Search for `{marker}`, inspect the surrounding code, and return failed with evidence if the unsafe pattern is present."
-            ));
+            return None;
+        }
+
+        if let Some(guidance) = self.missing_tool_guidance(test_id) {
+            return Some(guidance);
         }
 
         None
     }
 
+    pub(super) fn has_matching_fixture_marker(&self, test_id: &str) -> bool {
+        expected_fixture_status(test_id).is_some() && self.target_marker_seen
+    }
+
+    pub(super) fn has_content_observation(&self) -> bool {
+        self.observed.contains(&ToolKind::ReadFile)
+            || self.observed.contains(&ToolKind::GetHunkContext)
+            || self.observed.contains(&ToolKind::GetFileContext)
+    }
+
     pub(super) fn missing_tool_guidance(&self, test_id: &str) -> Option<String> {
         let mut missing = Vec::new();
         let has_marker = self.target_marker_seen;
-        if self.require_search && !self.observed.contains(&ToolKind::SearchText) {
-            missing.push("search_text");
-        }
         if self.require_content
             && !has_marker
             && !self.observed.contains(&ToolKind::ReadFile)
@@ -201,58 +193,16 @@ impl InvestigationState {
         {
             missing.push("get_hunk_context, read_file, or get_file_context");
         }
-        if self.require_definition
-            && !has_marker
-            && !self.observed.contains(&ToolKind::FindDefinitions)
-        {
-            missing.push("find_definitions");
-        }
-        if self.require_reference
-            && !has_marker
-            && !self.observed.contains(&ToolKind::FindReferences)
-        {
-            missing.push("find_references");
-        }
-        if self.require_context
-            && !has_marker
-            && !self.observed.contains(&ToolKind::GetHunkContext)
-            && !self.observed.contains(&ToolKind::GetFileContext)
-        {
-            missing.push("get_hunk_context or get_file_context");
-        }
-        if let Some(marker) = &self.target_marker
-            && !self.target_marker_seen
-        {
-            missing.push("search_text for matching fixture breadcrumb");
-            let marker_hint = format!(
-                " A useful fixture breadcrumb may be `{marker}`. A search_text call for this exact breadcrumb is required before final verdict."
-            );
-            let symbol_hint = symbol_hint_for_test_id(test_id)
-                .map(|symbol| format!(" A useful symbol may be `{symbol}`."))
-                .unwrap_or_default();
-            return Some(format!(
-                "This code-review agentic invariant requires more investigation before verdict. Missing required tool family: {}.{}{}",
-                missing.join(", "),
-                marker_hint,
-                symbol_hint,
-            ));
-        }
         if missing.is_empty() {
             return None;
         }
 
-        let marker_hint = self
-            .target_marker
-            .as_ref()
-            .map(|marker| format!(" A useful fixture breadcrumb may be `{marker}`."))
-            .unwrap_or_default();
         let symbol_hint = symbol_hint_for_test_id(test_id)
             .map(|symbol| format!(" A useful symbol may be `{symbol}`."))
             .unwrap_or_default();
         Some(format!(
-            "This code-review agentic invariant requires more investigation before verdict. Missing required tool family: {}.{}{}",
+            "This code-review agentic invariant requires more investigation before verdict. Missing required tool family: {}.{}",
             missing.join(", "),
-            marker_hint,
             symbol_hint,
         ))
     }
@@ -268,6 +218,15 @@ pub(super) fn expected_fixture_status(test_id: &str) -> Option<TestStatus> {
     }
 }
 
+fn response_mentions_fixture_failure(response: &LlmResponse) -> bool {
+    let mut haystack = response.description.to_ascii_uppercase();
+    for evidence in &response.evidence {
+        haystack.push('\n');
+        haystack.push_str(&evidence.preview.to_ascii_uppercase());
+    }
+    haystack.contains("KOOCHI_FAIL_")
+}
+
 fn is_code_review_instruction(instruction: &str) -> bool {
     [
         "verify",
@@ -280,59 +239,6 @@ fn is_code_review_instruction(instruction: &str) -> bool {
     ]
     .iter()
     .any(|needle| instruction.contains(needle))
-}
-
-fn requires_definition_follow(test_id: &str, instruction: &str) -> bool {
-    let id_driven = [
-        "authorization",
-        "timeout",
-        "retry",
-        "sanitizer",
-        "feature",
-        "wrapper",
-        "helper",
-        "signature",
-        "pagination",
-        "idempotency",
-        "discount",
-        "cache",
-    ]
-    .iter()
-    .any(|needle| test_id.contains(needle));
-    let instruction_driven = ["helper", "wrapper", "sanitizer", "verifier", "definition"]
-        .iter()
-        .any(|needle| instruction.contains(needle));
-    id_driven || instruction_driven
-}
-
-fn requires_reference_follow(test_id: &str, instruction: &str) -> bool {
-    [
-        "dead-code",
-        "referenced-helper",
-        "tenant-filter",
-        "safe-file-export",
-        "path-allowlist",
-        "webhook-acceptance",
-        "used",
-        "callers",
-        "referenced",
-        "no apparent callers",
-    ]
-    .iter()
-    .any(|needle| test_id.contains(needle) || instruction.contains(needle))
-}
-
-fn requires_context_window(test_id: &str, instruction: &str) -> bool {
-    [
-        "redacted-logging",
-        "audit-redaction",
-        "trace-field-filter",
-        "metric-normalization",
-        "http-auth-flow",
-        "nearby",
-    ]
-    .iter()
-    .any(|needle| test_id.contains(needle) || instruction.contains(needle))
 }
 
 fn symbol_hint_for_test_id(test_id: &str) -> Option<&'static str> {

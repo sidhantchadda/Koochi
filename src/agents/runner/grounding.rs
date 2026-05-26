@@ -37,18 +37,23 @@ where
         format!("Review-scope source file inventory ({file_count} total):\n{shown_files}")
     };
     let hunk_packet = format_review_hunk_packet(&hunks);
+    let focus = InvariantFocus::new(&agent.id, &agent.instruction, &hunks);
+    let target_context_line = instruction_target_context_line(&agent.instruction, &hunks);
+    let focus_summary = focus.format_summary(target_context_line.as_ref());
     let hunk_packet_tokens = estimate_tokens(&hunk_packet);
-    let full_packet_tokens = estimate_tokens(&format!("{file_inventory}\n\n{hunk_packet}"));
+    let full_packet_tokens = estimate_tokens(&format!(
+        "{file_inventory}\n\n{focus_summary}\n\n{hunk_packet}"
+    ));
     let allows_direct_verdict =
         !hunks.is_empty() && full_packet_tokens <= agent.initial_context_token_budget;
     let context = if allows_direct_verdict {
         format!(
-            "{file_inventory}\n\n{hunk_packet}\n\nChanged lines above are the primary review evidence. You may return a final verdict immediately if the changed-line packet is sufficient. If surrounding code, helper behavior, definitions, references, or callers are needed, request tools and continue the loop. Prefer get_hunk_context with a hunk id for targeted surrounding code before whole-file reads. Final failed evidence should point to changed lines or review-scope context directly caused by the change."
+            "{file_inventory}\n\n{focus_summary}\n\n{hunk_packet}\n\nChanged lines above are the primary review evidence. Return `passed` only when this context is sufficient to show the invariant is satisfied. Do not return `failed` from this packet alone. Failed verdicts require targeted content inspection first with get_hunk_context, get_file_context, or read_file. Prefer get_hunk_context with a hunk id for targeted surrounding code before whole-file reads. Final failed evidence should point to focused changed lines or review-scope context directly caused by the change."
         )
     } else if !hunks.is_empty() {
         let hunk_summary = format_review_hunk_summary(&hunks);
         format!(
-            "{file_inventory}\n\nReview-scope changed-line packet is too large to include directly ({} hunks, about {} tokens). Hunk summary:\n{}\n\nUse get_hunk_context with a hunk id or list_review_hunks for targeted details before returning a verdict. Use read_file only when the hunk context is insufficient.",
+            "{file_inventory}\n\n{focus_summary}\n\nReview-scope changed-line packet is too large to include directly ({} hunks, about {} tokens). Hunk summary:\n{}\n\nUse get_hunk_context with a hunk id or list_review_hunks for targeted details before returning a verdict. Use read_file only when the hunk context is insufficient.",
             hunks.len(),
             hunk_packet_tokens,
             hunk_summary
@@ -60,7 +65,10 @@ where
     };
     let evidence_index = HashSet::new();
     let changed_lines = changed_lines_for_hunks(&hunks);
-    let review_causal_terms = review_causal_terms_for_hunks(&hunks);
+    let target_context_line = target_context_line.clone();
+    let focused_context_line = focus.first_relevant_changed_line.clone();
+    let relevant_changed_lines = focus.relevant_changed_lines;
+    let review_causal_terms = focus.review_causal_terms;
 
     let instruction = grounded_agent_prompt(&agent.instruction, context.trim());
 
@@ -73,6 +81,9 @@ where
         evidence_index,
         review_paths,
         changed_lines,
+        target_context_line,
+        focused_context_line,
+        relevant_changed_lines,
         review_causal_terms,
         allows_direct_verdict,
     })
@@ -93,26 +104,249 @@ fn changed_lines_for_hunks(hunks: &[ReviewHunk]) -> HashSet<(String, u32)> {
         .collect()
 }
 
-fn review_causal_terms_for_hunks(hunks: &[ReviewHunk]) -> HashSet<String> {
-    let mut terms = HashSet::new();
+#[derive(Debug)]
+struct InvariantFocus {
+    terms: Vec<String>,
+    matched_lines: Vec<String>,
+    first_relevant_changed_line: Option<(String, u32)>,
+    relevant_changed_lines: HashSet<(String, u32)>,
+    review_causal_terms: HashSet<String>,
+}
+
+impl InvariantFocus {
+    fn new(id: &str, instruction: &str, hunks: &[ReviewHunk]) -> Self {
+        let terms = invariant_focus_terms(id, instruction);
+        let term_set = terms.iter().cloned().collect::<HashSet<_>>();
+        let mut matched_lines = Vec::new();
+        let mut first_relevant_changed_line = None;
+        let mut relevant_changed_lines = HashSet::new();
+        let mut review_causal_terms = HashSet::new();
+        for hunk in hunks {
+            for line in &hunk.lines {
+                let Some(line_number) = changed_line_number(line) else {
+                    continue;
+                };
+                if !substantive_changed_line(&line.content) {
+                    continue;
+                }
+                let line_terms = symbol_tokens(&line.content)
+                    .into_iter()
+                    .map(|term| term.to_ascii_lowercase())
+                    .collect::<HashSet<_>>();
+                let mut matched = line_terms
+                    .iter()
+                    .filter(|term| term_set.contains(*term))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                matched.sort();
+                if matched.is_empty() {
+                    continue;
+                }
+                if first_relevant_changed_line.is_none() {
+                    first_relevant_changed_line = Some((hunk.path.clone(), line_number));
+                }
+                relevant_changed_lines.insert((hunk.path.clone(), line_number));
+                review_causal_terms.extend(matched.iter().cloned());
+                if matched_lines.len() < 16 {
+                    matched_lines.push(format!(
+                        "- hunk_id={} {}:{} [{}] {}",
+                        hunk.id,
+                        hunk.path,
+                        line_number,
+                        matched.join(", "),
+                        line.content.trim()
+                    ));
+                }
+            }
+        }
+        Self {
+            terms,
+            matched_lines,
+            first_relevant_changed_line,
+            relevant_changed_lines,
+            review_causal_terms,
+        }
+    }
+
+    fn format_summary(&self, target_context_line: Option<&(String, u32)>) -> String {
+        let terms = if self.terms.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.terms.join(", ")
+        };
+        let target_hint = target_context_line
+            .map(|(path, line)| {
+                format!("\nExact target symbol line for get_file_context: {path}:{line}")
+            })
+            .unwrap_or_default();
+        if self.matched_lines.is_empty() {
+            format!(
+                "Invariant focus terms: {terms}{target_hint}\nNo substantive changed line directly matches these focus terms. Failed verdicts require targeted content inspection with get_hunk_context, get_file_context, or read_file before they can be accepted."
+            )
+        } else {
+            format!(
+                "Invariant focus terms: {terms}{target_hint}\nSubstantive changed lines matching invariant focus, with hunk ids for get_hunk_context:\n{}",
+                self.matched_lines.join("\n")
+            )
+        }
+    }
+}
+
+fn instruction_target_context_line(
+    instruction: &str,
+    hunks: &[ReviewHunk],
+) -> Option<(String, u32)> {
+    let backticked = backticked_terms(instruction);
+    let target_symbol = backticked.iter().find(|term| {
+        !term.contains('/') && !term.contains('.') && term.chars().any(|ch| ch == '_')
+    })?;
+    let target_path = backticked
+        .iter()
+        .find(|term| term.contains('/') || term.ends_with(".rs"));
     for hunk in hunks {
-        terms.insert(hunk.id.clone());
+        if let Some(path) = target_path
+            && hunk.path != *path
+        {
+            continue;
+        }
         for line in &hunk.lines {
-            let trimmed = line.content.trim();
-            if trimmed.chars().count() >= 4 {
-                terms.insert(trimmed.to_string());
+            if line.content.contains(target_symbol)
+                && let Some(line_number) = changed_line_number(line)
+            {
+                return Some((hunk.path.clone(), line_number));
             }
-            for token in symbol_tokens(trimmed) {
-                terms.insert(token);
+        }
+    }
+    None
+}
+
+fn backticked_terms(value: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut in_backticks = false;
+    for part in value.split('`') {
+        if in_backticks {
+            terms.push(part.trim().to_string());
+        }
+        in_backticks = !in_backticks;
+    }
+    terms
+}
+
+fn changed_line_number(line: &crate::scope::ReviewHunkLine) -> Option<u32> {
+    match line.kind {
+        ReviewLineKind::Added | ReviewLineKind::Context => line.new_line,
+        ReviewLineKind::Removed => line.old_line,
+    }
+}
+
+fn invariant_focus_terms(id: &str, instruction: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut terms = Vec::new();
+    for source in [id, instruction] {
+        for token in symbol_tokens(source) {
+            let token = token.to_ascii_lowercase();
+            if is_focus_stopword(&token) || !seen.insert(token.clone()) {
+                continue;
             }
+            terms.push(token);
         }
     }
     terms
 }
 
+fn is_focus_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "able"
+            | "about"
+            | "active"
+            | "against"
+            | "allows"
+            | "before"
+            | "being"
+            | "browser"
+            | "changed"
+            | "changes"
+            | "check"
+            | "claim"
+            | "claims"
+            | "code"
+            | "configured"
+            | "concrete"
+            | "content"
+            | "could"
+            | "data"
+            | "does"
+            | "doing"
+            | "explicit"
+            | "evidence"
+            | "fail"
+            | "file"
+            | "files"
+            | "find"
+            | "from"
+            | "function"
+            | "handler"
+            | "handling"
+            | "helper"
+            | "helpers"
+            | "including"
+            | "immediate"
+            | "intended"
+            | "logic"
+            | "must"
+            | "other"
+            | "path"
+            | "paths"
+            | "request"
+            | "requests"
+            | "response"
+            | "returns"
+            | "review"
+            | "route"
+            | "scope"
+            | "serve"
+            | "server"
+            | "should"
+            | "safe"
+            | "static"
+            | "that"
+            | "this"
+            | "type"
+            | "unless"
+            | "uses"
+            | "when"
+            | "where"
+            | "with"
+            | "without"
+    )
+}
+
+pub(super) fn substantive_changed_line(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.contains("KOOCHI_SAFE_") || trimmed.contains("KOOCHI_FAIL_") {
+        return !trimmed.is_empty();
+    }
+    if trimmed.chars().all(|ch| "{}[]();,.".contains(ch)) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("import ")
+        || lower.starts_with("export type ")
+        || lower.starts_with("type ")
+        || lower.starts_with("//")
+        || lower.starts_with("*")
+        || lower == "}"
+        || lower == "};"
+    {
+        return false;
+    }
+    true
+}
+
 fn symbol_tokens(value: &str) -> Vec<String> {
     value
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|token| token.chars().count() >= 4)
         .map(ToString::to_string)
         .collect()
@@ -158,6 +392,31 @@ fn format_review_hunk_summary(hunks: &[ReviewHunk]) -> String {
             hunk.new_lines,
             hunk.lines.len()
         ));
+        let previews = hunk
+            .lines
+            .iter()
+            .filter_map(format_hunk_preview_line)
+            .take(4)
+            .collect::<Vec<_>>();
+        if !previews.is_empty() {
+            summary.push_str("\n    focused preview:");
+            for preview in previews {
+                summary.push_str(&format!("\n    {preview}"));
+            }
+        }
     }
     summary
+}
+
+fn format_hunk_preview_line(line: &crate::scope::ReviewHunkLine) -> Option<String> {
+    if !substantive_changed_line(&line.content) {
+        return None;
+    }
+    let line_number = changed_line_number(line)?;
+    let prefix = match line.kind {
+        ReviewLineKind::Added => "+",
+        ReviewLineKind::Removed => "-",
+        ReviewLineKind::Context => " ",
+    };
+    Some(format!("{prefix}{line_number}: {}", line.content.trim()))
 }

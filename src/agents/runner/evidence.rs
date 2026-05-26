@@ -9,12 +9,14 @@ pub(super) fn verdict_from_loop_result(
     let evidence_index = loop_result.evidence_index;
     let review_paths = loop_result.review_paths;
     let changed_lines = loop_result.changed_lines;
+    let relevant_changed_lines = loop_result.relevant_changed_lines;
     let review_causal_terms = loop_result.review_causal_terms;
     let classifications = classify_evidence(
         &response.evidence,
         &evidence_index,
         &review_paths,
         &changed_lines,
+        &relevant_changed_lines,
     );
     let has_changed_evidence = classifications
         .iter()
@@ -23,7 +25,8 @@ pub(super) fn verdict_from_loop_result(
         .iter()
         .any(|item| item.classification == EvidenceClassification::ReviewContext);
     let has_causal_review_context = has_review_context_evidence
-        && response_references_changed_context(&response, &review_causal_terms);
+        && (changed_lines.is_empty()
+            || response_references_changed_context(&response, &review_causal_terms));
     let has_accepted_failure_evidence = has_changed_evidence || has_causal_review_context;
     let response_status = response.status;
     let response_severity = response.severity;
@@ -32,15 +35,23 @@ pub(super) fn verdict_from_loop_result(
         .evidence
         .into_iter()
         .filter(|evidence| {
-            classify_single_evidence(evidence, &evidence_index, &review_paths, &changed_lines)
-                .is_some_and(|classification| {
-                    classification != EvidenceClassification::OutsideReview
-                })
+            classify_single_evidence(
+                evidence,
+                &evidence_index,
+                &review_paths,
+                &changed_lines,
+                &relevant_changed_lines,
+            )
+            .is_some_and(|classification| {
+                matches!(
+                    classification,
+                    EvidenceClassification::Changed | EvidenceClassification::ReviewContext
+                )
+            })
         })
         .collect::<Vec<_>>();
     let (status, description) = if response_status == TestStatus::Failed
         && !has_accepted_failure_evidence
-        && requires_concrete_evidence(&agent.instruction)
         && !is_infrastructure_failure(&response_description)
         && !is_absence_policy(&agent.instruction)
     {
@@ -53,7 +64,6 @@ pub(super) fn verdict_from_loop_result(
         )
     } else if response_status == TestStatus::Failed
         && accepted_evidence.is_empty()
-        && requires_concrete_evidence(&agent.instruction)
         && !is_infrastructure_failure(&response_description)
         && !is_absence_policy(&agent.instruction)
     {
@@ -77,11 +87,6 @@ pub(super) fn verdict_from_loop_result(
     }
 }
 
-fn requires_concrete_evidence(instruction: &str) -> bool {
-    let lower = instruction.to_ascii_lowercase();
-    lower.contains("concrete evidence") || lower.contains("with evidence")
-}
-
 fn is_infrastructure_failure(description: &str) -> bool {
     description.contains("reached the step limit without returning a final verdict")
 }
@@ -100,17 +105,26 @@ pub(super) fn classify_evidence(
     evidence_index: &HashSet<(String, u32)>,
     review_paths: &HashSet<String>,
     changed_lines: &HashSet<(String, u32)>,
+    relevant_changed_lines: &HashSet<(String, u32)>,
 ) -> Vec<EvidenceClassificationReport> {
     evidence
         .iter()
         .map(|evidence| {
-            let classification =
-                classify_single_evidence(evidence, evidence_index, review_paths, changed_lines)
-                    .unwrap_or(EvidenceClassification::OutsideReview);
+            let classification = classify_single_evidence(
+                evidence,
+                evidence_index,
+                review_paths,
+                changed_lines,
+                relevant_changed_lines,
+            )
+            .unwrap_or(EvidenceClassification::OutsideReview);
             EvidenceClassificationReport {
                 path: evidence.path.clone(),
                 line: evidence.line,
-                accepted: classification != EvidenceClassification::OutsideReview,
+                accepted: matches!(
+                    classification,
+                    EvidenceClassification::Changed | EvidenceClassification::ReviewContext
+                ),
                 classification,
             }
         })
@@ -122,15 +136,19 @@ fn classify_single_evidence(
     evidence_index: &HashSet<(String, u32)>,
     review_paths: &HashSet<String>,
     changed_lines: &HashSet<(String, u32)>,
+    relevant_changed_lines: &HashSet<(String, u32)>,
 ) -> Option<EvidenceClassification> {
     let key = (evidence.path.clone(), evidence.line);
-    if changed_lines.contains(&key) {
+    if relevant_changed_lines.contains(&key) {
         return Some(EvidenceClassification::Changed);
     }
     if evidence_index.contains(&key)
         && (review_paths.is_empty() || review_paths.contains(&evidence.path))
     {
         return Some(EvidenceClassification::ReviewContext);
+    }
+    if changed_lines.contains(&key) {
+        return Some(EvidenceClassification::UnfocusedChanged);
     }
     Some(EvidenceClassification::OutsideReview)
 }

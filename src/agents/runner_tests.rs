@@ -76,7 +76,7 @@ async fn runs_agents_through_bus() {
         vec![AgentSpec {
             id: "one".to_string(),
             name: "one".to_string(),
-            instruction: "Pass this".to_string(),
+            instruction: "Observe risky call handling.".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
             initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
@@ -148,7 +148,7 @@ async fn batches_agents_by_configured_limit() {
         .map(|index| AgentSpec {
             id: format!("test-{index}"),
             name: format!("test-{index}"),
-            instruction: "Pass this".to_string(),
+            instruction: "Observe risky_call handling.".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
             initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
@@ -255,7 +255,7 @@ async fn grounds_agent_instruction_with_small_changed_hunk_packet() {
         vec![AgentSpec {
             id: "one".to_string(),
             name: "one".to_string(),
-            instruction: "Pass this".to_string(),
+            instruction: "Check risky_call handling.".to_string(),
             model: "gpt-5-nano".to_string(),
             severity: None,
             initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
@@ -275,14 +275,68 @@ async fn grounds_agent_instruction_with_small_changed_hunk_packet() {
     assert!(
         request
             .instruction
-            .contains("You may return a final verdict immediately")
+            .contains("Return `passed` only when this context is sufficient")
+    );
+    let status_index = request.instruction.find("Status semantics:").unwrap();
+    let tool_index = request.instruction.find("Tool call JSON forms:").unwrap();
+    assert!(status_index < tool_index);
+    assert!(
+        request
+            .instruction
+            .contains("`passed` means the code satisfies the invariant")
+    );
+    assert!(request.instruction.contains("For `Fail if ...` invariants"));
+    assert!(request.instruction.contains("judge that exact target"));
+    assert!(request.instruction.contains("hunk_id=lib.rs#1 lib.rs:1"));
+    assert!(
+        request
+            .instruction
+            .contains("Do not return `failed` from this packet alone")
     );
 }
 
 #[tokio::test]
-async fn accepts_direct_final_when_full_changed_hunk_packet_is_sufficient() {
+async fn fail_prefixed_prompt_does_not_inject_fixture_breadcrumb() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("changed.rs"), "pub fn changed() {}\n").unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let bus = Arc::new(FakeLlmBus::new());
+    run_agents(
+        vec![AgentSpec {
+            id: "fail-payment-no-idempotency".to_string(),
+            name: "fail-payment-no-idempotency".to_string(),
+            instruction: "Fail if payment submission lacks idempotency.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    let request = bus.requests().await.remove(0);
+    assert!(!request.instruction.contains("fixture-style test id"));
+    assert!(
+        !request
+            .instruction
+            .contains("KOOCHI_FAIL_PAYMENT_NO_IDEMPOTENCY")
+    );
+    assert!(!request.instruction.contains("KOOCHI_FAIL_ plus"));
+    assert!(!request.instruction.contains("KOOCHI_SAFE_ plus"));
+}
+
+#[tokio::test]
+async fn accepts_direct_pass_when_full_changed_hunk_packet_is_sufficient() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn unsafe_changed() {}\n",
+    )
+    .unwrap();
     let search = Arc::new(LocalSearchSession::new(ScopeConfig {
         primary_repo: RepoScope {
             repo_id: "x".to_string(),
@@ -303,7 +357,7 @@ async fn accepts_direct_final_when_full_changed_hunk_packet_is_sufficient() {
                     kind: ReviewLineKind::Added,
                     old_line: None,
                     new_line: Some(1),
-                    content: "pub fn changed() {}".to_string(),
+                    content: "pub fn unsafe_changed() {}".to_string(),
                 }],
             }],
             commit: None,
@@ -315,16 +369,91 @@ async fn accepts_direct_final_when_full_changed_hunk_packet_is_sufficient() {
     }));
     let bus = Arc::new(ScriptedActionBus::new(vec![Ok(LlmAction::Final(
         LlmResponse {
-            status: TestStatus::Failed,
-            severity: Some(Severity::High),
-            description: "changed line is unsafe".to_string(),
-            evidence: vec![Evidence {
-                path: "changed.rs".to_string(),
-                line: 1,
-                preview: "pub fn changed() {}".to_string(),
-            }],
+            status: TestStatus::Passed,
+            severity: None,
+            description: "changed line is safe".to_string(),
+            evidence: Vec::new(),
         },
     ))]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Find authorization issue with concrete evidence.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 1);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert_eq!(verdicts[0].description, "changed line is safe");
+    assert!(verdicts[0].evidence.is_empty());
+}
+
+#[tokio::test]
+async fn rejects_direct_failed_verdict_until_targeted_content_inspection() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn unsafe_changed() {}\n",
+    )
+    .unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn unsafe_changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"changed line is unsafe",
+                "evidence":[{"path":"changed.rs","line":1,"preview":"pub fn unsafe_changed() {}"}]
+            }"#,
+        r#"{"action":"get_hunk_context","hunk_id":"changed.rs#1"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"changed line is unsafe after context inspection",
+                "evidence":[{"path":"changed.rs","line":1,"preview":"pub fn unsafe_changed() {}"}]
+            }"#,
+    ]));
 
     let verdicts = run_agents(
         vec![AgentSpec {
@@ -343,9 +472,93 @@ async fn accepts_direct_final_when_full_changed_hunk_packet_is_sufficient() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 1);
+    assert_eq!(bus.request_count().await, 3);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(
+        verdicts[0].description,
+        "changed line is unsafe after context inspection"
+    );
     assert_eq!(verdicts[0].evidence.len(), 1);
+}
+
+#[tokio::test]
+async fn rejects_direct_failed_verdict_with_unfocused_changed_line() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "import { thing } from './thing'\n",
+    )
+    .unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "import { thing } from './thing'".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedActionBus::new(vec![
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Failed,
+            severity: Some(Severity::High),
+            description: "origin validation is bypassed".to_string(),
+            evidence: vec![Evidence {
+                path: "changed.rs".to_string(),
+                line: 1,
+                preview: "import { thing } from './thing'".to_string(),
+            }],
+        })),
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Passed,
+            severity: None,
+            description: "no focused changed evidence".to_string(),
+            evidence: Vec::new(),
+        })),
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "server-action-origin-validation".to_string(),
+            name: "server-action-origin-validation".to_string(),
+            instruction: "Fail if Server Action handling can execute without origin validation."
+                .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 2);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert_eq!(verdicts[0].description, "no focused changed evidence");
 }
 
 #[tokio::test]
@@ -404,7 +617,393 @@ async fn grounds_agent_instruction_with_large_hunk_summary() {
     assert!(request.instruction.contains("Hunk summary:"));
     assert!(request.instruction.contains("- lib.rs#1 lib.rs"));
     assert!(request.instruction.contains("get_hunk_context"));
-    assert!(!request.instruction.contains("+1: pub fn risky_call() {}"));
+    assert!(request.instruction.contains("+1: pub fn risky_call() {}"));
+    assert!(
+        !request
+            .instruction
+            .contains("Review-scope changed hunks (1 total):")
+    );
+}
+
+#[tokio::test]
+async fn repeated_broad_tools_terminate_as_no_concrete_finding() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("changed.rs"), "pub fn changed() {}\n").unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"list_review_hunks"}"#,
+        r#"{"action":"list_review_hunks"}"#,
+        r#"{"action":"list_review_hunks"}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Fail if changed code has an issue.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert!(
+        verdicts[0]
+            .description
+            .contains("No concrete review-scope finding")
+    );
+}
+
+#[tokio::test]
+async fn broad_and_search_tools_do_not_satisfy_failed_verdict_content_requirement() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn unsafe_changed() {}\n",
+    )
+    .unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn unsafe_changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"list_review_hunks"}"#,
+        r#"{"action":"list_files","kind":"source"}"#,
+        r#"{"action":"search_text","query":"unsafe_changed","kind":"source"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"broad and search tools saw unsafe code",
+                "evidence":[{"path":"changed.rs","line":1,"preview":"pub fn unsafe_changed() {}"}]
+            }"#,
+        r#"{"action":"get_hunk_context","hunk_id":"changed.rs#1"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"targeted hunk context shows unsafe code",
+                "evidence":[{"path":"changed.rs","line":1,"preview":"pub fn unsafe_changed() {}"}]
+            }"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Find unsafe code with concrete evidence.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 6);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(
+        verdicts[0].description,
+        "targeted hunk context shows unsafe code"
+    );
+}
+
+#[tokio::test]
+async fn repeated_broad_tools_after_rejected_failure_use_targeted_rescue() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn unsafe_changed() {}\n",
+    )
+    .unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn unsafe_changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"changed line is unsafe",
+                "evidence":[{"path":"changed.rs","line":1,"preview":"pub fn unsafe_changed() {}"}]
+            }"#,
+        r#"{"action":"list_review_hunks"}"#,
+        r#"{"action":"list_review_hunks"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"targeted rescue shows unsafe code",
+                "evidence":[{"path":"changed.rs","line":1,"preview":"pub fn unsafe_changed() {}"}]
+            }"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Find unsafe code with concrete evidence.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 4);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].description, "targeted rescue shows unsafe code");
+}
+
+#[tokio::test]
+async fn repeated_broad_tools_after_content_observation_are_reprompted_not_terminated() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn unsafe_changed() {}\n",
+    )
+    .unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn unsafe_changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"get_file_context","path":"changed.rs","line":1}"#,
+        r#"{"action":"list_review_hunks"}"#,
+        r#"{"action":"list_review_hunks"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"targeted content shows unsafe code",
+                "evidence":[{"path":"changed.rs","line":1,"preview":"pub fn unsafe_changed() {}"}]
+            }"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction:
+                "Review `unsafe_changed` in `changed.rs`. Fail if changed code has an issue."
+                    .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 4);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(
+        verdicts[0].description,
+        "targeted content shows unsafe code"
+    );
+}
+
+#[tokio::test]
+async fn step_limit_after_content_uses_deferred_failed_verdict() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn unsafe_changed() {}\n",
+    )
+    .unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn unsafe_changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"changed line is unsafe",
+                "evidence":[{"path":"changed.rs","line":1,"preview":"pub fn unsafe_changed() {}"}]
+            }"#,
+        r#"{"action":"get_file_context","path":"changed.rs","line":1}"#,
+        r#"{"action":"list_review_hunks"}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction:
+                "Review `unsafe_changed` in `changed.rs`. Fail if changed code has an issue."
+                    .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        3,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].description, "changed line is unsafe");
 }
 
 #[tokio::test]
@@ -449,7 +1048,11 @@ async fn drops_provider_evidence_not_found_in_repo_context() {
 #[tokio::test]
 async fn failed_verdict_without_review_scope_evidence_is_not_reported() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("changed.rs"), "pub fn changed() {}\n").unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn unsafe_changed() {}\n",
+    )
+    .unwrap();
     std::fs::write(
         temp.path().join("unrelated.rs"),
         "pub fn unrelated() { println!(\"token\"); }\n",
@@ -534,7 +1137,7 @@ async fn failed_verdict_with_changed_line_evidence_is_accepted() {
                     kind: ReviewLineKind::Added,
                     old_line: None,
                     new_line: Some(1),
-                    content: "pub fn changed() {}".to_string(),
+                    content: "pub fn unsafe_changed() {}".to_string(),
                 }],
             }],
             commit: None,
@@ -545,14 +1148,14 @@ async fn failed_verdict_with_changed_line_evidence_is_accepted() {
         agents: Vec::new(),
     }));
     let bus = Arc::new(ScriptedToolBus::new(vec![
-        r#"{"action":"search_text","query":"changed","kind":"source"}"#,
+        r#"{"action":"search_text","query":"unsafe","kind":"source"}"#,
         r#"{"action":"get_hunk_context","hunk_id":"changed.rs#1"}"#,
         r#"{
                 "action":"final",
                 "status":"failed",
                 "severity":"high",
                 "description":"changed line is unsafe",
-                "evidence":[{"path":"changed.rs","line":1,"preview":"pub fn changed() {}"}]
+                "evidence":[{"path":"changed.rs","line":1,"preview":"pub fn unsafe_changed() {}"}]
             }"#,
     ]));
 
@@ -657,7 +1260,7 @@ async fn failed_verdict_with_causal_review_context_is_accepted() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("changed.rs"),
-        "pub fn changed() { helper(); }\npub fn helper() {}\n",
+        "pub fn changed() { unsafe_helper(); }\npub fn unsafe_helper() {}\n",
     )
     .unwrap();
     let search = Arc::new(LocalSearchSession::new(ScopeConfig {
@@ -680,7 +1283,7 @@ async fn failed_verdict_with_causal_review_context_is_accepted() {
                     kind: ReviewLineKind::Added,
                     old_line: None,
                     new_line: Some(1),
-                    content: "pub fn changed() { helper(); }".to_string(),
+                    content: "pub fn changed() { unsafe_helper(); }".to_string(),
                 }],
             }],
             commit: None,
@@ -691,14 +1294,14 @@ async fn failed_verdict_with_causal_review_context_is_accepted() {
         agents: Vec::new(),
     }));
     let bus = Arc::new(ScriptedToolBus::new(vec![
-        r#"{"action":"search_text","query":"helper","kind":"source"}"#,
+        r#"{"action":"search_text","query":"unsafe_helper","kind":"source"}"#,
         r#"{"action":"read_file","path":"changed.rs"}"#,
         r#"{
                 "action":"final",
                 "status":"failed",
                 "severity":"high",
-                "description":"The changed line calls helper, and helper is unsafe.",
-                "evidence":[{"path":"changed.rs","line":2,"preview":"pub fn helper() {}"}]
+                "description":"The changed line calls unsafe_helper, and unsafe_helper is unsafe.",
+                "evidence":[{"path":"changed.rs","line":2,"preview":"pub fn unsafe_helper() {}"}]
             }"#,
     ]));
 
@@ -745,6 +1348,7 @@ async fn absence_policy_failure_can_fail_without_line_evidence() {
         agents: Vec::new(),
     }));
     let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"read_file","path":"changed.rs"}"#,
         r#"{
                 "action":"final",
                 "status":"failed",
@@ -799,6 +1403,7 @@ async fn exact_red_herring_failure_is_preserved_without_evidence() {
         agents: Vec::new(),
     }));
     let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"read_file","path":"changed.rs"}"#,
         r#"{
                 "action":"final",
                 "status":"failed",
@@ -1031,6 +1636,349 @@ fn parses_text_final_verdict_with_default_status() {
     }
 }
 
+#[test]
+fn parses_text_final_verdict_with_line_preview_alias() {
+    let turn = parse_agent_turn(
+        r#"{"status":"failed","severity":"high","description":"bad","evidence":[{"path":"src/lib.rs","line":7,"line_preview":"bad();"}]}"#,
+        None,
+    )
+    .unwrap();
+
+    match turn {
+        AgentTurn::Final { evidence, .. } => {
+            assert_eq!(evidence[0].preview, "bad();");
+        }
+        _ => panic!("expected final turn"),
+    }
+}
+
+#[test]
+fn parses_text_final_verdict_before_trailing_overclosed_brackets() {
+    let turn = parse_agent_turn(
+        r#"{"status":"failed","severity":"high","description":"bad","evidence":[{"path":"src/lib.rs","line":7,"preview":"if value == \"}\" { bad(); }"}]}]}]"#,
+        None,
+    )
+    .unwrap();
+
+    match turn {
+        AgentTurn::Final {
+            status, evidence, ..
+        } => {
+            assert!(matches!(status, StatusJson::Failed));
+            assert_eq!(evidence[0].preview, "if value == \"}\" { bad(); }");
+        }
+        _ => panic!("expected final turn"),
+    }
+}
+
+#[test]
+fn failed_verdict_with_only_weak_accepted_evidence_is_rejected() {
+    let response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "idempotency key is missing".to_string(),
+        evidence: vec![Evidence {
+            path: "src/claims/payments.rs".to_string(),
+            line: 20,
+            preview: "}".to_string(),
+        }],
+    };
+    let evidence_index = HashSet::from([("src/claims/payments.rs".to_string(), 20)]);
+    let review_paths = HashSet::from(["src/claims/payments.rs".to_string()]);
+    let changed_lines = HashSet::from([("src/claims/payments.rs".to_string(), 20)]);
+    let relevant_changed_lines = HashSet::new();
+
+    assert!(failed_verdict_lacks_substantive_accepted_evidence(
+        &response,
+        &evidence_index,
+        &review_paths,
+        &changed_lines,
+        &relevant_changed_lines,
+    ));
+
+    let signature_response = LlmResponse {
+        evidence: vec![Evidence {
+            path: "src/claims/payments.rs".to_string(),
+            line: 14,
+            preview:
+                "pub fn submit_claim_payment_without_idempotency(request: &PaymentRequest) -> PaymentCommand {"
+                    .to_string(),
+        }],
+        ..response.clone()
+    };
+    let signature_evidence_index = HashSet::from([("src/claims/payments.rs".to_string(), 14)]);
+
+    assert!(failed_verdict_lacks_substantive_accepted_evidence(
+        &signature_response,
+        &signature_evidence_index,
+        &review_paths,
+        &changed_lines,
+        &relevant_changed_lines,
+    ));
+
+    let substantive_response = LlmResponse {
+        evidence: vec![Evidence {
+            path: "src/claims/payments.rs".to_string(),
+            line: 17,
+            preview: "idempotency_key: None,".to_string(),
+        }],
+        ..response
+    };
+    let substantive_evidence_index = HashSet::from([
+        ("src/claims/payments.rs".to_string(), 17),
+        ("src/claims/payments.rs".to_string(), 20),
+    ]);
+
+    assert!(!failed_verdict_lacks_substantive_accepted_evidence(
+        &substantive_response,
+        &substantive_evidence_index,
+        &review_paths,
+        &changed_lines,
+        &relevant_changed_lines,
+    ));
+}
+
+#[test]
+fn passed_fail_if_verdict_with_failed_status_language_is_rejected() {
+    let response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "The named function demonstrates the unsafe branch; the correct status is failed."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    let instruction = "Fail if the named function can approve without a reason.";
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &response,
+        instruction
+    ));
+
+    let failure_condition_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "The named function exports disabled policies, satisfying the invariant failure condition."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &failure_condition_response,
+        instruction
+    ));
+
+    let triggered_condition_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "The fail condition is triggered by the named function.".to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &triggered_condition_response,
+        "Fail if the named function violates this invariant."
+    ));
+
+    let violation_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "This violates the invariant and indicates a failure.".to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &violation_response,
+        "Fail if the named function violates this invariant."
+    ));
+
+    let delayed_violation_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "The function does not log raw values. The snippet includes raw values, which would imply a violation and constitutes a violation."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &delayed_violation_response,
+        "Fail if the named function logs raw values."
+    ));
+
+    let invariant_is_violated_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "The raw value is present; therefore the invariant is violated.".to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &invariant_is_violated_response,
+        "Fail if the named function logs raw values."
+    ));
+
+    let report_failure_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "This constitutes a failure, so the appropriate action is to report a failure."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &report_failure_response,
+        "Fail if the named function violates this invariant."
+    ));
+
+    let affirms_fail_condition_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "The function exports all policy_ids without filtering by enabled flag, matching the intention to include disabled policies.".to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &affirms_fail_condition_response,
+        "Review the named function. Fail if the changed code demonstrates that policy export includes disabled policies."
+    ));
+
+    let negates_fail_condition_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "The function filters out disabled policies and does not include them in policy export."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(!passed_verdict_contradicts_failure_language(
+        &negates_fail_condition_response,
+        "Review the named function. Fail if the changed code demonstrates that policy export includes disabled policies."
+    ));
+
+    let target_affirms_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "claim_report_path uses an allowlist. claim_report_path_unchecked uses provided requested_name directly in join but is a separate unchecked variant."
+            .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &target_affirms_response,
+        "Review `claim_report_path_unchecked` in `src/claims/reports.rs`. Fail if the changed code demonstrates that report path builder joins caller controlled names that can escape the report directory."
+    ));
+
+    let no_evidence_excludes_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "export_all_policies_including_disabled maps policy_id for all policies including disabled, and no evidence excludes disabled policies.".to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &no_evidence_excludes_response,
+        "Review `export_all_policies_including_disabled` in `src/claims/policies.rs`. Fail if the changed code demonstrates that policy export includes disabled policies."
+    ));
+
+    let exports_all_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "export_all_policies_including_disabled returns all policy_ids regardless of enabled flag and does not export only disabled policies."
+            .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &exports_all_response,
+        "Review `export_all_policies_including_disabled` in `src/claims/policies.rs`. Fail if the changed code demonstrates that policy export includes disabled policies."
+    ));
+
+    let target_negates_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "claim_report_path_unchecked does not join caller controlled names into the report directory."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(!passed_verdict_contradicts_failure_language(
+        &target_negates_response,
+        "Review `claim_report_path_unchecked` in `src/claims/reports.rs`. Fail if the changed code demonstrates that report path builder joins caller controlled names that can escape the report directory."
+    ));
+
+    let negative_condition_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "The global dedupe key does not include tenant_id, showing it omits tenant identity as intended."
+            .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &negative_condition_response,
+        "Review the named function. Fail if the changed code demonstrates that background job dedupe key omits tenant identity."
+    ));
+
+    let minimum_includes_single_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "The function requires at least one approver, so the single-approver case is accepted."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &minimum_includes_single_response,
+        "Review the named function. Fail if the changed code demonstrates that high-value claim approval accepts a single approver."
+    ));
+
+    let wrong_verdict_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "The invariant condition is triggered; therefore the correct verdict is failed."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &wrong_verdict_response,
+        "Fail if the named function uses raw claim status values as labels."
+    ));
+
+    let missing_required_control_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "The named function has unsafe behavior because it lacks required safeguards."
+            .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &missing_required_control_response,
+        "Fail if the named function lacks required safeguards."
+    ));
+
+    let safe_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "The named function has no unsafe behavior for this invariant.".to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(!passed_verdict_contradicts_failure_language(
+        &safe_response,
+        instruction
+    ));
+}
+
 #[tokio::test]
 async fn accepts_plain_verdict_json_as_final_turn() {
     let temp = tempfile::tempdir().unwrap();
@@ -1059,6 +2007,47 @@ async fn accepts_plain_verdict_json_as_final_turn() {
     assert_eq!(bus.request_count().await, 1);
     assert_eq!(verdicts[0].status, TestStatus::Passed);
     assert_eq!(verdicts[0].description, "No secrets found.");
+}
+
+#[tokio::test]
+async fn fail_prefixed_real_invariant_does_not_require_fixture_marker_search() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("cache.rs"),
+        "pub fn claim_cache_key_without_tenant(_tenant_id: &str, claim_id: &str) -> String {\n    format!(\"claim:{claim_id}\")\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"read_file","path":"cache.rs"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"cache key omits tenant identity and can collide across tenants",
+                "evidence":[{"path":"cache.rs","line":2,"preview":"format!(\"claim:{claim_id}\")"}]
+            }"#,
+    ]));
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "fail-cache-cross-tenant-key".to_string(),
+            name: "fail-cache-cross-tenant-key".to_string(),
+            instruction: "Review claim_cache_key_without_tenant. Fail if the cache key omits tenant identity with concrete evidence.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 2);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence.len(), 1);
 }
 
 #[tokio::test]
@@ -1230,12 +2219,12 @@ async fn honors_configured_agent_step_limit() {
     .unwrap();
 
     assert_eq!(bus.request_count().await, 1);
-    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
     assert!(verdicts[0].description.contains("step limit"));
 }
 
 #[tokio::test]
-async fn step_limit_failure_with_concrete_evidence_instruction_stays_failed() {
+async fn step_limit_without_concrete_finding_passes_even_with_concrete_evidence_instruction() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
     let search = Arc::new(session(temp.path().to_path_buf()));
@@ -1259,8 +2248,125 @@ async fn step_limit_failure_with_concrete_evidence_instruction_stays_failed() {
     .await
     .unwrap();
 
-    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
     assert!(verdicts[0].description.contains("step limit"));
+}
+
+#[tokio::test]
+async fn shared_tool_cache_reuses_observations_across_agents() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn handler() {\n    log_token();\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"search_text","query":"log_token","kind":"source"}"#,
+        r#"{"action":"read_file","path":"lib.rs"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"token logging found",
+                "evidence":[{"path":"lib.rs","line":2,"preview":"log_token();"}]
+            }"#,
+        r#"{"action":"search_text","query":"log_token","kind":"source"}"#,
+        r#"{"action":"read_file","path":"lib.rs"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"token logging found again",
+                "evidence":[{"path":"lib.rs","line":2,"preview":"log_token();"}]
+            }"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![
+            AgentSpec {
+                id: "one".to_string(),
+                name: "one".to_string(),
+                instruction: "Find token logging.".to_string(),
+                model: "gpt-5-nano".to_string(),
+                severity: None,
+                initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+            },
+            AgentSpec {
+                id: "two".to_string(),
+                name: "two".to_string(),
+                instruction: "Find token logging.".to_string(),
+                model: "gpt-5-nano".to_string(),
+                severity: None,
+                initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+            },
+        ],
+        search.clone(),
+        bus,
+        1,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(verdicts.len(), 2);
+    assert!(
+        verdicts
+            .iter()
+            .all(|verdict| verdict.status == TestStatus::Failed)
+    );
+    assert!(verdicts.iter().all(|verdict| verdict.evidence.len() == 1));
+    let stats = search.stats();
+    assert_eq!(stats.search_text_misses, 1);
+    assert_eq!(stats.search_text_hits, 0);
+}
+
+#[tokio::test]
+async fn tool_cache_coalesces_concurrent_identical_tool_calls() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
+    let search = session(temp.path().to_path_buf());
+    let cache = ToolExecutionCache::default();
+
+    let (first, second) = tokio::join!(
+        async {
+            let mut evidence = HashSet::new();
+            let executed = execute_tool(
+                AgentTurn::SearchText {
+                    query: "handler".to_string(),
+                    kind: Some("source".to_string()),
+                },
+                &search,
+                &cache,
+                &mut evidence,
+            )
+            .await
+            .unwrap();
+            (executed.cache_hit, evidence)
+        },
+        async {
+            let mut evidence = HashSet::new();
+            let executed = execute_tool(
+                AgentTurn::SearchText {
+                    query: "handler".to_string(),
+                    kind: Some("source".to_string()),
+                },
+                &search,
+                &cache,
+                &mut evidence,
+            )
+            .await
+            .unwrap();
+            (executed.cache_hit, evidence)
+        }
+    );
+
+    assert_ne!(first.0, second.0);
+    assert!(first.1.contains(&("lib.rs".to_string(), 1)));
+    assert!(second.1.contains(&("lib.rs".to_string(), 1)));
+    let stats = search.stats();
+    assert_eq!(stats.search_text_misses, 1);
+    assert_eq!(stats.search_text_hits, 0);
 }
 
 struct ScriptedToolBus {
