@@ -1,6 +1,7 @@
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -57,7 +58,7 @@ impl<'a> LiveProviderCase<'a> {
             fixtures,
             expected,
             expected_exit,
-            debug: false,
+            debug: true,
         }
     }
 
@@ -93,16 +94,27 @@ fn run_case_with_config_name(case: LiveProviderCase<'_>, config_name: &str) -> L
     let live = live_provider_for_config(&config_path);
     let report_path = temp.path().join("report.json");
     let output = run_case_command(temp.path(), &report_path, &case, &live);
+    let debug_log = case
+        .debug
+        .then(|| try_latest_debug_log(temp.path()))
+        .flatten();
+    let debug_summary = debug_log
+        .as_ref()
+        .map(format_debug_summary)
+        .unwrap_or_else(|| "live-provider debug metrics: no debug log was written".to_string());
+    if case.debug {
+        println!("{debug_summary}");
+    }
     assert_eq!(
         output.status.code(),
         Some(case.expected_exit),
-        "stdout: {}\nstderr: {}",
+        "stdout: {}\nstderr: {}\n{}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr),
+        debug_summary
     );
     let report = read_json(&report_path);
-    assert_report_matches(&report, case.expected);
-    let debug_log = case.debug.then(|| latest_debug_log(temp.path()));
+    assert_report_matches_with_debug(&report, case.expected, &debug_summary);
     LiveProviderRun {
         output,
         report,
@@ -129,13 +141,100 @@ fn run_case_command(
     command.output().unwrap()
 }
 
-pub fn latest_debug_log(root: &Path) -> Value {
+pub fn try_latest_debug_log(root: &Path) -> Option<Value> {
     let mut entries = fs::read_dir(root.join(".koochi").join("debug"))
-        .unwrap()
+        .ok()?
         .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+        .ok()?;
     entries.sort_by_key(|entry| entry.file_name());
-    read_json(&entries.last().unwrap().path())
+    entries.last().map(|entry| read_json(&entry.path()))
+}
+
+pub fn format_debug_summary(debug_log: &Value) -> String {
+    let coverage = &debug_log["review"]["coverage"];
+    let llm = &debug_log["llm"];
+    let search = &debug_log["search"];
+    let agents = &debug_log["agents"];
+    let aggregate = &agents["aggregate"];
+    let mut output = String::new();
+
+    writeln!(&mut output, "live-provider debug metrics:").unwrap();
+    writeln!(
+        &mut output,
+        "  result: {} passed, {} failed, elapsed {}ms",
+        number(debug_log, &["passed"]),
+        number(debug_log, &["failed"]),
+        number(debug_log, &["elapsed_ms"])
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "  review coverage: {} source files, {} LOC, {} chunks, {} delivered, {} pass rejections",
+        number(coverage, &["source_files"]),
+        number(coverage, &["loc"]),
+        number(coverage, &["chunks"]),
+        number(coverage, &["chunks_delivered"]),
+        number(coverage, &["pass_rejections"])
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "  llm: {} turns, {} provider calls, {} tokens, {} native tools, {} finals, {} cache hits / {} misses, {} non-progress terminations",
+        number(llm, &["turns"]),
+        number(llm, &["provider_calls"]),
+        number(llm, &["total_tokens"]),
+        number(llm, &["native_tool_calls"]),
+        number(llm, &["native_final_calls"]),
+        number(llm, &["tool_cache_hits"]),
+        number(llm, &["tool_cache_misses"]),
+        number(llm, &["non_progress_terminations"])
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "  search: {} total calls; list_review_files {}, read_file {}, get_file_context {}, get_hunk_context {}, search_text {}",
+        number(search, &["total_calls"]),
+        number(search, &["list_review_files_calls"]),
+        number(search, &["read_file_calls"]),
+        number(search, &["get_file_context_calls"]),
+        number(search, &["get_hunk_context_calls"]),
+        number(search, &["search_text_calls"])
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "  agents: {} runs; prompts {}; tools {}; unique LOC read {}; coverage chunks {}",
+        number(agents, &["total"]),
+        metric(aggregate, "prompts"),
+        metric(aggregate, "tool_calls"),
+        metric(aggregate, "unique_loc_read"),
+        metric(aggregate, "coverage_chunks_delivered")
+    )
+    .unwrap();
+
+    let runs = agents["runs"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if !runs.is_empty()
+        && !agents["console_truncated_per_agent_table"]
+            .as_bool()
+            .unwrap_or(false)
+    {
+        writeln!(&mut output, "  per-agent:").unwrap();
+        for run in runs {
+            writeln!(
+                &mut output,
+                "    {}: status={}, prompts={}, tools={}, unique_loc={}, elapsed={}ms",
+                text(run, &["test_id"]),
+                text(run, &["status"]),
+                number(run, &["llm_calls"]),
+                number(run, &["native_tool_calls"]),
+                number(run, &["unique_loc_read"]),
+                number(run, &["elapsed_ms"])
+            )
+            .unwrap();
+        }
+    }
+
+    output.trim_end().to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -153,19 +252,49 @@ impl<'a> ExpectedReport<'a> {
     }
 }
 
-pub fn assert_report_matches(report: &Value, expected: ExpectedReport<'_>) {
+pub fn assert_report_matches_with_debug(
+    report: &Value,
+    expected: ExpectedReport<'_>,
+    debug_summary: &str,
+) {
     let passed = ids(report, "passed");
     let failed = ids(report, "failed");
     assert_eq!(
         passed,
         expected.passed.iter().copied().collect::<HashSet<_>>(),
-        "unexpected passed tests in report: {report:#}"
+        "unexpected passed tests in report: {report:#}\n{debug_summary}"
     );
     assert_eq!(
         failed,
         expected.failed.iter().copied().collect::<HashSet<_>>(),
-        "unexpected failed tests in report: {report:#}"
+        "unexpected failed tests in report: {report:#}\n{debug_summary}"
     );
+}
+
+fn number(value: &Value, path: &[&str]) -> u64 {
+    path.iter()
+        .fold(value, |value, key| &value[*key])
+        .as_u64()
+        .unwrap_or_default()
+}
+
+fn text(value: &Value, path: &[&str]) -> String {
+    path.iter()
+        .fold(value, |value, key| &value[*key])
+        .as_str()
+        .unwrap_or("<missing>")
+        .to_string()
+}
+
+fn metric(value: &Value, name: &str) -> String {
+    let metric = &value[name];
+    format!(
+        "mean {:.2}, stddev {:.2}, min {:.2}, max {:.2}",
+        metric["mean"].as_f64().unwrap_or_default(),
+        metric["stddev"].as_f64().unwrap_or_default(),
+        metric["min"].as_f64().unwrap_or_default(),
+        metric["max"].as_f64().unwrap_or_default()
+    )
 }
 
 pub fn assert_failures_have_evidence(report: &Value) {
@@ -357,4 +486,69 @@ fn fixture_configs(root: &Path) -> Vec<PathBuf> {
         .map(|name| root.join(name))
         .filter(|path| path.exists())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn debug_summary_includes_agent_and_coverage_metrics() {
+        let summary = format_debug_summary(&json!({
+            "elapsed_ms": 123,
+            "passed": 1,
+            "failed": 1,
+            "review": {
+                "coverage": {
+                    "source_files": 2,
+                    "loc": 42,
+                    "chunks": 3,
+                    "chunks_delivered": 4,
+                    "pass_rejections": 5
+                }
+            },
+            "llm": {
+                "turns": 6,
+                "provider_calls": 7,
+                "total_tokens": 800,
+                "native_tool_calls": 9,
+                "native_final_calls": 10,
+                "tool_cache_hits": 11,
+                "tool_cache_misses": 12,
+                "non_progress_terminations": 13
+            },
+            "search": {
+                "total_calls": 14,
+                "list_review_files_calls": 15,
+                "read_file_calls": 16,
+                "get_file_context_calls": 17,
+                "get_hunk_context_calls": 18,
+                "search_text_calls": 19
+            },
+            "agents": {
+                "total": 1,
+                "console_truncated_per_agent_table": false,
+                "aggregate": {
+                    "prompts": {"min": 1.0, "max": 3.0, "mean": 2.0, "stddev": 0.5},
+                    "tool_calls": {"min": 2.0, "max": 4.0, "mean": 3.0, "stddev": 0.75},
+                    "unique_loc_read": {"min": 10.0, "max": 20.0, "mean": 15.0, "stddev": 2.0},
+                    "coverage_chunks_delivered": {"min": 1.0, "max": 1.0, "mean": 1.0, "stddev": 0.0}
+                },
+                "runs": [{
+                    "test_id": "one",
+                    "status": "failed",
+                    "llm_calls": 6,
+                    "native_tool_calls": 9,
+                    "unique_loc_read": 15,
+                    "elapsed_ms": 100
+                }]
+            }
+        }));
+
+        assert!(summary.contains("2 source files, 42 LOC"));
+        assert!(summary.contains("6 turns, 7 provider calls, 800 tokens"));
+        assert!(summary.contains("agents: 1 runs; prompts mean 2.00"));
+        assert!(summary.contains("one: status=failed, prompts=6, tools=9"));
+    }
 }
