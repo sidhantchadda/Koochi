@@ -2021,6 +2021,68 @@ async fn malformed_native_tool_arguments_are_rejected_and_reprompted() {
     assert_eq!(verdicts[0].evidence.len(), 1);
 }
 
+#[tokio::test]
+async fn invalid_prompt_provider_error_records_prompt_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await.unwrap());
+    let bus = Arc::new(ScriptedActionBus::new(vec![Err(LlmBusError::HttpStatus {
+        status: reqwest::StatusCode::BAD_REQUEST,
+        body: r#"{"error":{"message":"Invalid prompt","code":"invalid_prompt"}}"#.to_string(),
+    })]));
+    let dump_dir = temp.path().join(".koochi").join("debug").join("prompts");
+    let error = run_agents_with_inventory_and_progress_and_diagnostics(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Find token logging. OPENAI_API_KEY=sk-testsecretvalue1234567890"
+                .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus,
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+        inventory,
+        AgentDiagnostics::with_prompt_dump_dir(dump_dir.clone()),
+        |_| {},
+    )
+    .await
+    .unwrap_err();
+
+    let AgentError::PromptRejected {
+        test_id,
+        step,
+        prompt_tokens,
+        prompt_dump_path,
+        source,
+    } = error
+    else {
+        panic!("expected prompt rejection diagnostic, got {error:?}");
+    };
+
+    assert_eq!(test_id, "one");
+    assert_eq!(step, 1);
+    assert!(prompt_tokens > 0);
+    assert!(prompt_dump_path.starts_with(&dump_dir));
+    assert!(matches!(
+        source,
+        LlmBusError::HttpStatus {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            ..
+        }
+    ));
+    let dump = std::fs::read_to_string(prompt_dump_path).unwrap();
+    assert!(dump.contains(r#""test_id": "one""#));
+    assert!(dump.contains(r#""step": 1"#));
+    assert!(dump.contains("prompt_redacted"));
+    assert!(dump.contains("OPENAI_API_KEY=[REDACTED]"));
+    assert!(!dump.contains("sk-testsecretvalue1234567890"));
+}
+
 #[test]
 fn parses_search_text_tool_with_query_equals_typo() {
     let turn = parse_agent_turn(

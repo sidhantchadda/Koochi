@@ -32,9 +32,12 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
 
@@ -103,10 +106,45 @@ struct ReviewSourceChunk {
     content: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AgentDiagnostics {
+    prompt_dump_dir: Option<PathBuf>,
+}
+
+impl AgentDiagnostics {
+    pub fn with_prompt_dump_dir(path: impl Into<PathBuf>) -> Self {
+        Self {
+            prompt_dump_dir: Some(path.into()),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error(transparent)]
     Llm(#[from] LlmBusError),
+    #[error(
+        "provider rejected prompt for agent `{test_id}` at step {step} ({prompt_tokens} estimated prompt tokens); redacted prompt dump: {prompt_dump_path}: {source}"
+    )]
+    PromptRejected {
+        test_id: String,
+        step: usize,
+        prompt_tokens: usize,
+        prompt_dump_path: PathBuf,
+        #[source]
+        source: LlmBusError,
+    },
+    #[error(
+        "provider rejected prompt for agent `{test_id}` at step {step} ({prompt_tokens} estimated prompt tokens); prompt dump unavailable ({dump_error}): {source}"
+    )]
+    PromptRejectedWithoutDump {
+        test_id: String,
+        step: usize,
+        prompt_tokens: usize,
+        dump_error: String,
+        #[source]
+        source: LlmBusError,
+    },
     #[error("search failed while preparing agent context: {0}")]
     Search(String),
     #[error("agent task failed: {0}")]
@@ -287,6 +325,35 @@ pub async fn run_agents_with_inventory_and_progress<S, B, F>(
     max_parallel_agents: usize,
     max_agent_steps: usize,
     inventory: Arc<ReviewScopeInventory>,
+    progress: F,
+) -> Result<Vec<AgentVerdict>, AgentError>
+where
+    S: CodeSearchApi + 'static,
+    S::Error: Display,
+    B: LlmBus + ?Sized + 'static,
+    F: FnMut(AgentProgressEvent),
+{
+    run_agents_with_inventory_and_progress_and_diagnostics(
+        agents,
+        search,
+        bus,
+        max_parallel_agents,
+        max_agent_steps,
+        inventory,
+        AgentDiagnostics::default(),
+        progress,
+    )
+    .await
+}
+
+pub async fn run_agents_with_inventory_and_progress_and_diagnostics<S, B, F>(
+    agents: Vec<AgentSpec>,
+    search: Arc<S>,
+    bus: Arc<B>,
+    max_parallel_agents: usize,
+    max_agent_steps: usize,
+    inventory: Arc<ReviewScopeInventory>,
+    diagnostics: AgentDiagnostics,
     mut progress: F,
 ) -> Result<Vec<AgentVerdict>, AgentError>
 where
@@ -301,6 +368,7 @@ where
     let mut completed_agent_count = 0;
     let batch_count = agents.len().div_ceil(chunk_size);
     let tool_cache = Arc::new(ToolExecutionCache::default());
+    let diagnostics = Arc::new(diagnostics);
     for (batch_index, chunk) in agents.chunks(chunk_size).enumerate() {
         progress(AgentProgressEvent::BatchPreparing {
             batch_index: batch_index + 1,
@@ -321,10 +389,18 @@ where
                 let bus = bus.clone();
                 let tool_cache = tool_cache.clone();
                 let inventory = inventory.clone();
+                let diagnostics = diagnostics.clone();
                 async move {
-                    let result =
-                        run_agent_loop(agent, search, bus, tool_cache, inventory, max_agent_steps)
-                            .await;
+                    let result = run_agent_loop(
+                        agent,
+                        search,
+                        bus,
+                        tool_cache,
+                        inventory,
+                        max_agent_steps,
+                        diagnostics,
+                    )
+                    .await;
                     (index, result)
                 }
             })
@@ -463,6 +539,33 @@ where
     B: LlmBus + ?Sized + 'static,
     F: FnMut(AgentTraceEvent),
 {
+    run_agent_with_trace_and_inventory_and_diagnostics(
+        agent,
+        search,
+        bus,
+        inventory,
+        max_agent_steps,
+        AgentDiagnostics::default(),
+        trace,
+    )
+    .await
+}
+
+pub async fn run_agent_with_trace_and_inventory_and_diagnostics<S, B, F>(
+    agent: AgentSpec,
+    search: Arc<S>,
+    bus: Arc<B>,
+    inventory: Arc<ReviewScopeInventory>,
+    max_agent_steps: usize,
+    diagnostics: AgentDiagnostics,
+    trace: F,
+) -> Result<AgentVerdict, AgentError>
+where
+    S: CodeSearchApi + 'static,
+    S::Error: Display,
+    B: LlmBus + ?Sized + 'static,
+    F: FnMut(AgentTraceEvent),
+{
     let loop_result = run_agent_loop_traced(
         &agent,
         search,
@@ -470,6 +573,7 @@ where
         Arc::new(ToolExecutionCache::default()),
         inventory,
         max_agent_steps,
+        Arc::new(diagnostics),
         trace,
     )
     .await?;
@@ -594,6 +698,7 @@ async fn run_agent_loop<S, B>(
     tool_cache: Arc<ToolExecutionCache>,
     inventory: Arc<ReviewScopeInventory>,
     max_agent_steps: usize,
+    diagnostics: Arc<AgentDiagnostics>,
 ) -> Result<AgentLoopResult, AgentError>
 where
     S: CodeSearchApi + 'static,
@@ -607,6 +712,7 @@ where
         tool_cache,
         inventory,
         max_agent_steps,
+        diagnostics,
         |_| {},
     )
     .await
@@ -619,6 +725,7 @@ async fn run_agent_loop_traced<S, B, F>(
     tool_cache: Arc<ToolExecutionCache>,
     inventory: Arc<ReviewScopeInventory>,
     max_agent_steps: usize,
+    diagnostics: Arc<AgentDiagnostics>,
     mut trace: F,
 ) -> Result<AgentLoopResult, AgentError>
 where
@@ -696,9 +803,10 @@ where
 
     for step in 1..=max_agent_steps.max(1) {
         let prompt = prompt_with_history(&base_prompt, &history);
+        let prompt_tokens = estimate_tokens(&prompt);
         trace(AgentTraceEvent::StepStarted {
             step,
-            prompt_tokens: estimate_tokens(&prompt),
+            prompt_tokens,
             prompt: prompt.clone(),
         });
         llm_calls += 1;
@@ -725,7 +833,17 @@ where
                 );
                 continue;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(contextualize_llm_error(
+                    &agent.id,
+                    step,
+                    prompt_tokens,
+                    &prompt,
+                    diagnostics.as_ref(),
+                    error,
+                )
+                .await);
+            }
         };
         match &action {
             LlmAction::Tool(_) => native_tool_calls += 1,
@@ -2526,6 +2644,146 @@ fn prompt_with_history(base_prompt: &str, history: &[String]) -> String {
         }
         start += 1;
     }
+}
+
+async fn contextualize_llm_error(
+    test_id: &str,
+    step: usize,
+    prompt_tokens: usize,
+    prompt: &str,
+    diagnostics: &AgentDiagnostics,
+    error: LlmBusError,
+) -> AgentError {
+    if !is_provider_invalid_prompt(&error) {
+        return error.into();
+    }
+
+    match write_rejected_prompt_dump(test_id, step, prompt_tokens, prompt, diagnostics, &error)
+        .await
+    {
+        Ok(prompt_dump_path) => AgentError::PromptRejected {
+            test_id: test_id.to_string(),
+            step,
+            prompt_tokens,
+            prompt_dump_path,
+            source: error,
+        },
+        Err(dump_error) => AgentError::PromptRejectedWithoutDump {
+            test_id: test_id.to_string(),
+            step,
+            prompt_tokens,
+            dump_error,
+            source: error,
+        },
+    }
+}
+
+fn is_provider_invalid_prompt(error: &LlmBusError) -> bool {
+    let LlmBusError::HttpStatus { body, .. } = error else {
+        return false;
+    };
+    let lower = body.to_ascii_lowercase();
+    lower.contains("invalid_prompt") || lower.contains("invalid prompt")
+}
+
+async fn write_rejected_prompt_dump(
+    test_id: &str,
+    step: usize,
+    prompt_tokens: usize,
+    prompt: &str,
+    diagnostics: &AgentDiagnostics,
+    error: &LlmBusError,
+) -> Result<PathBuf, String> {
+    let dir = diagnostics
+        .prompt_dump_dir
+        .as_ref()
+        .ok_or_else(|| "prompt dump directory not configured".to_string())?;
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|err| err.to_string())?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = dir.join(format!(
+        "prompt-rejected-{timestamp}-{}-step-{step}.json",
+        safe_file_stem(test_id)
+    ));
+    let payload = json!({
+        "test_id": test_id,
+        "step": step,
+        "estimated_prompt_tokens": prompt_tokens,
+        "prompt_chars": prompt.chars().count(),
+        "provider_error": error.to_string(),
+        "redaction": "Known API-key and bearer-token shaped substrings are redacted; repository source may otherwise be present for debugging.",
+        "prompt_redacted": redact_prompt_for_dump(prompt),
+    });
+    let json = serde_json::to_string_pretty(&payload).map_err(|err| err.to_string())?;
+    tokio::fs::write(&path, json)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(path)
+}
+
+fn safe_file_stem(value: &str) -> String {
+    let stem = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if stem.is_empty() {
+        "agent".to_string()
+    } else {
+        stem
+    }
+}
+
+fn redact_prompt_for_dump(prompt: &str) -> String {
+    prompt
+        .lines()
+        .map(redact_prompt_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn redact_prompt_line(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    if !lower.contains("bearer ") && !lower.contains("sk-") && !lower.contains("api_key") {
+        return line.to_string();
+    }
+    if let Some(index) = lower.find("bearer ") {
+        return format!("{}bearer [REDACTED]", &line[..index]);
+    }
+    line.split_whitespace()
+        .map(redact_prompt_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_prompt_token(token: &str) -> String {
+    let trimmed = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | ',' | ';' | ':' | ')' | ']' | '}' | '(' | '[' | '{'
+        )
+    });
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("sk-") && trimmed.chars().count() > 16 {
+        return token.replace(trimmed, "[REDACTED]");
+    }
+    for key in ["openai_api_key=", "anthropic_api_key=", "api_key="] {
+        if let Some(index) = lower.find(key) {
+            let prefix_len = index + key.len();
+            let (prefix, _) = trimmed.split_at(prefix_len.min(trimmed.len()));
+            return token.replace(trimmed, &format!("{prefix}[REDACTED]"));
+        }
+    }
+    token.to_string()
 }
 
 fn prompt_observation(

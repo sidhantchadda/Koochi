@@ -1,9 +1,10 @@
 use crate::Severity;
+use crate::agents::AgentDiagnostics;
 use crate::agents::AgentProgressEvent;
 use crate::agents::AgentTraceEvent;
 use crate::agents::build_review_scope_inventory;
-use crate::agents::run_agent_with_trace_and_inventory;
-use crate::agents::run_agents_with_inventory_and_progress;
+use crate::agents::run_agent_with_trace_and_inventory_and_diagnostics;
+use crate::agents::run_agents_with_inventory_and_progress_and_diagnostics;
 use crate::config::ConfigError;
 use crate::config::KoochiConfig;
 use crate::config::discover_config;
@@ -22,6 +23,7 @@ use crate::synthesis::synthesize_results;
 use clap::Parser;
 use std::io::IsTerminal;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -204,6 +206,7 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
     let search = Arc::new(LocalSearchSession::new(scope.clone()));
     let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await?);
     confirm_large_review_scope_if_needed(inventory.as_ref(), cli.yes)?;
+    let agent_diagnostics = agent_diagnostics(&scope.primary_repo.root);
     let built_bus = build_llm_bus(&config)?;
     if let Some(agent) = trace_agent {
         println!("Tracing 1 agentic invariant: {}", agent.id);
@@ -211,12 +214,13 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
         trace_debug_stats.set_inventory(inventory.as_ref());
         trace_debug_stats.agent_batches = 1;
         let trace_started = Instant::now();
-        let verdict = run_agent_with_trace_and_inventory(
+        let verdict = run_agent_with_trace_and_inventory_and_diagnostics(
             agent,
             search.clone(),
             built_bus.bus.clone(),
             inventory.clone(),
             config.max_agent_steps,
+            agent_diagnostics,
             |event| {
                 trace_debug_stats.record_trace(&event);
                 print_trace_event(event, cli.verbose);
@@ -241,13 +245,14 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
     println!("Running {} agentic invariants", scope.agents.len());
     let mut debug_stats = DebugRunStats::default();
     debug_stats.set_inventory(inventory.as_ref());
-    let verdicts = run_agents_with_inventory_and_progress(
+    let verdicts = run_agents_with_inventory_and_progress_and_diagnostics(
         scope.agents.clone(),
         search.clone(),
         built_bus.bus.clone(),
         config.max_parallel_agents,
         config.max_agent_steps,
         inventory,
+        agent_diagnostics,
         |event| {
             debug_stats.record(&event);
             match event {
@@ -330,6 +335,15 @@ fn confirm_large_review_scope_if_needed(
             files: inventory.file_count(),
         })
     }
+}
+
+fn agent_diagnostics(repo_root: &Path) -> AgentDiagnostics {
+    AgentDiagnostics::with_prompt_dump_dir(
+        repo_root
+            .join(".koochi")
+            .join("debug")
+            .join("prompt-rejections"),
+    )
 }
 
 async fn write_json_report(
