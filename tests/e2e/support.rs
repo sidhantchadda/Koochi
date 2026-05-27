@@ -144,6 +144,7 @@ fn run_case_command(path: &Path, report_path: &Path, case: &E2eCase<'_>) -> Outp
     let mut command = Command::new(koochi_bin());
     command
         .current_dir(path)
+        .arg("--yes")
         .arg("--json-output")
         .arg(report_path);
     if case.debug {

@@ -22,6 +22,8 @@ pub enum ScopeError {
     MissingHeadParent,
     #[error("cannot review git ref `{0}` because it does not resolve to a commit")]
     InvalidReviewRef(String),
+    #[error("`--all`/`--full-repo` cannot be combined with `--commit`, `--base`, or `--head`")]
+    ConflictingFullRepoOptions,
     #[error("`--commit` cannot be combined with `--base` or `--head`")]
     ConflictingReviewOptions,
     #[error("`--base` and `--head` must be provided together")]
@@ -58,6 +60,7 @@ pub enum ReviewMode {
     HeadCommit,
     Commit,
     DiffRange { base: String, head: String },
+    FullRepo,
     FullRepoFallback,
 }
 
@@ -145,6 +148,7 @@ pub enum ReviewTarget {
     Auto,
     Commit(String),
     Range { base: String, head: String },
+    FullRepo,
 }
 
 pub fn build_scope(
@@ -168,7 +172,7 @@ pub fn build_scope(
         })?;
     let repo_id = root.to_string_lossy().to_string();
     let revision = match &target {
-        ReviewTarget::Auto => parse_revision(&config.repo.revision),
+        ReviewTarget::Auto | ReviewTarget::FullRepo => parse_revision(&config.repo.revision),
         ReviewTarget::Commit(commit) => GitRevision::Commit(commit.clone()),
         ReviewTarget::Range { head, .. } => GitRevision::Commit(head.clone()),
     };
@@ -201,7 +205,7 @@ fn build_review_scope(
     target: &ReviewTarget,
 ) -> Result<ReviewScope, ScopeError> {
     if !is_git_root(root) {
-        if !matches!(target, ReviewTarget::Auto) {
+        if !matches!(target, ReviewTarget::Auto | ReviewTarget::FullRepo) {
             return Err(ScopeError::InvalidReviewRef(
                 "explicit review target requires a git repository root".to_string(),
             ));
@@ -218,6 +222,14 @@ fn build_review_scope(
         ReviewTarget::Auto => {}
         ReviewTarget::Commit(commit) => return explicit_commit_review_scope(root, commit),
         ReviewTarget::Range { base, head } => return diff_range_review_scope(root, base, head),
+        ReviewTarget::FullRepo => {
+            return Ok(ReviewScope {
+                mode: ReviewMode::FullRepo,
+                files: Vec::new(),
+                hunks: Vec::new(),
+                commit: None,
+            });
+        }
     }
 
     if let Some(changes) = local_review_changes(root) {
@@ -263,7 +275,14 @@ pub fn review_target_from_options(
     commit: Option<String>,
     base: Option<String>,
     head: Option<String>,
+    full_repo: bool,
 ) -> Result<ReviewTarget, ScopeError> {
+    if full_repo && (commit.is_some() || base.is_some() || head.is_some()) {
+        return Err(ScopeError::ConflictingFullRepoOptions);
+    }
+    if full_repo {
+        return Ok(ReviewTarget::FullRepo);
+    }
     if commit.is_some() && (base.is_some() || head.is_some()) {
         return Err(ScopeError::ConflictingReviewOptions);
     }
@@ -939,6 +958,38 @@ mod tests {
 
         assert_eq!(review.mode, ReviewMode::FullRepoFallback);
         assert!(review.files.is_empty());
+    }
+
+    #[test]
+    fn review_scope_can_target_full_repo_inside_git_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        if !git(temp.path(), ["init"]) {
+            return;
+        }
+        git(temp.path(), ["config", "user.email", "koochi@example.test"]);
+        git(temp.path(), ["config", "user.name", "Koochi"]);
+        fs::write(temp.path().join("first.rs"), "fn first() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "initial"]);
+        fs::write(temp.path().join("second.rs"), "fn second() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+
+        let review = build_review_scope(temp.path(), &ReviewTarget::FullRepo).unwrap();
+
+        assert_eq!(review.mode, ReviewMode::FullRepo);
+        assert!(review.files.is_empty());
+        assert!(review.hunks.is_empty());
+    }
+
+    #[test]
+    fn review_target_options_accept_full_repo_and_reject_mixes() {
+        assert_eq!(
+            review_target_from_options(None, None, None, true).unwrap(),
+            ReviewTarget::FullRepo
+        );
+        let err = review_target_from_options(Some("HEAD".to_string()), None, None, true)
+            .expect_err("full-repo cannot combine with commit");
+        assert!(matches!(err, ScopeError::ConflictingFullRepoOptions));
     }
 
     #[test]

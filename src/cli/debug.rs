@@ -11,10 +11,25 @@ pub(crate) struct DebugRunStats {
     tool_cache_hits: usize,
     tool_cache_misses: usize,
     non_progress_terminations: usize,
+    coverage_source_files: usize,
+    coverage_loc: u64,
+    coverage_bytes: u64,
+    coverage_chunks: usize,
+    coverage_chunk_line_limit: usize,
+    coverage_chunks_delivered: usize,
+    coverage_pass_rejections: usize,
     pub(crate) llm_elapsed: Duration,
 }
 
 impl DebugRunStats {
+    pub(crate) fn set_inventory(&mut self, inventory: &crate::agents::ReviewScopeInventory) {
+        self.coverage_source_files = inventory.file_count();
+        self.coverage_loc = inventory.line_count();
+        self.coverage_bytes = inventory.byte_count();
+        self.coverage_chunks = inventory.chunk_count();
+        self.coverage_chunk_line_limit = inventory.chunk_line_limit();
+    }
+
     pub(crate) fn record(&mut self, event: &AgentProgressEvent) {
         match event {
             AgentProgressEvent::BatchCompleted {
@@ -26,6 +41,8 @@ impl DebugRunStats {
                 tool_cache_hits,
                 tool_cache_misses,
                 non_progress_terminations,
+                coverage_chunks_delivered,
+                coverage_pass_rejections,
                 ..
             } => {
                 self.agent_batches += 1;
@@ -36,6 +53,8 @@ impl DebugRunStats {
                 self.tool_cache_hits += tool_cache_hits;
                 self.tool_cache_misses += tool_cache_misses;
                 self.non_progress_terminations += non_progress_terminations;
+                self.coverage_chunks_delivered += coverage_chunks_delivered;
+                self.coverage_pass_rejections += coverage_pass_rejections;
                 self.llm_elapsed += *llm_elapsed;
             }
             AgentProgressEvent::BatchPreparing { .. }
@@ -65,6 +84,15 @@ impl DebugRunStats {
         }
         if matches!(event, AgentTraceEvent::NonProgressTerminated { .. }) {
             self.non_progress_terminations += 1;
+        }
+        if let AgentTraceEvent::ReviewCoverageDelivered {
+            delivered_chunks, ..
+        } = event
+        {
+            self.coverage_chunks_delivered = *delivered_chunks;
+        }
+        if matches!(event, AgentTraceEvent::PassCoverageRejected { .. }) {
+            self.coverage_pass_rejections += 1;
         }
     }
 }
@@ -114,6 +142,20 @@ pub(crate) fn print_debug_report(
         "  agent guardrails: {} tool-cache hits / {} misses, {} non-progress terminations",
         debug.tool_cache_hits, debug.tool_cache_misses, debug.non_progress_terminations
     );
+    if debug.coverage_source_files > 0 {
+        println!(
+            "  review coverage: {} source files, {} LOC, {} chunks ({} lines/chunk)",
+            format_count(debug.coverage_source_files as u64),
+            format_count(debug.coverage_loc),
+            format_count(debug.coverage_chunks as u64),
+            debug.coverage_chunk_line_limit
+        );
+        println!(
+            "  agent coverage: {} chunks delivered, {} pass verdicts rejected before full coverage",
+            format_count(debug.coverage_chunks_delivered as u64),
+            format_count(debug.coverage_pass_rejections as u64)
+        );
+    }
     println!(
         "  search tools: {} calls total (list_files {}, list_review_files {}, read_file {}, get_hunk_context {}, get_file_context {}, search_text {}, definitions {}, references {})",
         total_search_calls,
@@ -161,6 +203,18 @@ struct DebugReviewLog {
     hunk_count: usize,
     initial_packet_mode: &'static str,
     initial_packet_tokens: usize,
+    coverage: DebugCoverageLog,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DebugCoverageLog {
+    source_files: usize,
+    loc: u64,
+    bytes: u64,
+    chunks: usize,
+    chunk_line_limit: usize,
+    chunks_delivered: usize,
+    pass_rejections: usize,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -267,6 +321,15 @@ fn build_debug_log(
             hunk_count: review.hunks.len(),
             initial_packet_mode: initial_packet_mode(review, initial_context_token_budget),
             initial_packet_tokens: estimate_review_packet_tokens(review),
+            coverage: DebugCoverageLog {
+                source_files: debug.coverage_source_files,
+                loc: debug.coverage_loc,
+                bytes: debug.coverage_bytes,
+                chunks: debug.coverage_chunks,
+                chunk_line_limit: debug.coverage_chunk_line_limit,
+                chunks_delivered: debug.coverage_chunks_delivered,
+                pass_rejections: debug.coverage_pass_rejections,
+            },
         },
         llm: DebugLlmLog {
             turns: debug.llm_turns,

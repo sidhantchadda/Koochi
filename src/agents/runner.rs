@@ -13,6 +13,7 @@ use crate::prompts::grounded_agent_prompt;
 use crate::scope::AgentSpec;
 use crate::scope::ReviewHunk;
 use crate::scope::ReviewLineKind;
+use crate::scope::ReviewMode;
 use crate::search::CodeSearchApi;
 use crate::search::FileKind;
 use crate::search::FindDefinitionsRequest;
@@ -29,6 +30,7 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +56,52 @@ const MAX_READ_FILE_LINES: usize = 120;
 const MAX_SEARCH_MATCHES: usize = 40;
 const MAX_REFERENCE_MATCHES: usize = 80;
 const MAX_HUNK_SUMMARY_PREVIEW_LINES: usize = 4;
+const REVIEW_COVERAGE_CHUNK_LINES: usize = MAX_READ_FILE_LINES;
+const MAX_REVIEW_COVERAGE_BATCH_CHARS: usize = 10_000;
+const FULL_REPO_REQUIRED_SEARCH_TERMS: usize = 30;
+
+#[derive(Debug, Clone)]
+pub struct ReviewScopeInventory {
+    file_count: usize,
+    line_count: u64,
+    byte_count: u64,
+    chunks: Vec<ReviewSourceChunk>,
+}
+
+impl ReviewScopeInventory {
+    pub fn file_count(&self) -> usize {
+        self.file_count
+    }
+
+    pub fn line_count(&self) -> u64 {
+        self.line_count
+    }
+
+    pub fn byte_count(&self) -> u64 {
+        self.byte_count
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    pub fn chunk_line_limit(&self) -> usize {
+        REVIEW_COVERAGE_CHUNK_LINES
+    }
+
+    fn is_empty(&self) -> bool {
+        self.file_count == 0 || self.chunks.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReviewSourceChunk {
+    index: usize,
+    path: String,
+    start_line: u32,
+    end_line: u32,
+    content: String,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -99,6 +147,8 @@ pub enum AgentProgressEvent {
         tool_cache_hits: usize,
         tool_cache_misses: usize,
         non_progress_terminations: usize,
+        coverage_chunks_delivered: usize,
+        coverage_pass_rejections: usize,
         llm_elapsed: Duration,
     },
 }
@@ -140,6 +190,19 @@ pub enum AgentTraceEvent {
         step: usize,
         response: LlmResponse,
     },
+    ReviewCoverageDelivered {
+        step: usize,
+        delivered_chunks: usize,
+        total_chunks: usize,
+        remaining_chunks: usize,
+        observation: String,
+    },
+    PassCoverageRejected {
+        step: usize,
+        delivered_chunks: usize,
+        total_chunks: usize,
+        guidance: String,
+    },
     FinalVerdict {
         step: usize,
         response: LlmResponse,
@@ -177,12 +240,14 @@ where
     S::Error: Display,
     B: LlmBus + ?Sized + 'static,
 {
-    run_agents_with_progress(
+    let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await?);
+    run_agents_with_inventory_and_progress(
         agents,
         search,
         bus,
         max_parallel_agents,
         max_agent_steps,
+        inventory,
         |_| {},
     )
     .await
@@ -194,6 +259,34 @@ pub async fn run_agents_with_progress<S, B, F>(
     bus: Arc<B>,
     max_parallel_agents: usize,
     max_agent_steps: usize,
+    progress: F,
+) -> Result<Vec<AgentVerdict>, AgentError>
+where
+    S: CodeSearchApi + 'static,
+    S::Error: Display,
+    B: LlmBus + ?Sized + 'static,
+    F: FnMut(AgentProgressEvent),
+{
+    let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await?);
+    run_agents_with_inventory_and_progress(
+        agents,
+        search,
+        bus,
+        max_parallel_agents,
+        max_agent_steps,
+        inventory,
+        progress,
+    )
+    .await
+}
+
+pub async fn run_agents_with_inventory_and_progress<S, B, F>(
+    agents: Vec<AgentSpec>,
+    search: Arc<S>,
+    bus: Arc<B>,
+    max_parallel_agents: usize,
+    max_agent_steps: usize,
+    inventory: Arc<ReviewScopeInventory>,
     mut progress: F,
 ) -> Result<Vec<AgentVerdict>, AgentError>
 where
@@ -227,9 +320,11 @@ where
                 let search = search.clone();
                 let bus = bus.clone();
                 let tool_cache = tool_cache.clone();
+                let inventory = inventory.clone();
                 async move {
                     let result =
-                        run_agent_loop(agent, search, bus, tool_cache, max_agent_steps).await;
+                        run_agent_loop(agent, search, bus, tool_cache, inventory, max_agent_steps)
+                            .await;
                     (index, result)
                 }
             })
@@ -307,6 +402,14 @@ where
             .iter()
             .map(|result| result.non_progress_terminations)
             .sum::<usize>();
+        let coverage_chunks_delivered = loop_results
+            .iter()
+            .map(|result| result.coverage_chunks_delivered)
+            .sum::<usize>();
+        let coverage_pass_rejections = loop_results
+            .iter()
+            .map(|result| result.coverage_pass_rejections)
+            .sum::<usize>();
         progress(AgentProgressEvent::BatchCompleted {
             batch_index: batch_index + 1,
             batch_count,
@@ -318,6 +421,8 @@ where
             tool_cache_hits,
             tool_cache_misses,
             non_progress_terminations,
+            coverage_chunks_delivered,
+            coverage_pass_rejections,
             llm_elapsed,
         });
         for (agent, loop_result) in chunk.iter().zip(loop_results) {
@@ -340,11 +445,30 @@ where
     B: LlmBus + ?Sized + 'static,
     F: FnMut(AgentTraceEvent),
 {
+    let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await?);
+    run_agent_with_trace_and_inventory(agent, search, bus, inventory, max_agent_steps, trace).await
+}
+
+pub async fn run_agent_with_trace_and_inventory<S, B, F>(
+    agent: AgentSpec,
+    search: Arc<S>,
+    bus: Arc<B>,
+    inventory: Arc<ReviewScopeInventory>,
+    max_agent_steps: usize,
+    trace: F,
+) -> Result<AgentVerdict, AgentError>
+where
+    S: CodeSearchApi + 'static,
+    S::Error: Display,
+    B: LlmBus + ?Sized + 'static,
+    F: FnMut(AgentTraceEvent),
+{
     let loop_result = run_agent_loop_traced(
         &agent,
         search,
         bus,
         Arc::new(ToolExecutionCache::default()),
+        inventory,
         max_agent_steps,
         trace,
     )
@@ -367,6 +491,8 @@ struct AgentLoopResult {
     tool_cache_hits: usize,
     tool_cache_misses: usize,
     non_progress_terminations: usize,
+    coverage_chunks_delivered: usize,
+    coverage_pass_rejections: usize,
 }
 
 struct GroundedRequest {
@@ -379,6 +505,86 @@ struct GroundedRequest {
     relevant_changed_lines: HashSet<(String, u32)>,
     review_causal_terms: HashSet<String>,
     allows_direct_verdict: bool,
+    full_repo_mode: bool,
+    full_repo_search_terms: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct ReviewCoverageState {
+    next_chunk: usize,
+    coverage_chunks_delivered: usize,
+    pass_rejections: usize,
+}
+
+struct ReviewCoverageBatch {
+    observation: String,
+    evidence_lines: Vec<(String, u32)>,
+    chunk_count: usize,
+    remaining_chunks: usize,
+}
+
+impl ReviewCoverageState {
+    fn is_complete(&self, inventory: &ReviewScopeInventory) -> bool {
+        inventory.is_empty() || self.next_chunk >= inventory.chunks.len()
+    }
+
+    fn delivered_chunks(&self) -> usize {
+        self.next_chunk
+    }
+
+    fn coverage_chunks_delivered(&self) -> usize {
+        self.coverage_chunks_delivered
+    }
+
+    fn pass_rejections(&self) -> usize {
+        self.pass_rejections
+    }
+
+    fn record_pass_rejection(&mut self) {
+        self.pass_rejections += 1;
+    }
+
+    fn next_batch(&mut self, inventory: &ReviewScopeInventory) -> Option<ReviewCoverageBatch> {
+        if self.is_complete(inventory) {
+            return None;
+        }
+        let start = self.next_chunk;
+        let mut end = start;
+        let mut rendered_chars = 0usize;
+        let mut chunks = Vec::new();
+        let mut evidence_lines = Vec::new();
+        while end < inventory.chunks.len() {
+            let chunk = &inventory.chunks[end];
+            let rendered = coverage_chunk_json(chunk);
+            let rendered_len = rendered.to_string().chars().count();
+            if end > start && rendered_chars + rendered_len > MAX_REVIEW_COVERAGE_BATCH_CHARS {
+                break;
+            }
+            rendered_chars += rendered_len;
+            evidence_lines
+                .extend((chunk.start_line..=chunk.end_line).map(|line| (chunk.path.clone(), line)));
+            chunks.push(rendered);
+            end += 1;
+        }
+        self.next_chunk = end;
+        self.coverage_chunks_delivered += chunks.len();
+        let remaining_chunks = inventory.chunks.len().saturating_sub(self.next_chunk);
+        Some(ReviewCoverageBatch {
+            observation: json!({
+                "review_scope_coverage": {
+                    "delivered_chunks": chunks,
+                    "delivered_chunk_count": end - start,
+                    "delivered_through_chunk": self.next_chunk,
+                    "total_chunks": inventory.chunks.len(),
+                    "remaining_chunks": remaining_chunks,
+                }
+            })
+            .to_string(),
+            evidence_lines,
+            chunk_count: end - start,
+            remaining_chunks,
+        })
+    }
 }
 
 async fn run_agent_loop<S, B>(
@@ -386,6 +592,7 @@ async fn run_agent_loop<S, B>(
     search: Arc<S>,
     bus: Arc<B>,
     tool_cache: Arc<ToolExecutionCache>,
+    inventory: Arc<ReviewScopeInventory>,
     max_agent_steps: usize,
 ) -> Result<AgentLoopResult, AgentError>
 where
@@ -393,7 +600,16 @@ where
     S::Error: Display,
     B: LlmBus + ?Sized + 'static,
 {
-    run_agent_loop_traced(agent, search, bus, tool_cache, max_agent_steps, |_| {}).await
+    run_agent_loop_traced(
+        agent,
+        search,
+        bus,
+        tool_cache,
+        inventory,
+        max_agent_steps,
+        |_| {},
+    )
+    .await
 }
 
 async fn run_agent_loop_traced<S, B, F>(
@@ -401,6 +617,7 @@ async fn run_agent_loop_traced<S, B, F>(
     search: Arc<S>,
     bus: Arc<B>,
     tool_cache: Arc<ToolExecutionCache>,
+    inventory: Arc<ReviewScopeInventory>,
     max_agent_steps: usize,
     mut trace: F,
 ) -> Result<AgentLoopResult, AgentError>
@@ -443,6 +660,8 @@ where
             tool_cache_hits: 0,
             tool_cache_misses: 0,
             non_progress_terminations: 0,
+            coverage_chunks_delivered: 0,
+            coverage_pass_rejections: 0,
         });
     }
     let base_prompt = agent_loop_prompt(&agent.id, &grounded.request.instruction);
@@ -451,8 +670,10 @@ where
     let has_explicit_targeted_rescue = grounded.target_context_line.is_some()
         || instruction_review_path(&agent.instruction, &grounded.review_paths).is_some();
     let mut targeted_rescue_hint = targeted_rescue_turn(agent, &grounded);
+    let mut full_repo_rescue_terms = VecDeque::from(grounded.full_repo_search_terms.clone());
     let mut evidence_index = grounded.evidence_index;
     let mut investigation = InvestigationState::new(agent);
+    let mut coverage = ReviewCoverageState::default();
     let mut llm_calls = 0;
     let mut native_tool_calls = 0;
     let mut native_final_calls = 0;
@@ -463,6 +684,15 @@ where
     let mut non_progress = NonProgressState::default();
     let mut deferred_failed_response = None;
     let mut contradictory_pass_rejections = 0usize;
+    push_history(
+        &mut history,
+        format!(
+            "\n\nReview-scope coverage gate:\nKoochi has indexed {} source files, {} LOC, and {} deterministic source chunks for this review scope. You may return `failed` as soon as concrete review-scope evidence demonstrates a violation. Koochi will not accept `passed` until it has shown this agent every review-scope source chunk.",
+            inventory.file_count(),
+            inventory.line_count(),
+            inventory.chunk_count()
+        ),
+    );
 
     for step in 1..=max_agent_steps.max(1) {
         let prompt = prompt_with_history(&base_prompt, &history);
@@ -529,6 +759,50 @@ where
             let final_response = investigation
                 .fixture_corrected_final(&agent.id, &final_response)
                 .unwrap_or(final_response);
+            if final_response.status == TestStatus::Passed
+                && !coverage.is_complete(inventory.as_ref())
+            {
+                coverage.record_pass_rejection();
+                let guidance = format!(
+                    "Passed verdict rejected because this agent has reviewed {}/{} review-scope source chunks. Koochi must show every review-scope source chunk to this agent before accepting passed.",
+                    coverage.delivered_chunks(),
+                    inventory.chunk_count()
+                );
+                trace(AgentTraceEvent::PassCoverageRejected {
+                    step,
+                    delivered_chunks: coverage.delivered_chunks(),
+                    total_chunks: inventory.chunk_count(),
+                    guidance: guidance.clone(),
+                });
+                let Some(batch) = coverage.next_batch(inventory.as_ref()) else {
+                    push_history(
+                        &mut history,
+                        format!(
+                            "\n\nStep {step} passed verdict rejected:\n{guidance}\n\nReturn exactly one final verdict JSON now."
+                        ),
+                    );
+                    continue;
+                };
+                for line in &batch.evidence_lines {
+                    evidence_index.insert(line.clone());
+                }
+                investigation.record(ToolKind::ReviewCoverage, &batch.observation);
+                trace(AgentTraceEvent::ReviewCoverageDelivered {
+                    step,
+                    delivered_chunks: coverage.delivered_chunks(),
+                    total_chunks: inventory.chunk_count(),
+                    remaining_chunks: batch.remaining_chunks,
+                    observation: batch.observation.clone(),
+                });
+                push_history(
+                    &mut history,
+                    format!(
+                        "\n\nStep {step} passed verdict rejected:\n{guidance}\n\nReview-scope source coverage batch ({} chunks, {} remaining):\n{}\n\nStudy this exact source. Return `failed` immediately if this batch demonstrates a concrete violation. Return `passed` only if you have no concrete finding after Koochi has delivered every review-scope source chunk.",
+                        batch.chunk_count, batch.remaining_chunks, batch.observation
+                    ),
+                );
+                continue;
+            }
             let direct_verdict_allowed = grounded.allows_direct_verdict
                 && direct_verdict_is_grounded(&final_response, &grounded.relevant_changed_lines)
                 && direct_verdict_satisfies_investigation(
@@ -569,6 +843,30 @@ where
                     &mut history,
                     format!(
                         "\n\nStep {step} failed verdict rejected:\n{guidance}\n\nReturn exactly one final_verdict JSON now if the issue is concrete, or a passed verdict if no concrete review-scope issue remains."
+                    ),
+                );
+                continue;
+            }
+            if let Some(guidance) = failed_verdict_has_mismatched_evidence_preview(
+                search.as_ref(),
+                &final_response,
+                &evidence_index,
+                &grounded.review_paths,
+                &grounded.changed_lines,
+                &grounded.relevant_changed_lines,
+            )
+            .await?
+                && !is_absence_policy(&agent.instruction)
+                && !investigation.has_matching_fixture_marker(&agent.id)
+            {
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: guidance.clone(),
+                });
+                push_history(
+                    &mut history,
+                    format!(
+                        "\n\nStep {step} failed verdict evidence rejected:\n{guidance}\n\nUse exact path, line, and preview values from a targeted content observation, then return failed only if that exact line demonstrates the issue. Otherwise return passed/no concrete finding."
                     ),
                 );
                 continue;
@@ -616,6 +914,40 @@ where
                 );
                 continue;
             }
+            if grounded.full_repo_mode
+                && failed_verdict_lacks_full_repo_focus_evidence(
+                    &final_response,
+                    &grounded.full_repo_search_terms,
+                )
+                && !investigation.has_matching_fixture_marker(&agent.id)
+            {
+                let guidance = "Full-repo failed verdict evidence must be concretely tied to this invariant's focus terms. Do not cite generic declarations, bundled/minified blobs, or unrelated lines. Search a specific invariant term, inspect a focused source context, and cite a line whose preview itself demonstrates the violation.".to_string();
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: guidance.clone(),
+                });
+                push_history(
+                    &mut history,
+                    format!(
+                        "\n\nStep {step} weak full-repo failed evidence rejected:\n{guidance}\n\nReturn one targeted tool call now, or return passed if no concrete full-repo issue remains."
+                    ),
+                );
+                continue;
+            }
+            if failed_verdict_is_speculative(&final_response)
+                && !investigation.has_matching_fixture_marker(&agent.id)
+            {
+                let guidance = "Failed verdicts must describe a concrete review-scope violation, not a possible gap or something that still requires confirmation. Return failed only with evidence that directly demonstrates the violation; otherwise return passed/no concrete finding.".to_string();
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: guidance.clone(),
+                });
+                push_history(
+                    &mut history,
+                    format!("\n\nStep {step} speculative failed verdict rejected:\n{guidance}"),
+                );
+                continue;
+            }
             if passed_verdict_contradicts_failure_language(&final_response, &agent.instruction) {
                 contradictory_pass_rejections += 1;
                 if contradictory_pass_rejections >= 2 {
@@ -652,6 +984,11 @@ where
                             &grounded.changed_lines,
                             &grounded.relevant_changed_lines,
                         )
+                        && (!grounded.full_repo_mode
+                            || !failed_verdict_lacks_full_repo_focus_evidence(
+                                &repaired_response,
+                                &grounded.full_repo_search_terms,
+                            ))
                     {
                         trace(AgentTraceEvent::FinalVerdict {
                             step,
@@ -681,6 +1018,8 @@ where
                             tool_cache_hits,
                             tool_cache_misses,
                             non_progress_terminations,
+                            coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
+                            coverage_pass_rejections: coverage.pass_rejections(),
                         });
                     }
                 }
@@ -723,6 +1062,8 @@ where
                 tool_cache_hits,
                 tool_cache_misses,
                 non_progress_terminations,
+                coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
+                coverage_pass_rejections: coverage.pass_rejections(),
             });
         } else {
             let tool = describe_turn(&turn);
@@ -765,6 +1106,45 @@ where
             if let Some(decision) =
                 non_progress.record(&turn, investigation.has_content_observation())
             {
+                if grounded.full_repo_mode
+                    && !investigation.has_content_observation()
+                    && let Some(executed_tools) = execute_full_repo_rescue(
+                        search.as_ref(),
+                        tool_cache.as_ref(),
+                        &mut evidence_index,
+                        &mut full_repo_rescue_terms,
+                    )
+                    .await?
+                {
+                    let mut observations = Vec::new();
+                    for executed in executed_tools {
+                        if executed.cache_hit {
+                            tool_cache_hits += 1;
+                        } else {
+                            tool_cache_misses += 1;
+                        }
+                        trace(AgentTraceEvent::ToolExecuted {
+                            step,
+                            tool: format!("full-repo targeted rescue {}", executed.tool_label()),
+                            cache_hit: executed.cache_hit,
+                            observation: executed.observation.clone(),
+                        });
+                        investigation.record(executed.kind, &executed.observation);
+                        observations.push(prompt_observation(
+                            step,
+                            &executed.observation,
+                            &mut seen_observations,
+                        ));
+                    }
+                    push_history(
+                        &mut history,
+                        format!(
+                            "\n\nStep {step} full-repo targeted search/context supplied after broad non-progress:\n{}\n\nUse these concrete observations. If a search match looks relevant, inspect it with get_file_context or read_file before returning failed. Return passed only if no concrete review-scope issue remains.",
+                            observations.join("\n")
+                        ),
+                    );
+                    continue;
+                }
                 if !investigation.has_content_observation()
                     && let Some(rescue_turn) = targeted_rescue_hint.take()
                 {
@@ -810,6 +1190,29 @@ where
                         continue;
                     }
                     NonProgressDecision::Terminate(reason) => {
+                        if !coverage.is_complete(inventory.as_ref())
+                            && let Some(batch) = coverage.next_batch(inventory.as_ref())
+                        {
+                            for line in &batch.evidence_lines {
+                                evidence_index.insert(line.clone());
+                            }
+                            investigation.record(ToolKind::ReviewCoverage, &batch.observation);
+                            trace(AgentTraceEvent::ReviewCoverageDelivered {
+                                step,
+                                delivered_chunks: coverage.delivered_chunks(),
+                                total_chunks: inventory.chunk_count(),
+                                remaining_chunks: batch.remaining_chunks,
+                                observation: batch.observation.clone(),
+                            });
+                            push_history(
+                                &mut history,
+                                format!(
+                                    "\n\nStep {step} repeated or broad tool use stopped: {reason}\n\nKoochi is continuing review-scope coverage before any pass can be accepted. Coverage batch ({} chunks, {} remaining):\n{}\n\nStudy this exact source. Return `failed` immediately if this batch demonstrates a concrete violation. Return `passed` only after Koochi has delivered every review-scope source chunk.",
+                                    batch.chunk_count, batch.remaining_chunks, batch.observation
+                                ),
+                            );
+                            continue;
+                        }
                         non_progress_terminations += 1;
                         let response = no_concrete_finding_response(agent, &reason);
                         trace(AgentTraceEvent::NonProgressTerminated {
@@ -832,6 +1235,8 @@ where
                             tool_cache_hits,
                             tool_cache_misses,
                             non_progress_terminations,
+                            coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
+                            coverage_pass_rejections: coverage.pass_rejections(),
                         });
                     }
                 }
@@ -909,20 +1314,38 @@ where
             tool_cache_hits,
             tool_cache_misses,
             non_progress_terminations,
+            coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
+            coverage_pass_rejections: coverage.pass_rejections(),
         });
     }
 
-    let response = investigation
-        .fixture_step_limit_response(&agent.id, agent.severity)
-        .unwrap_or_else(|| LlmResponse {
+    let response = if let Some(response) =
+        investigation.fixture_step_limit_response(&agent.id, agent.severity)
+    {
+        response
+    } else if !coverage.is_complete(inventory.as_ref()) {
+        LlmResponse {
+            status: TestStatus::Failed,
+            severity: agent.severity,
+            description: format!(
+                "Agent `{}` reached the step limit after reviewing {}/{} review-scope source chunks. Passing is not allowed until every review-scope source chunk has been shown to the agent.",
+                agent.id,
+                coverage.delivered_chunks(),
+                inventory.chunk_count()
+            ),
+            evidence: Vec::new(),
+        }
+    } else {
+        LlmResponse {
             status: TestStatus::Passed,
             severity: None,
             description: format!(
-                "Agent `{}` reached the step limit without a concrete review-scope finding.",
+                "Agent `{}` reached the step limit without a concrete review-scope finding after reviewing all review-scope source chunks.",
                 agent.id
             ),
             evidence: Vec::new(),
-        });
+        }
+    };
     trace(AgentTraceEvent::StepLimit {
         response: response.clone(),
     });
@@ -950,6 +1373,8 @@ where
         tool_cache_hits,
         tool_cache_misses,
         non_progress_terminations,
+        coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
+        coverage_pass_rejections: coverage.pass_rejections(),
     })
 }
 
@@ -964,6 +1389,25 @@ fn direct_verdict_is_grounded(
                 && substantive_evidence_preview(&evidence.preview)
         }),
     }
+}
+
+fn coverage_chunk_json(chunk: &ReviewSourceChunk) -> serde_json::Value {
+    json!({
+        "chunk_index": chunk.index,
+        "path": chunk.path,
+        "start_line": chunk.start_line,
+        "end_line": chunk.end_line,
+        "content": line_numbered_content(&chunk.content, chunk.start_line),
+    })
+}
+
+fn line_numbered_content(content: &str, start_line: u32) -> String {
+    content
+        .lines()
+        .enumerate()
+        .map(|(index, line)| format!("{}: {}", start_line + index as u32, line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn direct_verdict_satisfies_investigation(
@@ -1011,6 +1455,231 @@ fn failed_verdict_lacks_substantive_accepted_evidence(
     }
 
     has_accepted_evidence
+}
+
+async fn failed_verdict_has_mismatched_evidence_preview<S>(
+    search: &S,
+    response: &LlmResponse,
+    evidence_index: &HashSet<(String, u32)>,
+    review_paths: &HashSet<String>,
+    changed_lines: &HashSet<(String, u32)>,
+    relevant_changed_lines: &HashSet<(String, u32)>,
+) -> Result<Option<String>, AgentError>
+where
+    S: CodeSearchApi + ?Sized,
+    S::Error: Display,
+{
+    if response.status != TestStatus::Failed {
+        return Ok(None);
+    }
+
+    let classifications = classify_evidence(
+        &response.evidence,
+        evidence_index,
+        review_paths,
+        changed_lines,
+        relevant_changed_lines,
+    );
+    for (evidence, classification) in response.evidence.iter().zip(classifications) {
+        if !classification.accepted {
+            continue;
+        }
+        let preview = evidence.preview.trim();
+        if preview.is_empty() {
+            return Ok(Some(format!(
+                "Failed verdict evidence for {}:{} has an empty preview.",
+                evidence.path, evidence.line
+            )));
+        }
+        let context = match search
+            .get_file_context(GetFileContextRequest {
+                path: evidence.path.clone(),
+                line: evidence.line,
+            })
+            .await
+        {
+            Ok(context) => context,
+            Err(_) => {
+                return Ok(Some(format!(
+                    "Failed verdict evidence cites {}:{}, but that line could not be read.",
+                    evidence.path, evidence.line
+                )));
+            }
+        };
+        if context.start_line == 0 {
+            return Ok(Some(format!(
+                "Failed verdict evidence cites {}:{}, but that line could not be read.",
+                evidence.path, evidence.line
+            )));
+        }
+        let Some(actual) = context
+            .content
+            .lines()
+            .nth(evidence.line.saturating_sub(context.start_line) as usize)
+            .map(str::trim)
+        else {
+            return Ok(Some(format!(
+                "Failed verdict evidence cites {}:{}, but that line is outside the returned file context.",
+                evidence.path, evidence.line
+            )));
+        };
+        if !evidence_preview_matches_actual_line(preview, actual) {
+            return Ok(Some(format!(
+                "Failed verdict evidence preview for {}:{} does not match the actual source line.",
+                evidence.path, evidence.line
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
+fn evidence_preview_matches_actual_line(preview: &str, actual: &str) -> bool {
+    let preview = preview.trim();
+    let actual = actual.trim();
+    if preview == actual || actual.contains(preview) {
+        return true;
+    }
+    if let Some(prefix) = preview.strip_suffix("...") {
+        return actual.starts_with(prefix.trim_end());
+    }
+    if preview.contains("...") {
+        let mut remainder = actual;
+        for part in preview
+            .split("...")
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            let Some(index) = remainder.find(part) else {
+                return false;
+            };
+            remainder = &remainder[index + part.len()..];
+        }
+        return true;
+    }
+    false
+}
+
+fn failed_verdict_lacks_full_repo_focus_evidence(
+    response: &LlmResponse,
+    focus_terms: &[String],
+) -> bool {
+    if response.status != TestStatus::Failed || response.evidence.is_empty() {
+        return false;
+    }
+    let focus_terms = focus_terms
+        .iter()
+        .filter(|term| term.chars().count() >= 4)
+        .collect::<Vec<_>>();
+    if focus_terms.len() < 2 {
+        return false;
+    }
+    !response.evidence.iter().any(|evidence| {
+        let preview = evidence.preview.to_ascii_lowercase();
+        if weak_full_repo_failure_preview(&preview) {
+            return false;
+        }
+        let path = evidence.path.to_ascii_lowercase();
+        let preview_matches = focus_terms
+            .iter()
+            .filter(|term| description_contains_term(&preview, term))
+            .count();
+        let path_matches = focus_terms
+            .iter()
+            .filter(|term| description_contains_term(&path, term))
+            .count();
+        preview_matches >= 2 || (preview_matches >= 1 && path_matches >= 2)
+    })
+}
+
+fn weak_full_repo_failure_preview(preview: &str) -> bool {
+    let trimmed = preview.trim();
+    if !substantive_failure_preview(trimmed) {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("(()=>")
+        || lower.starts_with("(function(")
+        || lower.contains("__webpack_modules__")
+    {
+        return true;
+    }
+    let tokens = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.len() <= 2
+        && matches!(
+            tokens.first().copied(),
+            Some("let" | "const" | "var" | "type" | "interface")
+        )
+    {
+        return true;
+    }
+    if tokens
+        .first()
+        .is_some_and(|token| matches!(*token, "let" | "const" | "var"))
+        && [
+            "allowlist",
+            "allowed",
+            "config",
+            "domains",
+            "remote_patterns",
+            "remotepatterns",
+            "safelist",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return true;
+    }
+    false
+}
+
+fn failed_verdict_is_speculative(response: &LlmResponse) -> bool {
+    if response.status != TestStatus::Failed {
+        return false;
+    }
+    let description = response.description.to_ascii_lowercase();
+    [
+        "appears capable",
+        "appears to",
+        "could allow",
+        "could enable",
+        "could execute",
+        "could escape",
+        "could be surfaced if",
+        "could indicate",
+        "could influence",
+        "does not demonstrate",
+        "does not yet confirm",
+        "doesn't yet confirm",
+        "if altered",
+        "if any path",
+        "if code path",
+        "if metadata",
+        "might ",
+        "may ",
+        "no clear ",
+        "not yet confirm",
+        "not confirm enforcement",
+        "not shown here",
+        "potential exposure",
+        "potential gap",
+        "potential violation",
+        "evidence required",
+        "requires verifying",
+        "requires targeted",
+        "required to confirm",
+        "required from review-scope",
+        "still requires confirmation",
+        "targeted evidence",
+        "to confirm enforcement",
+        "would be if",
+        "would indicate",
+    ]
+    .iter()
+    .any(|needle| description.contains(needle))
 }
 
 async fn target_failure_evidence<S>(
@@ -1126,6 +1795,11 @@ fn passed_verdict_contradicts_failure_language(response: &LlmResponse, instructi
         return false;
     }
     let lower = response.description.to_ascii_lowercase();
+    if passed_verdict_explicitly_reports_no_finding(&lower)
+        || passed_verdict_reports_absent_failure_condition(&lower, instruction)
+    {
+        return false;
+    }
     let decisive_contradictions = [
         "should be marked as failed",
         "should be marked failed",
@@ -1416,7 +2090,187 @@ fn description_contains_term(description: &str, term: &str) -> bool {
     false
 }
 
+fn passed_verdict_reports_absent_failure_condition(description: &str, instruction: &str) -> bool {
+    if [
+        "fail condition was not observed",
+        "fail condition was not detected",
+        "fail condition was not found",
+        "fail condition is not observed",
+        "fail condition is not detected",
+        "fail condition is not found",
+        "failure condition was not observed",
+        "failure condition was not detected",
+        "failure condition was not found",
+        "failure condition is not observed",
+        "failure condition is not detected",
+        "failure condition is not found",
+        "violation was not observed",
+        "violation was not detected",
+        "violation was not found",
+        "issue was not observed",
+        "issue was not detected",
+        "issue was not found",
+    ]
+    .iter()
+    .any(|needle| description.contains(needle))
+    {
+        return true;
+    }
+
+    let instruction = instruction.to_ascii_lowercase();
+    let Some((_, failure_condition)) = instruction.split_once("fail if") else {
+        return false;
+    };
+    let failure_condition = failure_condition
+        .split(['.', '\n'])
+        .next()
+        .unwrap_or(failure_condition);
+    let terms = failure_condition_terms(failure_condition);
+
+    terms.iter().any(|term| {
+        if failure_safeguard_term(term) {
+            return false;
+        }
+        failure_term_variants(term).iter().any(|variant| {
+            contains_phrase(description, &format!("no {variant}"))
+                || contains_phrase(description, &format!("no `{variant}`"))
+                || contains_phrase(description, &format!("{variant} was not observed"))
+                || contains_phrase(description, &format!("{variant} were not observed"))
+                || contains_phrase(description, &format!("{variant} was not detected"))
+                || contains_phrase(description, &format!("{variant} were not detected"))
+                || contains_phrase(description, &format!("{variant} was not found"))
+                || contains_phrase(description, &format!("{variant} were not found"))
+        })
+    })
+}
+
+fn failure_safeguard_term(term: &str) -> bool {
+    matches!(
+        term,
+        "allowlist"
+            | "allowlisting"
+            | "bound"
+            | "bounded"
+            | "check"
+            | "checked"
+            | "checks"
+            | "configuration"
+            | "configured"
+            | "guard"
+            | "guarded"
+            | "normalize"
+            | "normalized"
+            | "redact"
+            | "redacted"
+            | "redaction"
+            | "restrict"
+            | "restricted"
+            | "restriction"
+            | "restrictions"
+            | "safe"
+            | "safeguard"
+            | "safeguards"
+            | "sanitize"
+            | "sanitized"
+            | "validating"
+            | "validation"
+    )
+}
+
+fn failure_term_variants(term: &str) -> Vec<String> {
+    let mut variants = vec![term.to_string()];
+    if term.len() > 4
+        && let Some(singular) = term.strip_suffix('s')
+        && singular.len() >= 4
+    {
+        variants.push(singular.to_string());
+    }
+    if term.len() > 5
+        && let Some(stem) = term.strip_suffix("ed")
+        && stem.len() >= 4
+    {
+        variants.push(stem.to_string());
+    }
+    variants.sort();
+    variants.dedup();
+    variants
+}
+
+fn contains_phrase(haystack: &str, phrase: &str) -> bool {
+    let mut start = 0;
+    while let Some(offset) = haystack[start..].find(phrase) {
+        let absolute = start + offset;
+        let before = haystack[..absolute].chars().next_back();
+        let after = haystack[absolute + phrase.len()..].chars().next();
+        let before_boundary = before.is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        let after_boundary = after.is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        if before_boundary && after_boundary {
+            return true;
+        }
+        start = absolute + phrase.len();
+    }
+    false
+}
+
+fn passed_verdict_explicitly_reports_no_finding(description: &str) -> bool {
+    if description.contains("no evidence") && description.contains("excludes") {
+        return false;
+    }
+    if negated_changed_capability(description) {
+        return true;
+    }
+    [
+        "not violated",
+        "not found to be violated",
+        "no evidence of",
+        "no evidence found",
+        "no evidence that",
+        "no evidence detected",
+        "no evidence observed",
+        "found no evidence",
+        "no concrete evidence",
+        "no concrete evidence found",
+        "no concrete evidence that",
+        "no direct evidence",
+        "no direct logic",
+        "no concrete change",
+        "nothing directly indicating",
+        "nothing directly indicates",
+        "no concrete violation",
+        "no concrete review-scope violation",
+        "no concrete failure",
+        "no concrete finding",
+        "no finding",
+    ]
+    .iter()
+    .any(|needle| description.contains(needle))
+}
+
+fn negated_changed_capability(description: &str) -> bool {
+    let starts_or_sentence = description.starts_with("no changed ")
+        || description.contains(". no changed ")
+        || description.contains("; no changed ");
+    starts_or_sentence
+        && [
+            " enables ",
+            " enable ",
+            " allows ",
+            " allow ",
+            " can ",
+            " could ",
+            " would ",
+        ]
+        .iter()
+        .any(|needle| description.contains(needle))
+}
+
 fn passed_verdict_affirms_no_failure(description: &str) -> bool {
+    if description.contains("no evidence") && description.contains("excludes") {
+        return false;
+    }
+    if negated_changed_capability(description) {
+        return true;
+    }
     [
         "no unsafe behavior",
         "no unsafe pattern",
@@ -1447,6 +2301,7 @@ fn passed_verdict_affirms_no_failure(description: &str) -> bool {
         "failure condition is not met",
         "no concrete failure",
         "no concrete finding",
+        "no concrete evidence",
         "no finding",
     ]
     .iter()
@@ -1709,6 +2564,8 @@ Status semantics:
 
 You may either request one tool call or return the final verdict.
 
+Koochi enforces review-scope coverage outside the prompt. You may return `failed` as soon as concrete evidence demonstrates a violation. Koochi will reject `passed` until it has shown this agent every review-scope source chunk: all source files in `--all`/full-repo mode, or changed source files in commit, range, and local-change modes.
+
 Tool call JSON forms:
 {{"action":"list_files","kind":"source"}}
 {{"action":"list_review_hunks"}}
@@ -1725,7 +2582,7 @@ Final verdict JSON forms:
 
 Return only JSON. The user-facing test instruction is policy intent, not a tool plan. You decide which search tools to use.
 
-If Koochi included the full review-scope changed hunks above and those hunks are sufficient to show the invariant is satisfied, return a passed verdict. Do not call search_text just to rediscover code already shown in the changed-hunk packet. Failed verdicts require targeted content inspection first with get_hunk_context, get_file_context, or read_file.
+If Koochi included the full review-scope changed hunks above and those hunks are sufficient to show a concrete violation, return a failed verdict after targeted content inspection. Do not call search_text just to rediscover code already shown in the changed-hunk packet. Passed verdicts are allowed only after Koochi's coverage gate has delivered every review-scope source chunk.
 
 When Koochi shows an exact target symbol line or the instruction names a review-scope file, use get_file_context or read_file for that target before broad discovery tools.
 
@@ -2063,6 +2920,101 @@ where
     Ok(executed)
 }
 
+pub async fn build_review_scope_inventory<S>(search: &S) -> Result<ReviewScopeInventory, AgentError>
+where
+    S: CodeSearchApi + ?Sized,
+    S::Error: Display,
+{
+    let mut files = search
+        .list_review_files(ListFilesRequest {
+            kind: FileKind::Source,
+        })
+        .await
+        .map_err(|err| AgentError::Search(err.to_string()))?
+        .files;
+    files.sort();
+    files.dedup();
+    let file_count = files.len();
+    let mut line_count = 0u64;
+    let mut byte_count = 0u64;
+    let mut chunks = Vec::new();
+
+    for path in files {
+        let response = search
+            .read_file(ReadFileRequest { path: path.clone() })
+            .await
+            .map_err(|err| AgentError::Search(err.to_string()))?;
+        line_count += response.line_count as u64;
+        byte_count += response.content.len() as u64;
+        let lines = response.content.lines().collect::<Vec<_>>();
+        for (chunk_index, chunk_lines) in lines.chunks(REVIEW_COVERAGE_CHUNK_LINES).enumerate() {
+            let start_line = (chunk_index * REVIEW_COVERAGE_CHUNK_LINES + 1) as u32;
+            let end_line = start_line + chunk_lines.len() as u32 - 1;
+            chunks.push(ReviewSourceChunk {
+                index: chunks.len(),
+                path: response.path.clone(),
+                start_line,
+                end_line,
+                content: chunk_lines.join("\n"),
+            });
+        }
+    }
+
+    Ok(ReviewScopeInventory {
+        file_count,
+        line_count,
+        byte_count,
+        chunks,
+    })
+}
+
+async fn execute_full_repo_rescue<S>(
+    search: &S,
+    cache: &ToolExecutionCache,
+    evidence_index: &mut HashSet<(String, u32)>,
+    terms: &mut VecDeque<String>,
+) -> Result<Option<Vec<ExecutedTool>>, AgentError>
+where
+    S: CodeSearchApi + ?Sized,
+    S::Error: Display,
+{
+    let Some(term) = terms.pop_front() else {
+        return Ok(None);
+    };
+    let search_result = execute_tool(
+        AgentTurn::SearchText {
+            query: term,
+            kind: Some("source".to_string()),
+        },
+        search,
+        cache,
+        evidence_index,
+    )
+    .await?;
+    let first_match = first_search_match(&search_result.observation);
+    let mut executed = vec![search_result];
+    if let Some((path, line)) = first_match {
+        executed.push(
+            execute_tool(
+                AgentTurn::GetFileContext { path, line },
+                search,
+                cache,
+                evidence_index,
+            )
+            .await?,
+        );
+    }
+    Ok(Some(executed))
+}
+
+fn first_search_match(observation: &str) -> Option<(String, u32)> {
+    let value: serde_json::Value = serde_json::from_str(observation).ok()?;
+    let first = value.get("matches")?.as_array()?.first()?;
+    let path = first.get("path")?.as_str()?.to_string();
+    let line = first.get("line")?.as_u64()? as u32;
+    Some((path, line))
+}
+
 async fn execute_tool_uncached<S>(tool: ToolTurn, search: &S) -> Result<ExecutedTool, AgentError>
 where
     S: CodeSearchApi + ?Sized,
@@ -2150,10 +3102,19 @@ where
             ))
         }
         ToolTurn::ReadFile { path } => {
-            let response = search
-                .read_file(ReadFileRequest { path })
+            let response = match search
+                .read_file(ReadFileRequest { path: path.clone() })
                 .await
-                .map_err(|err| AgentError::Search(err.to_string()))?;
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    return Ok(ExecutedTool::new(
+                        ToolKind::ReadFile,
+                        json!({"path": path, "error": err.to_string()}).to_string(),
+                        Vec::new(),
+                    ));
+                }
+            };
             let evidence_lines = (1..=response.line_count)
                 .map(|line| (response.path.clone(), line))
                 .collect::<Vec<_>>();
@@ -2169,10 +3130,22 @@ where
             ))
         }
         ToolTurn::GetFileContext { path, line } => {
-            let response = search
-                .get_file_context(GetFileContextRequest { path, line })
+            let response = match search
+                .get_file_context(GetFileContextRequest {
+                    path: path.clone(),
+                    line,
+                })
                 .await
-                .map_err(|err| AgentError::Search(err.to_string()))?;
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    return Ok(ExecutedTool::new(
+                        ToolKind::GetFileContext,
+                        json!({"path": path, "line": line, "error": err.to_string()}).to_string(),
+                        Vec::new(),
+                    ));
+                }
+            };
             let mut evidence_lines = Vec::new();
             if response.start_line > 0 {
                 for line in response.start_line..=response.end_line {
@@ -2298,6 +3271,20 @@ impl ExecutedTool {
             kind: self.kind,
             observation: self.observation.clone(),
             evidence_lines: self.evidence_lines.clone(),
+        }
+    }
+
+    fn tool_label(&self) -> &'static str {
+        match self.kind {
+            ToolKind::ReviewCoverage => "review_scope_coverage",
+            ToolKind::ListFiles => "list_files",
+            ToolKind::ListReviewHunks => "list_review_hunks",
+            ToolKind::GetHunkContext => "get_hunk_context",
+            ToolKind::SearchText => "search_text",
+            ToolKind::ReadFile => "read_file",
+            ToolKind::GetFileContext => "get_file_context",
+            ToolKind::FindDefinitions => "find_definitions",
+            ToolKind::FindReferences => "find_references",
         }
     }
 }

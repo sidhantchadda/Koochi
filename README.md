@@ -58,6 +58,16 @@ Review a diff range:
 koochi --base <ref> --head <ref>
 ```
 
+Review the entire repository instead of a git diff scope:
+
+```sh
+koochi --all
+koochi --full-repo
+koochi --ful-repo
+```
+
+If the review-scope source code is larger than 5,000 LOC, Koochi asks for confirmation before starting provider calls because every agent must review the full scope before it can pass. Use `--yes`/`-y` for non-interactive runs.
+
 Example config:
 
 ```toml

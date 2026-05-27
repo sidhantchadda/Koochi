@@ -1,8 +1,9 @@
 use crate::Severity;
 use crate::agents::AgentProgressEvent;
 use crate::agents::AgentTraceEvent;
-use crate::agents::run_agent_with_trace;
-use crate::agents::run_agents_with_progress;
+use crate::agents::build_review_scope_inventory;
+use crate::agents::run_agent_with_trace_and_inventory;
+use crate::agents::run_agents_with_inventory_and_progress;
 use crate::config::ConfigError;
 use crate::config::KoochiConfig;
 use crate::config::discover_config;
@@ -19,6 +20,7 @@ use crate::search::SearchStatsSnapshot;
 use crate::synthesis::SynthesisReport;
 use crate::synthesis::synthesize_results;
 use clap::Parser;
+use std::io::IsTerminal;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,12 +55,20 @@ pub struct Cli {
     pub base: Option<String>,
     #[arg(long, requires = "base")]
     pub head: Option<String>,
+    #[arg(
+        long,
+        visible_aliases = ["full-repo", "ful-repo"],
+        conflicts_with_all = ["commit", "base", "head"]
+    )]
+    pub all: bool,
     #[arg(short, long)]
     pub verbose: bool,
     #[arg(short, long)]
     pub debug: bool,
     #[arg(short = 't', long)]
     pub trace: Option<String>,
+    #[arg(short = 'y', long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +95,12 @@ pub enum CliError {
     Serialize(serde_json::Error),
     #[error("trace test id `{0}` was not found in config")]
     TraceTestNotFound(String),
+    #[error(
+        "review scope contains {loc} source LOC across {files} files; rerun with --yes to confirm every agent should review the full scope before passing"
+    )]
+    LargeReviewScopeRequiresConfirmation { loc: u64, files: usize },
+    #[error("failed to read confirmation from stdin: {0}")]
+    ReadConfirmation(std::io::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +108,8 @@ pub enum RunExit {
     Success,
     TestFailures,
 }
+
+const LARGE_REVIEW_SCOPE_LOC_CONFIRMATION: u64 = 5_000;
 
 pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
     let started = Instant::now();
@@ -127,7 +145,7 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let review_target = review_target_from_options(cli.commit, cli.base, cli.head)?;
+    let review_target = review_target_from_options(cli.commit, cli.base, cli.head, cli.all)?;
     let scope = build_scope(&config, config_dir, review_target)?;
     println!("{}", review_scope_line(&scope.review));
     if cli.verbose {
@@ -184,16 +202,20 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
         return Ok(RunExit::Success);
     }
     let search = Arc::new(LocalSearchSession::new(scope.clone()));
+    let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await?);
+    confirm_large_review_scope_if_needed(inventory.as_ref(), cli.yes)?;
     let built_bus = build_llm_bus(&config)?;
     if let Some(agent) = trace_agent {
         println!("Tracing 1 agentic invariant: {}", agent.id);
         let mut trace_debug_stats = DebugRunStats::default();
+        trace_debug_stats.set_inventory(inventory.as_ref());
         trace_debug_stats.agent_batches = 1;
         let trace_started = Instant::now();
-        let verdict = run_agent_with_trace(
+        let verdict = run_agent_with_trace_and_inventory(
             agent,
             search.clone(),
             built_bus.bus.clone(),
+            inventory.clone(),
             config.max_agent_steps,
             |event| {
                 trace_debug_stats.record_trace(&event);
@@ -218,12 +240,14 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
 
     println!("Running {} agentic invariants", scope.agents.len());
     let mut debug_stats = DebugRunStats::default();
-    let verdicts = run_agents_with_progress(
+    debug_stats.set_inventory(inventory.as_ref());
+    let verdicts = run_agents_with_inventory_and_progress(
         scope.agents.clone(),
         search.clone(),
         built_bus.bus.clone(),
         config.max_parallel_agents,
         config.max_agent_steps,
+        inventory,
         |event| {
             debug_stats.record(&event);
             match event {
@@ -273,6 +297,41 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
     })
 }
 
+fn confirm_large_review_scope_if_needed(
+    inventory: &crate::agents::ReviewScopeInventory,
+    assume_yes: bool,
+) -> Result<(), CliError> {
+    if inventory.line_count() <= LARGE_REVIEW_SCOPE_LOC_CONFIRMATION || assume_yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(CliError::LargeReviewScopeRequiresConfirmation {
+            loc: inventory.line_count(),
+            files: inventory.file_count(),
+        });
+    }
+    print!(
+        "Review scope contains {} LOC across {} source files. Each agent must review all of it before passing. Continue? [y/N] ",
+        inventory.line_count(),
+        inventory.file_count()
+    );
+    std::io::stdout()
+        .flush()
+        .map_err(CliError::ReadConfirmation)?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(CliError::ReadConfirmation)?;
+    if matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
+        Ok(())
+    } else {
+        Err(CliError::LargeReviewScopeRequiresConfirmation {
+            loc: inventory.line_count(),
+            files: inventory.file_count(),
+        })
+    }
+}
+
 async fn write_json_report(
     path: Option<PathBuf>,
     report: &SynthesisReport,
@@ -317,9 +376,11 @@ mod tests {
             commit: None,
             base: None,
             head: None,
+            all: false,
             verbose: false,
             debug: false,
             trace: None,
+            yes: false,
         })
         .await
         .unwrap();
@@ -455,9 +516,11 @@ mod tests {
             commit: None,
             base: None,
             head: None,
+            all: false,
             verbose: false,
             debug: false,
             trace: None,
+            yes: false,
         })
         .await
         .unwrap();
@@ -487,9 +550,11 @@ mod tests {
             commit: None,
             base: None,
             head: None,
+            all: false,
             verbose: false,
             debug: true,
             trace: None,
+            yes: false,
         })
         .await
         .unwrap();
@@ -531,14 +596,37 @@ mod tests {
             commit: None,
             base: None,
             head: None,
+            all: false,
             verbose: false,
             debug: false,
             trace: Some("selected".to_string()),
+            yes: false,
         })
         .await
         .unwrap();
 
         assert_eq!(exit, RunExit::Success);
+    }
+
+    #[test]
+    fn all_flag_has_full_repo_aliases() {
+        let all = Cli::try_parse_from(["koochi", "--all"]).unwrap();
+        assert!(all.all);
+
+        let full_repo = Cli::try_parse_from(["koochi", "--full-repo"]).unwrap();
+        assert!(full_repo.all);
+
+        let typo_alias = Cli::try_parse_from(["koochi", "--ful-repo"]).unwrap();
+        assert!(typo_alias.all);
+    }
+
+    #[test]
+    fn yes_flag_bypasses_large_scope_confirmation() {
+        let yes = Cli::try_parse_from(["koochi", "--yes"]).unwrap();
+        assert!(yes.yes);
+
+        let short = Cli::try_parse_from(["koochi", "-y"]).unwrap();
+        assert!(short.yes);
     }
 
     fn git<const N: usize>(root: &Path, args: [&str; N]) -> bool {

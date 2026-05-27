@@ -12,6 +12,10 @@ use std::path::PathBuf;
 use tokio::sync::Mutex;
 
 fn session(root: PathBuf) -> LocalSearchSession {
+    session_with_mode(root, ReviewMode::FullRepoFallback)
+}
+
+fn session_with_mode(root: PathBuf, mode: ReviewMode) -> LocalSearchSession {
     LocalSearchSession::new(ScopeConfig {
         primary_repo: RepoScope {
             repo_id: "x".to_string(),
@@ -19,7 +23,7 @@ fn session(root: PathBuf) -> LocalSearchSession {
             revision: GitRevision::Head,
         },
         review: ReviewScope {
-            mode: ReviewMode::FullRepoFallback,
+            mode,
             files: Vec::new(),
             hunks: Vec::new(),
             commit: None,
@@ -54,10 +58,12 @@ fn derives_fixture_marker_from_expected_result_test_ids() {
 
 #[tokio::test]
 async fn runs_agents_through_bus() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
     let search = Arc::new(LocalSearchSession::new(ScopeConfig {
         primary_repo: RepoScope {
             repo_id: "x".to_string(),
-            root: PathBuf::from("."),
+            root: temp.path().to_path_buf(),
             revision: GitRevision::Head,
         },
         review: ReviewScope {
@@ -89,7 +95,7 @@ async fn runs_agents_through_bus() {
     .await
     .unwrap();
     assert_eq!(verdicts.len(), 1);
-    assert_eq!(bus.requests().await.len(), 1);
+    assert_eq!(bus.requests().await.len(), 2);
     assert!(bus.batches().await.is_empty());
 }
 
@@ -126,10 +132,12 @@ async fn empty_source_scope_passes_without_llm_call() {
 
 #[tokio::test]
 async fn batches_agents_by_configured_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
     let search = Arc::new(LocalSearchSession::new(ScopeConfig {
         primary_repo: RepoScope {
             repo_id: "x".to_string(),
-            root: PathBuf::from("."),
+            root: temp.path().to_path_buf(),
             revision: GitRevision::Head,
         },
         review: ReviewScope {
@@ -156,12 +164,14 @@ async fn batches_agents_by_configured_limit() {
         .collect();
     let mut batch_sizes = Vec::new();
     let mut completions = Vec::new();
-    let verdicts = run_agents_with_progress(
+    let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await.unwrap());
+    let verdicts = run_agents_with_inventory_and_progress(
         agents,
         search,
         bus.clone(),
         2,
         crate::config::DEFAULT_MAX_AGENT_STEPS,
+        inventory,
         |event| {
             if let AgentProgressEvent::BatchPreparing { agent_count, .. } = event {
                 batch_sizes.push(agent_count);
@@ -181,7 +191,7 @@ async fn batches_agents_by_configured_limit() {
     assert_eq!(verdicts.len(), 5);
     assert_eq!(batch_sizes, vec![2, 2, 1]);
     assert_eq!(completions, vec![(1, 5), (2, 5), (3, 5), (4, 5), (5, 5)]);
-    assert_eq!(bus.requests().await.len(), 5);
+    assert_eq!(bus.requests().await.len(), 10);
 }
 
 #[tokio::test]
@@ -214,6 +224,383 @@ async fn grounds_agent_instruction_with_repo_context() {
     );
     assert!(request.instruction.contains("- lib.rs"));
     assert!(!request.instruction.contains("pub fn risky_call"));
+}
+
+#[tokio::test]
+async fn full_repo_prompt_maps_changed_wording_to_repo_code() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn risky_call() {}\n").unwrap();
+    let search = Arc::new(session_with_mode(
+        temp.path().to_path_buf(),
+        ReviewMode::FullRepo,
+    ));
+    let bus = Arc::new(FakeLlmBus::new());
+    run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Fail if changed code can call risky_call.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    let request = bus.requests().await.remove(0);
+    assert!(request.instruction.contains("Full-repo mode is active"));
+    assert!(request.instruction.contains("There is no changed diff"));
+    assert!(
+        request
+            .instruction
+            .contains("interpret that as \"review-scope repository code\"")
+    );
+    assert!(
+        request
+            .instruction
+            .contains("do not return passed merely because no diff exists")
+    );
+    assert!(
+        request
+            .instruction
+            .contains("delivered coverage chunk that demonstrates the invariant violation")
+    );
+}
+
+#[tokio::test]
+async fn full_repo_inventory_reads_all_source_files_before_first_llm_step() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn first() {}\n").unwrap();
+    std::fs::write(temp.path().join("app.ts"), "export function second() {}\n").unwrap();
+    std::fs::write(temp.path().join("README.md"), "# docs\n").unwrap();
+    let search = Arc::new(session_with_mode(
+        temp.path().to_path_buf(),
+        ReviewMode::FullRepo,
+    ));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"final","status":"passed","severity":null,"description":"covered","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"covered after review","evidence":[]}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Pass this invariant.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search.clone(),
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 2);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    let stats = search.stats();
+    assert_eq!(stats.read_file_misses, 2);
+    assert_eq!(stats.read_file_hits, 0);
+}
+
+#[tokio::test]
+async fn review_scope_inventory_chunks_source_lines() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+
+    let inventory = build_review_scope_inventory(search.as_ref()).await.unwrap();
+
+    assert_eq!(inventory.file_count(), 1);
+    assert_eq!(inventory.line_count(), 1);
+    assert_eq!(inventory.chunk_count(), 1);
+}
+
+#[tokio::test]
+async fn commit_mode_inventory_reads_only_review_scope_source_files() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("changed.rs"), "pub fn changed() {}\n").unwrap();
+    std::fs::write(temp.path().join("unchanged.rs"), "pub fn unchanged() {}\n").unwrap();
+    std::fs::write(temp.path().join("notes.md"), "# notes\n").unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string(), "notes.md".to_string()],
+            hunks: Vec::new(),
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"final","status":"passed","severity":null,"description":"covered","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"covered after review","evidence":[]}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Pass this invariant.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search.clone(),
+        bus,
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    let stats = search.stats();
+    assert_eq!(stats.read_file_misses, 1);
+    assert_eq!(stats.read_file_hits, 0);
+}
+
+#[tokio::test]
+async fn review_scope_inventory_is_shared_across_agents() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn first() {}\n").unwrap();
+    std::fs::write(temp.path().join("main.ts"), "export const second = true;\n").unwrap();
+    let search = Arc::new(session_with_mode(
+        temp.path().to_path_buf(),
+        ReviewMode::FullRepo,
+    ));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"final","status":"passed","severity":null,"description":"covered one","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"covered one after review","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"covered two","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"covered two after review","evidence":[]}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![
+            AgentSpec {
+                id: "one".to_string(),
+                name: "one".to_string(),
+                instruction: "Pass this invariant.".to_string(),
+                model: "gpt-5-nano".to_string(),
+                severity: None,
+                initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+            },
+            AgentSpec {
+                id: "two".to_string(),
+                name: "two".to_string(),
+                instruction: "Pass this invariant.".to_string(),
+                model: "gpt-5-nano".to_string(),
+                severity: None,
+                initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+            },
+        ],
+        search.clone(),
+        bus,
+        1,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(verdicts.len(), 2);
+    assert!(
+        verdicts
+            .iter()
+            .all(|verdict| verdict.status == TestStatus::Passed)
+    );
+    let stats = search.stats();
+    assert_eq!(stats.read_file_misses, 2);
+    assert_eq!(stats.read_file_hits, 0);
+}
+
+#[tokio::test]
+async fn pass_requires_review_scope_coverage_without_focus_term_searches() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("cache.ts"),
+        "export function cachePrivateLeak() {\n  return 'private cache leak checked'\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(session_with_mode(
+        temp.path().to_path_buf(),
+        ReviewMode::FullRepo,
+    ));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"final","status":"passed","severity":null,"description":"no finding","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"no finding","evidence":[]}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "private-cache-leak".to_string(),
+            name: "private-cache-leak".to_string(),
+            instruction: "Fail if changed code can leak private cache data.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search.clone(),
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert_eq!(bus.request_count().await, 2);
+    assert_eq!(search.stats().search_text_misses, 0);
+}
+
+#[tokio::test]
+async fn pass_waits_until_all_review_scope_coverage_batches_are_delivered() {
+    let temp = tempfile::tempdir().unwrap();
+    let long_line = "x".repeat(160);
+    let content = (0..121)
+        .map(|index| format!("pub fn generated_{index}() {{ \"{long_line}\"; }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(temp.path().join("large.rs"), content).unwrap();
+    let search = Arc::new(session_with_mode(
+        temp.path().to_path_buf(),
+        ReviewMode::FullRepo,
+    ));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"final","status":"passed","severity":null,"description":"first pass","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"second pass","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"covered all chunks","evidence":[]}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "multi-chunk".to_string(),
+            name: "multi-chunk".to_string(),
+            instruction: "Pass only after review.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search.clone(),
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert_eq!(verdicts[0].description, "covered all chunks");
+    assert_eq!(bus.request_count().await, 3);
+    let inventory = build_review_scope_inventory(search.as_ref()).await.unwrap();
+    assert_eq!(inventory.chunk_count(), 2);
+}
+
+#[tokio::test]
+async fn failed_verdict_can_return_before_full_review_scope_coverage() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn risky() {\n    dangerous_sink();\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(session_with_mode(
+        temp.path().to_path_buf(),
+        ReviewMode::FullRepo,
+    ));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"get_file_context","path":"lib.rs","line":2}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"dangerous sink is reachable",
+                "evidence":[{"path":"lib.rs","line":2,"preview":"dangerous_sink();"}]
+            }"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "fail-fast".to_string(),
+            name: "fail-fast".to_string(),
+            instruction: "Fail if code calls dangerous_sink.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(bus.request_count().await, 2);
+}
+
+#[tokio::test]
+async fn full_repo_broad_listing_loop_gets_targeted_search_rescue() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn check() {\n    unsafe_origin();\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(session_with_mode(
+        temp.path().to_path_buf(),
+        ReviewMode::FullRepo,
+    ));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"list_files","kind":"source"}"#,
+        r#"{"action":"list_files","kind":"source"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"unsafe origin handling found",
+                "evidence":[{"path":"lib.rs","line":2,"preview":"unsafe_origin();"}]
+            }"#,
+    ]));
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "origin-validation".to_string(),
+            name: "origin-validation".to_string(),
+            instruction: "Fail if changed code allows unsafe origin handling.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search.clone(),
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence.len(), 1);
+    let stats = search.stats();
+    assert!(stats.search_text_misses > 0);
+    assert!(stats.get_file_context_calls > 0);
 }
 
 #[tokio::test]
@@ -330,7 +717,7 @@ async fn fail_prefixed_prompt_does_not_inject_fixture_breadcrumb() {
 }
 
 #[tokio::test]
-async fn accepts_direct_pass_when_full_changed_hunk_packet_is_sufficient() {
+async fn rejects_pass_until_review_scope_coverage_is_delivered() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("changed.rs"),
@@ -367,14 +754,20 @@ async fn accepts_direct_pass_when_full_changed_hunk_packet_is_sufficient() {
         tools: Vec::new(),
         agents: Vec::new(),
     }));
-    let bus = Arc::new(ScriptedActionBus::new(vec![Ok(LlmAction::Final(
-        LlmResponse {
+    let bus = Arc::new(ScriptedActionBus::new(vec![
+        Ok(LlmAction::Final(LlmResponse {
             status: TestStatus::Passed,
             severity: None,
             description: "changed line is safe".to_string(),
             evidence: Vec::new(),
-        },
-    ))]));
+        })),
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Passed,
+            severity: None,
+            description: "changed file reviewed and safe".to_string(),
+            evidence: Vec::new(),
+        })),
+    ]));
 
     let verdicts = run_agents(
         vec![AgentSpec {
@@ -393,9 +786,9 @@ async fn accepts_direct_pass_when_full_changed_hunk_packet_is_sufficient() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 1);
+    assert_eq!(bus.request_count().await, 2);
     assert_eq!(verdicts[0].status, TestStatus::Passed);
-    assert_eq!(verdicts[0].description, "changed line is safe");
+    assert_eq!(verdicts[0].description, "changed file reviewed and safe");
     assert!(verdicts[0].evidence.is_empty());
 }
 
@@ -536,6 +929,12 @@ async fn rejects_direct_failed_verdict_with_unfocused_changed_line() {
             description: "no focused changed evidence".to_string(),
             evidence: Vec::new(),
         })),
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Passed,
+            severity: None,
+            description: "no focused changed evidence after full review".to_string(),
+            evidence: Vec::new(),
+        })),
     ]));
 
     let verdicts = run_agents(
@@ -556,9 +955,12 @@ async fn rejects_direct_failed_verdict_with_unfocused_changed_line() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 2);
+    assert_eq!(bus.request_count().await, 3);
     assert_eq!(verdicts[0].status, TestStatus::Passed);
-    assert_eq!(verdicts[0].description, "no focused changed evidence");
+    assert_eq!(
+        verdicts[0].description,
+        "no focused changed evidence after full review"
+    );
 }
 
 #[tokio::test]
@@ -663,6 +1065,7 @@ async fn repeated_broad_tools_terminate_as_no_concrete_finding() {
         r#"{"action":"list_review_hunks"}"#,
         r#"{"action":"list_review_hunks"}"#,
         r#"{"action":"list_review_hunks"}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"no concrete finding after coverage","evidence":[]}"#,
     ]));
 
     let verdicts = run_agents(
@@ -682,12 +1085,12 @@ async fn repeated_broad_tools_terminate_as_no_concrete_finding() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(bus.request_count().await, 4);
     assert_eq!(verdicts[0].status, TestStatus::Passed);
     assert!(
         verdicts[0]
             .description
-            .contains("No concrete review-scope finding")
+            .contains("no concrete finding after coverage")
     );
 }
 
@@ -1116,7 +1519,11 @@ async fn failed_verdict_without_review_scope_evidence_is_not_reported() {
 #[tokio::test]
 async fn failed_verdict_with_changed_line_evidence_is_accepted() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("changed.rs"), "pub fn changed() {}\n").unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn unsafe_changed() {}\n",
+    )
+    .unwrap();
     let search = Arc::new(LocalSearchSession::new(ScopeConfig {
         primary_repo: RepoScope {
             repo_id: "x".to_string(),
@@ -1525,6 +1932,40 @@ async fn malformed_provider_json_is_rejected_and_reprompted() {
     assert_eq!(bus.request_count().await, 4);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence.len(), 1);
+}
+
+#[tokio::test]
+async fn missing_read_file_tool_result_is_observation_not_run_error() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
+    let search = Arc::new(session_with_mode(
+        temp.path().to_path_buf(),
+        ReviewMode::FullRepo,
+    ));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"read_file","path":"src/lib.rs"}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"missing example path did not provide evidence","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"missing example path did not provide evidence after coverage","evidence":[]}"#,
+    ]));
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Check changed code for unsafe behavior.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
 }
 
 #[tokio::test]
@@ -1977,6 +2418,327 @@ fn passed_fail_if_verdict_with_failed_status_language_is_rejected() {
         &safe_response,
         instruction
     ));
+
+    let no_evidence_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "Invariant not violated in reviewed scope: no evidence of requests being executed without origin/host validation was observed."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(!passed_verdict_contradicts_failure_language(
+        &no_evidence_response,
+        "Fail if changed Server Action request handling can execute an action without validating the request origin or forwarded host against the configured allowed origins."
+    ));
+
+    let no_concrete_evidence_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "No concrete evidence found in the changed review-scope files that draft or preview mode code can render previews without validating signed cookies or secret tokens."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(!passed_verdict_contradicts_failure_language(
+        &no_concrete_evidence_response,
+        "Fail if changed draft mode or preview mode code can render previews without validating signed cookies or secret tokens."
+    ));
+
+    let no_concrete_change_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "No concrete change in the review-scope files indicates that changed draft mode or preview mode code enables preview rendering without validating signed cookies or secret tokens."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(!passed_verdict_contradicts_failure_language(
+        &no_concrete_change_response,
+        "Fail if changed draft mode or preview mode code can render previews without validating signed cookies or secret tokens."
+    ));
+
+    let no_changed_capability_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "No changed draft mode or preview mode code enables preview rendering without validating signed cookies or secret tokens."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(!passed_verdict_contradicts_failure_language(
+        &no_changed_capability_response,
+        "Fail if changed draft mode or preview mode code can render previews without validating signed cookies or secret tokens."
+    ));
+
+    let server_only_not_found_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "Server/client boundary checks observed in build tooling; no client import of server-only APIs detected in reviewed area."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(!passed_verdict_contradicts_failure_language(
+        &server_only_not_found_response,
+        "Fail if changed bundling, module graph, or import analysis allows modules marked server-only or containing server-only APIs to be imported into client components or browser bundles."
+    ));
+
+    let client_only_not_found_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "No client-only modules were found executing in a server context in the reviewed source."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(!passed_verdict_contradicts_failure_language(
+        &client_only_not_found_response,
+        "Fail if changed bundling, module graph, or runtime code executes client-only modules in a server context where browser globals, side effects, or hydration assumptions can break rendering."
+    ));
+
+    let telemetry_not_found_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "No tokens, cookies, or sensitive identifiers were detected in the reviewed telemetry code."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(!passed_verdict_contradicts_failure_language(
+        &telemetry_not_found_response,
+        "Fail if changed telemetry, analytics, tracing, or metrics code emits raw project paths, usernames, environment variables, tokens, request headers, cookies, or other sensitive identifiers without redaction."
+    ));
+
+    let missing_validation_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "Origin validation was not observed before executing the Server Action request."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &missing_validation_response,
+        "Fail if changed Server Action request handling can execute an action without validating the request origin or forwarded host against the configured allowed origins."
+    ));
+}
+
+#[test]
+fn full_repo_failed_verdict_requires_focused_evidence_preview() {
+    let weak = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "lockfile trust issue".to_string(),
+        evidence: vec![Evidence {
+            path: "packages/next/src/build/lockfile.ts".to_string(),
+            line: 175,
+            preview: "let lockfile".to_string(),
+        }],
+    };
+    let terms = vec![
+        "package".to_string(),
+        "manager".to_string(),
+        "lockfile".to_string(),
+        "trust".to_string(),
+    ];
+
+    assert!(failed_verdict_lacks_full_repo_focus_evidence(&weak, &terms));
+
+    let focused = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "lockfile trust issue".to_string(),
+        evidence: vec![Evidence {
+            path: "packages/next/src/build/lockfile.ts".to_string(),
+            line: 175,
+            preview: "execute package manager command from lockfile metadata".to_string(),
+        }],
+    };
+
+    assert!(!failed_verdict_lacks_full_repo_focus_evidence(
+        &focused, &terms
+    ));
+
+    let bundled = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "private cache issue".to_string(),
+        evidence: vec![Evidence {
+            path: ".github/actions/needs-triage/dist/index.js".to_string(),
+            line: 1,
+            preview: "(()=>{var __webpack_modules__={9479:function(e,A,t){".to_string(),
+        }],
+    };
+
+    assert!(failed_verdict_lacks_full_repo_focus_evidence(
+        &bundled,
+        &[
+            "private".to_string(),
+            "cache".to_string(),
+            "static".to_string()
+        ]
+    ));
+
+    let config_declaration = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "remote allowlist issue".to_string(),
+        evidence: vec![Evidence {
+            path: "packages/next/src/server/image-optimizer.ts".to_string(),
+            line: 394,
+            preview: "const remotePatterns = nextConfig.images?.remotePatterns || []".to_string(),
+        }],
+    };
+
+    assert!(failed_verdict_lacks_full_repo_focus_evidence(
+        &config_declaration,
+        &[
+            "image".to_string(),
+            "remote".to_string(),
+            "allowlist".to_string(),
+            "arbitrary".to_string()
+        ]
+    ));
+}
+
+#[test]
+fn speculative_failed_verdict_is_rejected() {
+    let speculative = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description:
+            "Invariant violation: a concrete violation would be if this path fetches without validation, but targeted scan is required to confirm enforcement."
+                .to_string(),
+        evidence: vec![Evidence {
+            path: "packages/next/src/server/image-optimizer.ts".to_string(),
+            line: 394,
+            preview: "const remotePatterns = nextConfig.images?.remotePatterns || []".to_string(),
+        }],
+    };
+
+    assert!(failed_verdict_is_speculative(&speculative));
+
+    let modal_lockfile = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::Medium),
+        description:
+            "Invariant violation: review-scope code appears to rely on package manager metadata. This could enable arbitrary commands if metadata is altered at runtime."
+                .to_string(),
+        evidence: vec![Evidence {
+            path: ".github/actions/next-stats-action/src/run/index.js".to_string(),
+            line: 338,
+            preview:
+                "await exec(`cd ${pkgDir} && pnpm install --strict-peer-dependencies=false`, false)"
+                    .to_string(),
+        }],
+    };
+
+    assert!(failed_verdict_is_speculative(&modal_lockfile));
+
+    let needs_more_evidence = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description:
+            "Invariant violation: no clear enforcement is shown here; targeted evidence required from review-scope code demonstrating an absence or bypass of allowlist checks."
+                .to_string(),
+        evidence: vec![Evidence {
+            path: "packages/next/src/server/image-optimizer.ts".to_string(),
+            line: 394,
+            preview: "const remotePatterns = nextConfig.images?.remotePatterns || []".to_string(),
+        }],
+    };
+
+    assert!(failed_verdict_is_speculative(&needs_more_evidence));
+
+    let concrete = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description:
+            "The fetch path returns before checking the configured allowlist, so arbitrary remote hosts are accepted."
+                .to_string(),
+        evidence: vec![Evidence {
+            path: "packages/next/src/server/image-optimizer.ts".to_string(),
+            line: 401,
+            preview: "return fetch(url)".to_string(),
+        }],
+    };
+
+    assert!(!failed_verdict_is_speculative(&concrete));
+}
+
+#[tokio::test]
+async fn failed_verdict_requires_preview_to_match_actual_source_line() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub fn render() {\n    return make_network_error();\n}\n",
+    )
+    .unwrap();
+    let search = session(temp.path().to_path_buf());
+    let evidence_index = HashSet::from([("src/lib.rs".to_string(), 2)]);
+    let review_paths = HashSet::new();
+    let changed_lines = HashSet::new();
+    let relevant_changed_lines = HashSet::new();
+
+    let fabricated = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "status boundary issue".to_string(),
+        evidence: vec![Evidence {
+            path: "src/lib.rs".to_string(),
+            line: 2,
+            preview: "end of interrupted render path; may not set proper status".to_string(),
+        }],
+    };
+
+    assert!(
+        failed_verdict_has_mismatched_evidence_preview(
+            &search,
+            &fabricated,
+            &evidence_index,
+            &review_paths,
+            &changed_lines,
+            &relevant_changed_lines
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+
+    let exact = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "status boundary issue".to_string(),
+        evidence: vec![Evidence {
+            path: "src/lib.rs".to_string(),
+            line: 2,
+            preview: "return make_network_error();".to_string(),
+        }],
+    };
+
+    assert!(
+        failed_verdict_has_mismatched_evidence_preview(
+            &search,
+            &exact,
+            &evidence_index,
+            &review_paths,
+            &changed_lines,
+            &relevant_changed_lines
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1986,6 +2748,7 @@ async fn accepts_plain_verdict_json_as_final_turn() {
     let search = Arc::new(session(temp.path().to_path_buf()));
     let bus = Arc::new(ScriptedToolBus::new(vec![
         r#"{"status":"passed","severity":null,"description":"No secrets found.","evidence":[]}"#,
+        r#"{"status":"passed","severity":null,"description":"No secrets found after review.","evidence":[]}"#,
     ]));
     let verdicts = run_agents(
         vec![AgentSpec {
@@ -2004,9 +2767,9 @@ async fn accepts_plain_verdict_json_as_final_turn() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 1);
+    assert_eq!(bus.request_count().await, 2);
     assert_eq!(verdicts[0].status, TestStatus::Passed);
-    assert_eq!(verdicts[0].description, "No secrets found.");
+    assert_eq!(verdicts[0].description, "No secrets found after review.");
 }
 
 #[tokio::test]
@@ -2076,6 +2839,7 @@ async fn pass_fixture_check_rejects_failure_before_matching_safe_marker() {
             }"#,
         r#"{"action":"search_text","query":"KOOCHI_SAFE_PARAMETERIZED_SQL","kind":"source"}"#,
         r#"{"action":"final","status":"passed","severity":null,"description":"safe marker inspected","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"safe marker inspected after coverage","evidence":[]}"#,
     ]));
     let verdicts = run_agents(
         vec![AgentSpec {
@@ -2094,9 +2858,12 @@ async fn pass_fixture_check_rejects_failure_before_matching_safe_marker() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 5);
+    assert_eq!(bus.request_count().await, 6);
     assert_eq!(verdicts[0].status, TestStatus::Passed);
-    assert_eq!(verdicts[0].description, "safe marker inspected");
+    assert_eq!(
+        verdicts[0].description,
+        "safe marker inspected after coverage"
+    );
 }
 
 #[tokio::test]
@@ -2219,12 +2986,13 @@ async fn honors_configured_agent_step_limit() {
     .unwrap();
 
     assert_eq!(bus.request_count().await, 1);
-    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert!(verdicts[0].description.contains("step limit"));
+    assert!(verdicts[0].description.contains("Passing is not allowed"));
 }
 
 #[tokio::test]
-async fn step_limit_without_concrete_finding_passes_even_with_concrete_evidence_instruction() {
+async fn step_limit_without_full_coverage_cannot_pass_even_with_concrete_evidence_instruction() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
     let search = Arc::new(session(temp.path().to_path_buf()));
@@ -2248,8 +3016,9 @@ async fn step_limit_without_concrete_finding_passes_even_with_concrete_evidence_
     .await
     .unwrap();
 
-    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert!(verdicts[0].description.contains("step limit"));
+    assert!(verdicts[0].description.contains("Passing is not allowed"));
 }
 
 #[tokio::test]

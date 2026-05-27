@@ -20,6 +20,7 @@ where
         .await
         .map_err(|err| AgentError::Search(err.to_string()))?
         .hunks;
+    let full_repo_mode = matches!(search.review_mode(), Some(ReviewMode::FullRepo));
 
     let file_count = files.len();
     let review_paths = files.iter().cloned().collect::<HashSet<_>>();
@@ -58,9 +59,19 @@ where
             hunk_packet_tokens,
             hunk_summary
         )
+    } else if full_repo_mode {
+        let search_terms = full_repo_search_terms(&focus.terms);
+        let search_terms_hint = if search_terms.is_empty() {
+            "(none)".to_string()
+        } else {
+            search_terms.join(", ")
+        };
+        format!(
+            "{file_inventory}\n\nFull-repo mode is active. There is no changed diff or hunk packet. The review-scope source files above are the repository code under review for this run. Koochi will not accept a passed verdict until it has shown this agent every review-scope source chunk. If an invariant says \"changed code\", \"changed <area>\", or similar diff-oriented wording, interpret that as \"review-scope repository code\" in full-repo mode; do not return passed merely because no diff exists. Suggested full-repo search terms from this invariant: {search_terms_hint}. Use search_text, get_file_context, read_file, find_definitions, or find_references for targeted investigation when useful. Do not call list_files first; Koochi already supplied a source-file inventory preview, and broad file listing is not investigation. Failed verdicts require targeted content inspection first with get_file_context or read_file, and final failed evidence may come from any inspected review-scope source file or delivered coverage chunk that demonstrates the invariant violation."
+        )
     } else {
         format!(
-            "{file_inventory}\nOnly fail when the concrete issue is in one of these review-scope files. You may use list_files, search_text, read_file, get_file_context, find_definitions, or find_references to gather context from the wider repository when needed, but final failed evidence must come from review-scope files."
+            "{file_inventory}\nKoochi will not accept a passed verdict until it has shown this agent every review-scope source chunk. In commit, range, and local-change modes, review-scope source files are the changed source files for that review target. Only fail when the concrete issue is in one of these review-scope files. You may use list_files, search_text, read_file, get_file_context, find_definitions, or find_references to gather context from the wider repository when needed, but final failed evidence must come from review-scope files or delivered coverage chunks."
         )
     };
     let evidence_index = HashSet::new();
@@ -69,6 +80,7 @@ where
     let focused_context_line = focus.first_relevant_changed_line.clone();
     let relevant_changed_lines = focus.relevant_changed_lines;
     let review_causal_terms = focus.review_causal_terms;
+    let full_repo_search_terms = full_repo_search_terms(&focus.terms);
 
     let instruction = grounded_agent_prompt(&agent.instruction, context.trim());
 
@@ -86,7 +98,40 @@ where
         relevant_changed_lines,
         review_causal_terms,
         allows_direct_verdict,
+        full_repo_mode,
+        full_repo_search_terms,
     })
+}
+
+fn full_repo_search_terms(terms: &[String]) -> Vec<String> {
+    let mut terms = terms
+        .iter()
+        .filter(|term| term.chars().count() >= 4)
+        .filter(|term| !matches!(term.as_str(), "validation" | "integrity" | "preserved"))
+        .cloned()
+        .collect::<Vec<_>>();
+    terms.sort_by_key(|term| {
+        (
+            generic_full_repo_search_term(term),
+            std::cmp::Reverse(term.chars().count()),
+        )
+    });
+    terms.truncate(FULL_REPO_REQUIRED_SEARCH_TERMS);
+    terms
+}
+
+fn generic_full_repo_search_term(term: &str) -> bool {
+    matches!(
+        term,
+        "validation"
+            | "handling"
+            | "integrity"
+            | "preserved"
+            | "protection"
+            | "boundary"
+            | "boundaries"
+            | "runtime"
+    )
 }
 
 fn changed_lines_for_hunks(hunks: &[ReviewHunk]) -> HashSet<(String, u32)> {

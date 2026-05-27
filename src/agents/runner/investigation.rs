@@ -28,6 +28,7 @@ fn strip_redundant_outcome_prefix<'a>(suffix: &'a str, outcome: &str) -> &'a str
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ToolKind {
+    ReviewCoverage,
     ListFiles,
     ListReviewHunks,
     GetHunkContext,
@@ -180,17 +181,13 @@ impl InvestigationState {
         self.observed.contains(&ToolKind::ReadFile)
             || self.observed.contains(&ToolKind::GetHunkContext)
             || self.observed.contains(&ToolKind::GetFileContext)
+            || self.observed.contains(&ToolKind::ReviewCoverage)
     }
 
     pub(super) fn missing_tool_guidance(&self, test_id: &str) -> Option<String> {
         let mut missing = Vec::new();
         let has_marker = self.target_marker_seen;
-        if self.require_content
-            && !has_marker
-            && !self.observed.contains(&ToolKind::ReadFile)
-            && !self.observed.contains(&ToolKind::GetHunkContext)
-            && !self.observed.contains(&ToolKind::GetFileContext)
-        {
+        if self.require_content && !has_marker && !self.has_content_observation() {
             missing.push("get_hunk_context, read_file, or get_file_context");
         }
         if missing.is_empty() {

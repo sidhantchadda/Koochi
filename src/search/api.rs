@@ -1,6 +1,7 @@
 use super::file_kind::FileKind;
 use crate::FilePath;
 use crate::scope::ReviewHunk;
+use crate::scope::ReviewMode;
 use async_trait::async_trait;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -130,6 +131,10 @@ pub enum SymbolKind {
 #[async_trait]
 pub trait CodeSearchApi: Send + Sync {
     type Error;
+
+    fn review_mode(&self) -> Option<ReviewMode> {
+        None
+    }
 
     async fn list_files(&self, request: ListFilesRequest)
     -> Result<ListFilesResponse, Self::Error>;

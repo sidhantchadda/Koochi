@@ -152,6 +152,10 @@ impl LocalSearchSession {
 impl CodeSearchApi for LocalSearchSession {
     type Error = SearchError;
 
+    fn review_mode(&self) -> Option<crate::scope::ReviewMode> {
+        Some(self.scope.review.mode.clone())
+    }
+
     async fn list_files(
         &self,
         request: ListFilesRequest,

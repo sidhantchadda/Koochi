@@ -89,6 +89,7 @@ pub(super) fn verdict_from_loop_result(
 
 fn is_infrastructure_failure(description: &str) -> bool {
     description.contains("reached the step limit without returning a final verdict")
+        || description.contains("Passing is not allowed until every review-scope source chunk")
 }
 
 fn is_absence_policy(instruction: &str) -> bool {

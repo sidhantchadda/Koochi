@@ -171,6 +171,32 @@ pub(crate) fn print_trace_event(event: AgentTraceEvent, verbose: bool) {
             println!("  non-progress termination: {:?}", response.status);
             println!("    {}", response.description);
         }
+        AgentTraceEvent::PassCoverageRejected {
+            step: _,
+            delivered_chunks,
+            total_chunks,
+            guidance,
+        } => {
+            println!(
+                "  {}",
+                yellow(&format!(
+                    "rejected: pass before full review coverage ({delivered_chunks}/{total_chunks} chunks)"
+                ))
+            );
+            println!("    {}", compact_for_trace(&guidance, 1200));
+        }
+        AgentTraceEvent::ReviewCoverageDelivered {
+            step: _,
+            delivered_chunks,
+            total_chunks,
+            remaining_chunks,
+            observation,
+        } => {
+            println!(
+                "  coverage: {delivered_chunks}/{total_chunks} chunks delivered ({remaining_chunks} remaining)"
+            );
+            println!("  observation: {}", summarize_observation(&observation));
+        }
         AgentTraceEvent::FinalVerdict { step: _, response } => {
             println!(
                 "  final: {:?} severity={:?} evidence={}",
@@ -193,6 +219,41 @@ fn summarize_observation(observation: &str) -> String {
     };
     if let Some(files) = value.get("files").and_then(|value| value.as_array()) {
         return format!("{} files: {}", files.len(), preview_json_items(files, 8));
+    }
+    if let Some(scan) = value.get("source_scan").and_then(|value| value.as_object()) {
+        let file_count = scan
+            .get("file_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let line_count = scan
+            .get("line_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let scope = scan
+            .get("scope")
+            .and_then(|value| value.as_str())
+            .unwrap_or("review-scope source files");
+        return format!("scanned {file_count} files / {line_count} lines ({scope})");
+    }
+    if let Some(coverage) = value
+        .get("review_scope_coverage")
+        .and_then(|value| value.as_object())
+    {
+        let delivered = coverage
+            .get("delivered_chunk_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let total = coverage
+            .get("total_chunks")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let remaining = coverage
+            .get("remaining_chunks")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        return format!(
+            "review-scope coverage batch: {delivered} chunks delivered, {remaining}/{total} remaining"
+        );
     }
     if let Some(matches) = value.get("matches").and_then(|value| value.as_array()) {
         return format!(
@@ -383,6 +444,7 @@ pub(crate) fn review_scope_line(review: &crate::scope::ReviewScope) -> String {
             }
         }
         ReviewMode::LocalChanges => format!("Koochi: local changes ({loc_summary})"),
+        ReviewMode::FullRepo => format!("Koochi: full repo"),
         ReviewMode::FullRepoFallback => format!("Koochi: full repo fallback"),
     }
 }
@@ -415,7 +477,10 @@ pub(crate) fn review_source_file_count(review: &crate::scope::ReviewScope) -> us
 }
 
 pub(crate) fn should_skip_no_source_changes(review: &crate::scope::ReviewScope) -> bool {
-    !matches!(review.mode, ReviewMode::FullRepoFallback) && review_source_file_count(review) == 0
+    !matches!(
+        review.mode,
+        ReviewMode::FullRepo | ReviewMode::FullRepoFallback
+    ) && review_source_file_count(review) == 0
 }
 
 fn review_changed_loc_matching<F>(review: &crate::scope::ReviewScope, mut path_matches: F) -> usize
