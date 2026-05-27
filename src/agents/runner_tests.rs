@@ -35,27 +35,6 @@ fn session_with_mode(root: PathBuf, mode: ReviewMode) -> LocalSearchSession {
     })
 }
 
-#[test]
-fn derives_fixture_marker_from_expected_result_test_ids() {
-    assert_eq!(
-        fixture_marker_for_test_id("pass-timeout-retry-payment"),
-        Some("KOOCHI_SAFE_TIMEOUT_RETRY_PAYMENT".to_string())
-    );
-    assert_eq!(
-        fixture_marker_for_test_id("fail-no-timeout-payment-call"),
-        Some("KOOCHI_FAIL_NO_TIMEOUT_PAYMENT_CALL".to_string())
-    );
-    assert_eq!(
-        fixture_marker_for_test_id("pass-safe-file-export"),
-        Some("KOOCHI_SAFE_FILE_EXPORT".to_string())
-    );
-    assert_eq!(
-        fixture_marker_for_test_id("fail-fail-open-redirect"),
-        Some("KOOCHI_FAIL_OPEN_REDIRECT".to_string())
-    );
-    assert_eq!(fixture_marker_for_test_id("ordinary-test"), None);
-}
-
 #[tokio::test]
 async fn runs_agents_through_bus() {
     let temp = tempfile::tempdir().unwrap();
@@ -683,7 +662,7 @@ async fn grounds_agent_instruction_with_small_changed_hunk_packet() {
 }
 
 #[tokio::test]
-async fn fail_prefixed_prompt_does_not_inject_fixture_breadcrumb() {
+async fn fail_prefixed_prompt_does_not_inject_fixture_answer_keys() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
     let search = Arc::new(session(temp.path().to_path_buf()));
@@ -707,13 +686,7 @@ async fn fail_prefixed_prompt_does_not_inject_fixture_breadcrumb() {
 
     let request = bus.requests().await.remove(0);
     assert!(!request.instruction.contains("fixture-style test id"));
-    assert!(
-        !request
-            .instruction
-            .contains("KOOCHI_FAIL_PAYMENT_NO_IDEMPOTENCY")
-    );
-    assert!(!request.instruction.contains("KOOCHI_FAIL_ plus"));
-    assert!(!request.instruction.contains("KOOCHI_SAFE_ plus"));
+    assert!(!request.instruction.contains("answer key"));
 }
 
 #[tokio::test]
@@ -2119,7 +2092,7 @@ fn parses_get_hunk_context_tool_with_hunk_id() {
 #[test]
 fn parses_text_final_verdict_with_default_status() {
     let turn = parse_agent_turn(
-        r#"{"description":"safe marker found","severity":"low","evidence":[{"path":"src/workflows.rs","line":189,"preview":"// KOOCHI_SAFE_WORKFLOW_ROUTE_009"}]}"#,
+        r#"{"description":"safe route found","severity":"low","evidence":[{"path":"src/workflows.rs","line":189,"preview":"ensure_workflow_route();"}]}"#,
         Some(TestStatus::Passed),
     )
     .unwrap();
@@ -2456,6 +2429,20 @@ fn passed_fail_if_verdict_with_failed_status_language_is_rejected() {
         "Fail if the named function uses raw claim status values as labels."
     ));
 
+    let no_finding_then_failed_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description:
+            "No concrete violation found. The code shows the fail condition, so the correct verdict should be failed."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(passed_verdict_contradicts_failure_language(
+        &no_finding_then_failed_response,
+        "Fail if the named function uses raw claim status values as labels."
+    ));
+
     let missing_required_control_response = LlmResponse {
         status: TestStatus::Passed,
         severity: None,
@@ -2591,6 +2578,48 @@ fn passed_fail_if_verdict_with_failed_status_language_is_rejected() {
     assert!(passed_verdict_contradicts_failure_language(
         &missing_validation_response,
         "Fail if changed Server Action request handling can execute an action without validating the request origin or forwarded host against the configured allowed origins."
+    ));
+}
+
+#[test]
+fn failed_verdict_with_no_finding_or_coverage_language_is_rejected() {
+    let no_violation_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description:
+            "The reviewed target satisfies the invariant; no concrete violation was found."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(failed_verdict_contradicts_no_finding_language(
+        &no_violation_response
+    ));
+
+    let coverage_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description:
+            "The target appears correct, but I cannot declare passed because coverage is incomplete."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(failed_verdict_contradicts_no_finding_language(
+        &coverage_response
+    ));
+
+    let real_failure_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description:
+            "Invariant violation detected: the target opens after one stamp."
+                .to_string(),
+        evidence: Vec::new(),
+    };
+
+    assert!(!failed_verdict_contradicts_no_finding_language(
+        &real_failure_response
     ));
 }
 
@@ -2835,7 +2864,7 @@ async fn accepts_plain_verdict_json_as_final_turn() {
 }
 
 #[tokio::test]
-async fn fail_prefixed_real_invariant_does_not_require_fixture_marker_search() {
+async fn fail_prefixed_real_invariant_does_not_require_answer_key_search() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("cache.rs"),
@@ -2873,152 +2902,6 @@ async fn fail_prefixed_real_invariant_does_not_require_fixture_marker_search() {
     assert_eq!(bus.request_count().await, 2);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence.len(), 1);
-}
-
-#[tokio::test]
-async fn pass_fixture_check_rejects_failure_before_matching_safe_marker() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        temp.path().join("safe.rs"),
-        "// KOOCHI_SAFE_PARAMETERIZED_SQL\npub fn safe() {}\n",
-    )
-    .unwrap();
-    std::fs::write(
-        temp.path().join("unsafe.rs"),
-        "// KOOCHI_FAIL_SQL_INTERPOLATION\npub fn unsafe_query() {}\n",
-    )
-    .unwrap();
-    let search = Arc::new(session(temp.path().to_path_buf()));
-    let bus = Arc::new(ScriptedToolBus::new(vec![
-        r#"{"action":"search_text","query":"KOOCHI_FAIL_SQL_INTERPOLATION","kind":"source"}"#,
-        r#"{"action":"read_file","path":"unsafe.rs"}"#,
-        r#"{
-                "action":"final",
-                "status":"failed",
-                "severity":"high",
-                "description":"unrelated SQL interpolation marker found",
-                "evidence":[{"path":"unsafe.rs","line":1,"preview":"// KOOCHI_FAIL_SQL_INTERPOLATION"}]
-            }"#,
-        r#"{"action":"search_text","query":"KOOCHI_SAFE_PARAMETERIZED_SQL","kind":"source"}"#,
-        r#"{"action":"final","status":"passed","severity":null,"description":"safe marker inspected","evidence":[]}"#,
-        r#"{"action":"final","status":"passed","severity":null,"description":"safe marker inspected after coverage","evidence":[]}"#,
-    ]));
-    let verdicts = run_agents(
-        vec![AgentSpec {
-            id: "pass-parameterized-sql".to_string(),
-            name: "pass-parameterized-sql".to_string(),
-            instruction: "Verify project lookups use parameterized SQL.".to_string(),
-            model: "gpt-5-nano".to_string(),
-            severity: None,
-            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
-        }],
-        search,
-        bus.clone(),
-        128,
-        crate::config::DEFAULT_MAX_AGENT_STEPS,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(bus.request_count().await, 6);
-    assert_eq!(verdicts[0].status, TestStatus::Passed);
-    assert_eq!(
-        verdicts[0].description,
-        "safe marker inspected after coverage"
-    );
-}
-
-#[tokio::test]
-async fn fail_fixture_check_rejects_pass_after_matching_fail_marker() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        temp.path().join("probe.rs"),
-        "// KOOCHI_FAIL_CONFIG_DISCOVERY_LIVE\npub fn probe() {}\n",
-    )
-    .unwrap();
-    let search = Arc::new(session(temp.path().to_path_buf()));
-    let bus = Arc::new(ScriptedToolBus::new(vec![
-        r#"{"action":"search_text","query":"KOOCHI_FAIL_CONFIG_DISCOVERY_LIVE","kind":"source"}"#,
-        r#"{"action":"read_file","path":"probe.rs"}"#,
-        r#"{"action":"final","status":"passed","severity":null,"description":"marker is harmless","evidence":[]}"#,
-    ]));
-    let verdicts = run_agents(
-        vec![AgentSpec {
-            id: "fail-config-discovery-live".to_string(),
-            name: "fail-config-discovery-live".to_string(),
-            instruction: "Do not leave config discovery probe markers in reviewed source."
-                .to_string(),
-            model: "gpt-5-nano".to_string(),
-            severity: None,
-            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
-        }],
-        search,
-        bus.clone(),
-        128,
-        crate::config::DEFAULT_MAX_AGENT_STEPS,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(bus.request_count().await, 3);
-    assert_eq!(verdicts[0].status, TestStatus::Failed);
-    assert_eq!(verdicts[0].evidence.len(), 1);
-    assert!(
-        verdicts[0]
-            .description
-            .contains("Matching failure breadcrumb")
-    );
-}
-
-#[tokio::test]
-async fn fixture_marker_seen_before_step_limit_produces_expected_verdict() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        temp.path().join("probe.rs"),
-        "// KOOCHI_SAFE_TIMEOUT_RETRY_PAYMENT\n// KOOCHI_FAIL_NO_TIMEOUT_PAYMENT_CALL\n",
-    )
-    .unwrap();
-    let search = Arc::new(session(temp.path().to_path_buf()));
-    let bus = Arc::new(ScriptedToolBus::new(vec![
-        r#"{"action":"search_text","query":"KOOCHI_SAFE_TIMEOUT_RETRY_PAYMENT","kind":"source"}"#,
-        r#"{"action":"search_text","query":"KOOCHI_FAIL_NO_TIMEOUT_PAYMENT_CALL","kind":"source"}"#,
-    ]));
-    let verdicts = run_agents(
-        vec![
-            AgentSpec {
-                id: "pass-timeout-retry-payment".to_string(),
-                name: "pass-timeout-retry-payment".to_string(),
-                instruction: "Verify payment calls use timeout and retry handling.".to_string(),
-                model: "gpt-5-nano".to_string(),
-                severity: None,
-                initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
-            },
-            AgentSpec {
-                id: "fail-no-timeout-payment-call".to_string(),
-                name: "fail-no-timeout-payment-call".to_string(),
-                instruction: "Do not call external payment APIs without timeout handling."
-                    .to_string(),
-                model: "gpt-5-nano".to_string(),
-                severity: Some(Severity::High),
-                initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
-            },
-        ],
-        search,
-        bus,
-        2,
-        1,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(verdicts[0].status, TestStatus::Passed);
-    assert!(verdicts[0].description.contains("Matching safe breadcrumb"));
-    assert_eq!(verdicts[1].status, TestStatus::Failed);
-    assert!(
-        verdicts[1]
-            .description
-            .contains("Matching failure breadcrumb")
-    );
 }
 
 #[tokio::test]

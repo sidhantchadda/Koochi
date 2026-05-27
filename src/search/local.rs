@@ -54,6 +54,8 @@ pub enum SearchError {
     UnknownHunk(String),
     #[error("git command failed: {0}")]
     Git(String),
+    #[error("agent access to Koochi control-plane file `{0}` is not allowed")]
+    BlockedControlPlaneFile(String),
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +245,7 @@ impl CodeSearchApi for LocalSearchSession {
             .review
             .files
             .iter()
+            .filter(|path| !is_agent_hidden_file(path))
             .filter(|path| kind_matches(path, request.kind))
             .filter(|path| file_exists_for_repo(&self.scope.primary_repo, path))
             .cloned()
@@ -255,7 +258,14 @@ impl CodeSearchApi for LocalSearchSession {
 
     async fn list_review_hunks(&self) -> Result<ListReviewHunksResponse, Self::Error> {
         Ok(ListReviewHunksResponse {
-            hunks: self.scope.review.hunks.clone(),
+            hunks: self
+                .scope
+                .review
+                .hunks
+                .iter()
+                .filter(|hunk| !is_agent_hidden_file(&hunk.path))
+                .cloned()
+                .collect(),
         })
     }
 
@@ -271,6 +281,7 @@ impl CodeSearchApi for LocalSearchSession {
             .review
             .hunks
             .iter()
+            .filter(|hunk| !is_agent_hidden_file(&hunk.path))
             .find(|hunk| hunk.id == request.hunk_id)
             .cloned()
             .ok_or_else(|| SearchError::UnknownHunk(request.hunk_id.clone()))?;
@@ -366,6 +377,9 @@ impl CodeSearchApi for LocalSearchSession {
 
     async fn read_file(&self, request: ReadFileRequest) -> Result<ReadFileResponse, Self::Error> {
         let path = normalize_repo_path(&request.path);
+        if is_agent_hidden_file(&path) {
+            return Err(SearchError::BlockedControlPlaneFile(path));
+        }
         let read_lock = {
             let mut cache = self.cache.lock().await;
             if let Some(response) = cache.contents.get(&path).cloned() {
@@ -594,7 +608,7 @@ fn collect_files(root: &Path, kind: FileKind) -> Result<Vec<FilePath>, SearchErr
             .strip_prefix(root)
             .map_err(|_| SearchError::OutsideRepo(path.to_string_lossy().to_string()))?;
         let relative = path_to_unix(relative);
-        if kind_matches(&relative, kind) {
+        if !is_agent_hidden_file(&relative) && kind_matches(&relative, kind) {
             files.push(relative);
         }
     }
@@ -623,6 +637,7 @@ fn collect_files_for_repo(repo: &RepoScope, kind: FileKind) -> Result<Vec<FilePa
                 .map(str::trim)
                 .filter(|path| !path.is_empty())
                 .map(str::to_string)
+                .filter(|path| !is_agent_hidden_file(path))
                 .filter(|path| kind_matches(path, kind))
                 .collect::<Vec<_>>();
             files.sort();
@@ -681,6 +696,14 @@ fn normalize_repo_path(path: &str) -> String {
         .trim_start_matches("./")
         .trim_start_matches('/')
         .to_string()
+}
+
+fn is_agent_hidden_file(path: &str) -> bool {
+    let normalized = normalize_repo_path(path).to_ascii_lowercase();
+    normalized
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == "koochi.toml")
 }
 
 fn scoped_path(root: &Path, relative: &str) -> Result<PathBuf, SearchError> {

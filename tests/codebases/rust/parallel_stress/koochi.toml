@@ -1,0 +1,648 @@
+provider = "openai"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-5-nano"
+max_parallel_agents = 32
+max_parallel_llm_requests = 64
+max_agent_steps = 128
+initial_context_token_budget = 24000
+
+
+[[test]]
+id = "fail-meter-empty-label"
+severity = "critical"
+instruction = "Inspect `meter_bad_empty_label`. Fail if its body calls `meter_item` directly instead of `meter_ok`."
+
+[[test]]
+id = "fail-meter-open-scale"
+severity = "high"
+instruction = "Inspect `meter_bad_open_scale`. Fail if its body contains `signal.value * 100` or any direct multiplication of `signal.value`."
+
+[[test]]
+id = "fail-meter-paused-name"
+severity = "medium"
+instruction = "Inspect `meter_bad_paused_name`. Fail if the `name == \"paused\"` branch returns `Some(...)`."
+
+[[test]]
+id = "fail-meter-short-key"
+severity = "high"
+instruction = "Inspect `meter_bad_short_key`. Fail if the `format!` call uses `normalize_name(&signal.name)` while omitting `signal.label`."
+
+[[test]]
+id = "fail-row-group-skip"
+severity = "critical"
+instruction = "Inspect `row_bad_group_skip`. Fail if its body returns `Some(format!(...))` without any `row_ok` call."
+
+[[test]]
+id = "fail-row-plain-zone"
+severity = "high"
+instruction = "Inspect `row_bad_plain_zone`. Fail if its `format!` call uses `record.zone` directly."
+
+[[test]]
+id = "fail-row-closed-item"
+severity = "medium"
+instruction = "Inspect `row_bad_closed_item`. Fail if its body returns `Some(format!(...))` after checking only `same_group` and not `record.open`."
+
+[[test]]
+id = "fail-gate-missing-label"
+severity = "critical"
+instruction = "Inspect `gate_bad_missing_label`. Fail if `decision.open` becomes true without `label_present(request)`."
+
+[[test]]
+id = "fail-gate-single-stamp"
+severity = "high"
+instruction = "Inspect `gate_bad_single_stamp`. Fail if it opens on `stamp_count >= 1`."
+
+[[test]]
+id = "fail-gate-open-limit"
+severity = "high"
+instruction = "Inspect `gate_bad_open_limit`. Fail if it opens without an amount limit comparison."
+
+[[test]]
+id = "pass-meter-rule-002"
+severity = "medium"
+instruction = "Inspect `meter_rule_002`. Pass only if the body calls `meter_ok`."
+
+[[test]]
+id = "pass-meter-rule-003"
+severity = "medium"
+instruction = "Inspect `meter_rule_003`. Pass only if `signal` is the first argument to `meter_ok`."
+
+[[test]]
+id = "pass-meter-rule-004"
+severity = "medium"
+instruction = "Inspect `meter_rule_004`. Pass only if the route name literal is `meter_rule_004`."
+
+[[test]]
+id = "pass-meter-rule-005"
+severity = "medium"
+instruction = "Inspect `meter_rule_005`. Pass only if the numeric threshold is `6005`."
+
+[[test]]
+id = "pass-meter-rule-006"
+severity = "medium"
+instruction = "Inspect `meter_rule_006`. Pass only if the rule returns the `meter_ok` result directly."
+
+[[test]]
+id = "pass-meter-rule-007"
+severity = "medium"
+instruction = "Inspect `meter_rule_007`. Pass only if the `meter_ok` call supplies exactly three arguments."
+
+[[test]]
+id = "pass-meter-rule-008"
+severity = "medium"
+instruction = "Inspect `meter_rule_008`. Pass only if the string literal ends with suffix `008`."
+
+[[test]]
+id = "pass-meter-rule-009"
+severity = "medium"
+instruction = "Inspect `meter_rule_009`. Pass only if no `meter_item` call appears in its body."
+
+[[test]]
+id = "pass-meter-rule-010"
+severity = "medium"
+instruction = "Inspect `meter_rule_010`. Pass only if it accepts `signal: &Signal`."
+
+[[test]]
+id = "pass-meter-rule-011"
+severity = "medium"
+instruction = "Inspect `meter_rule_011`. Pass only if the helper receives literal `meter_rule_011`."
+
+[[test]]
+id = "pass-meter-rule-012"
+severity = "medium"
+instruction = "Inspect `meter_rule_012`. Pass only if the last `meter_ok` argument is `6012`."
+
+[[test]]
+id = "pass-meter-rule-013"
+severity = "medium"
+instruction = "Inspect `meter_rule_013`. Pass only if the function body contains no `if` branch."
+
+[[test]]
+id = "pass-meter-rule-014"
+severity = "medium"
+instruction = "Inspect `meter_rule_014`. Pass only if `meter_ok` is called with `signal`, a string, and a number."
+
+[[test]]
+id = "pass-meter-rule-015"
+severity = "medium"
+instruction = "Inspect `meter_rule_015`. Pass only if its literal label contains `015`."
+
+[[test]]
+id = "pass-meter-rule-016"
+severity = "medium"
+instruction = "Inspect `meter_rule_016`. Pass only if the call target is `meter_ok`."
+
+[[test]]
+id = "pass-meter-rule-017"
+severity = "medium"
+instruction = "Inspect `meter_rule_017`. Pass only if the original `signal` reference is forwarded."
+
+[[test]]
+id = "pass-meter-rule-018"
+severity = "medium"
+instruction = "Inspect `meter_rule_018`. Pass only if the quoted rule name is not shortened."
+
+[[test]]
+id = "pass-meter-rule-019"
+severity = "medium"
+instruction = "Inspect `meter_rule_019`. Pass only if the threshold literal is `6019`."
+
+[[test]]
+id = "pass-meter-rule-020"
+severity = "medium"
+instruction = "Inspect `meter_rule_020`. Pass only if it has no local variable before returning."
+
+[[test]]
+id = "pass-meter-rule-021"
+severity = "medium"
+instruction = "Inspect `meter_rule_021`. Pass only if the helper call includes a label argument."
+
+[[test]]
+id = "pass-meter-rule-022"
+severity = "medium"
+instruction = "Inspect `meter_rule_022`. Pass only if the label suffix is `022`."
+
+[[test]]
+id = "pass-meter-rule-023"
+severity = "medium"
+instruction = "Inspect `meter_rule_023`. Pass only if it avoids calling `bounded_value` itself."
+
+# [[test]]
+# id = "pass-meter-rule-024"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_024`. Pass only if `signal` is not replaced by another value."
+
+# [[test]]
+# id = "pass-meter-rule-025"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_025`. Pass only if the helper label exactly matches the function name."
+
+# [[test]]
+# id = "pass-meter-rule-026"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_026`. Pass only if the cutoff number is `6026`."
+
+# [[test]]
+# id = "pass-meter-rule-027"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_027`. Pass only if it contains one `meter_ok` call and nothing else substantive."
+
+# [[test]]
+# id = "pass-meter-rule-028"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_028`. Pass only if the third helper argument is a numeric literal."
+
+# [[test]]
+# id = "pass-meter-rule-029"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_029`. Pass only if `029` appears in the helper label."
+
+# [[test]]
+# id = "pass-meter-rule-030"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_030`. Pass only if it uses the shared meter helper."
+
+# [[test]]
+# id = "pass-meter-rule-031"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_031`. Pass only if the first helper parameter remains `signal`."
+
+# [[test]]
+# id = "pass-meter-rule-032"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_032`. Pass only if the literal name is spelled `meter_rule_032`."
+
+# [[test]]
+# id = "pass-meter-rule-033"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_033`. Pass only if the helper threshold equals `6033`."
+
+# [[test]]
+# id = "pass-meter-rule-034"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_034`. Pass only if the return expression starts with `meter_ok(`."
+
+# [[test]]
+# id = "pass-meter-rule-035"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_035`. Pass only if the helper receives `signal`, `meter_rule_035`, and `6035`."
+
+# [[test]]
+# id = "pass-meter-rule-036"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_036`. Pass only if the embedded suffix is `036`."
+
+# [[test]]
+# id = "pass-meter-rule-037"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_037`. Pass only if it does not build `MeterItem` directly."
+
+# [[test]]
+# id = "pass-meter-rule-038"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_038`. Pass only if `signal` is forwarded without field access."
+
+# [[test]]
+# id = "pass-meter-rule-039"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_039`. Pass only if the helper label is `meter_rule_039`."
+
+# [[test]]
+# id = "pass-meter-rule-040"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_040`. Pass only if the numeric limit is `6040`."
+
+# [[test]]
+# id = "pass-meter-rule-041"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_041`. Pass only if it has no `format!` call."
+
+# [[test]]
+# id = "pass-meter-rule-042"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_042`. Pass only if the `meter_ok` invocation includes a threshold."
+
+# [[test]]
+# id = "pass-meter-rule-043"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_043`. Pass only if the string literal suffix matches `043`."
+
+# [[test]]
+# id = "pass-meter-rule-044"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_044`. Pass only if it relies on `meter_ok` for the decision."
+
+# [[test]]
+# id = "pass-meter-rule-045"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_045`. Pass only if `signal` is the helper input."
+
+# [[test]]
+# id = "pass-meter-rule-046"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_046`. Pass only if the label literal is unchanged from the function name."
+
+# [[test]]
+# id = "pass-meter-rule-047"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_047`. Pass only if the threshold argument reads `6047`."
+
+# [[test]]
+# id = "pass-meter-rule-048"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_048`. Pass only if it returns `meter_ok(...)` directly."
+
+# [[test]]
+# id = "pass-meter-rule-049"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_049`. Pass only if there are three values inside the `meter_ok` call."
+
+# [[test]]
+# id = "pass-meter-rule-050"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_050`. Pass only if the literal name ends in `050`."
+
+# [[test]]
+# id = "pass-meter-rule-051"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_051`. Pass only if it does not contain a manual `Some` constructor."
+
+# [[test]]
+# id = "pass-meter-rule-052"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_052`. Pass only if the helper sees the borrowed `signal`."
+
+# [[test]]
+# id = "pass-meter-rule-053"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_053`. Pass only if the middle helper argument is `meter_rule_053`."
+
+# [[test]]
+# id = "pass-meter-rule-054"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_054`. Pass only if the helper limit is `6054`."
+
+# [[test]]
+# id = "pass-meter-rule-055"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_055`. Pass only if the function has no branch of its own."
+
+# [[test]]
+# id = "pass-meter-rule-056"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_056`. Pass only if the `meter_ok` argument list has length three."
+
+# [[test]]
+# id = "pass-meter-rule-057"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_057`. Pass only if suffix `057` is present in the label."
+
+# [[test]]
+# id = "pass-meter-rule-058"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_058`. Pass only if `meter_ok` is the only helper it invokes."
+
+# [[test]]
+# id = "pass-meter-rule-059"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_059`. Pass only if the call keeps `signal` as argument one."
+
+# [[test]]
+# id = "pass-meter-rule-060"
+# severity = "medium"
+# instruction = "Inspect `meter_rule_060`. Pass only if the label is exactly `meter_rule_060`."
+
+# [[test]]
+# id = "pass-row-rule-001"
+# severity = "high"
+# instruction = "Inspect `row_rule_001`. Pass only if it calls `row_ok`."
+
+# [[test]]
+# id = "pass-row-rule-002"
+# severity = "high"
+# instruction = "Inspect `row_rule_002`. Pass only if `record` is the first `row_ok` argument."
+
+# [[test]]
+# id = "pass-row-rule-003"
+# severity = "high"
+# instruction = "Inspect `row_rule_003`. Pass only if `group` is forwarded to the helper."
+
+# [[test]]
+# id = "pass-row-rule-004"
+# severity = "high"
+# instruction = "Inspect `row_rule_004`. Pass only if the label literal is `row_rule_004`."
+
+# [[test]]
+# id = "pass-row-rule-005"
+# severity = "high"
+# instruction = "Inspect `row_rule_005`. Pass only if the function returns the `row_ok` result directly."
+
+# [[test]]
+# id = "pass-row-rule-006"
+# severity = "high"
+# instruction = "Inspect `row_rule_006`. Pass only if `row_ok` receives exactly three arguments."
+
+# [[test]]
+# id = "pass-row-rule-007"
+# severity = "high"
+# instruction = "Inspect `row_rule_007`. Pass only if its quoted label ends in `007`."
+
+# [[test]]
+# id = "pass-row-rule-008"
+# severity = "high"
+# instruction = "Inspect `row_rule_008`. Pass only if no `format!` call appears in its body."
+
+# [[test]]
+# id = "pass-row-rule-009"
+# severity = "high"
+# instruction = "Inspect `row_rule_009`. Pass only if the original `record` value is forwarded."
+
+# [[test]]
+# id = "pass-row-rule-010"
+# severity = "high"
+# instruction = "Inspect `row_rule_010`. Pass only if the helper receives `group` as argument two."
+
+# [[test]]
+# id = "pass-row-rule-011"
+# severity = "high"
+# instruction = "Inspect `row_rule_011`. Pass only if the third `row_ok` argument is `row_rule_011`."
+
+# [[test]]
+# id = "pass-row-rule-012"
+# severity = "high"
+# instruction = "Inspect `row_rule_012`. Pass only if it does not build a row string itself."
+
+# [[test]]
+# id = "pass-row-rule-013"
+# severity = "high"
+# instruction = "Inspect `row_rule_013`. Pass only if the helper call includes `record`, `group`, and a label."
+
+# [[test]]
+# id = "pass-row-rule-014"
+# severity = "high"
+# instruction = "Inspect `row_rule_014`. Pass only if suffix `014` is present in the label."
+
+# [[test]]
+# id = "pass-row-rule-015"
+# severity = "high"
+# instruction = "Inspect `row_rule_015`. Pass only if `row_ok` is the called helper."
+
+# [[test]]
+# id = "pass-row-rule-016"
+# severity = "high"
+# instruction = "Inspect `row_rule_016`. Pass only if the helper input is `record`."
+
+# [[test]]
+# id = "pass-row-rule-017"
+# severity = "high"
+# instruction = "Inspect `row_rule_017`. Pass only if `group` is not replaced with a literal."
+
+# [[test]]
+# id = "pass-row-rule-018"
+# severity = "high"
+# instruction = "Inspect `row_rule_018`. Pass only if the row label is exactly `row_rule_018`."
+
+# [[test]]
+# id = "pass-row-rule-019"
+# severity = "high"
+# instruction = "Inspect `row_rule_019`. Pass only if there is no local variable in the body."
+
+# [[test]]
+# id = "pass-row-rule-020"
+# severity = "high"
+# instruction = "Inspect `row_rule_020`. Pass only if `row_ok` has a three-item argument list."
+
+# [[test]]
+# id = "pass-row-rule-021"
+# severity = "high"
+# instruction = "Inspect `row_rule_021`. Pass only if the label suffix is `021`."
+
+# [[test]]
+# id = "pass-row-rule-022"
+# severity = "high"
+# instruction = "Inspect `row_rule_022`. Pass only if it avoids reading `record.zone` directly."
+
+# [[test]]
+# id = "pass-row-rule-023"
+# severity = "high"
+# instruction = "Inspect `row_rule_023`. Pass only if argument one to `row_ok` is `record`."
+
+# [[test]]
+# id = "pass-row-rule-024"
+# severity = "high"
+# instruction = "Inspect `row_rule_024`. Pass only if argument two to `row_ok` is `group`."
+
+# [[test]]
+# id = "pass-row-rule-025"
+# severity = "high"
+# instruction = "Inspect `row_rule_025`. Pass only if the label literal matches the function name."
+
+# [[test]]
+# id = "pass-row-rule-026"
+# severity = "high"
+# instruction = "Inspect `row_rule_026`. Pass only if the body is just a helper delegation."
+
+# [[test]]
+# id = "pass-row-rule-027"
+# severity = "high"
+# instruction = "Inspect `row_rule_027`. Pass only if the helper is called with a label argument."
+
+# [[test]]
+# id = "pass-row-rule-028"
+# severity = "high"
+# instruction = "Inspect `row_rule_028`. Pass only if `028` appears in the row label literal."
+
+# [[test]]
+# id = "pass-row-rule-029"
+# severity = "high"
+# instruction = "Inspect `row_rule_029`. Pass only if it contains exactly one `row_ok` call."
+
+# [[test]]
+# id = "pass-row-rule-030"
+# severity = "high"
+# instruction = "Inspect `row_rule_030`. Pass only if `record` stays as the helper's first value."
+
+# [[test]]
+# id = "pass-row-rule-031"
+# severity = "high"
+# instruction = "Inspect `row_rule_031`. Pass only if `group` stays as the helper's second value."
+
+# [[test]]
+# id = "pass-row-rule-032"
+# severity = "high"
+# instruction = "Inspect `row_rule_032`. Pass only if the quoted name is `row_rule_032`."
+
+# [[test]]
+# id = "pass-row-rule-033"
+# severity = "high"
+# instruction = "Inspect `row_rule_033`. Pass only if the return expression starts with `row_ok(`."
+
+# [[test]]
+# id = "pass-row-rule-034"
+# severity = "high"
+# instruction = "Inspect `row_rule_034`. Pass only if `row_ok(record, group, ...)` is the call shape."
+
+# [[test]]
+# id = "pass-row-rule-035"
+# severity = "high"
+# instruction = "Inspect `row_rule_035`. Pass only if the label ends with `035`."
+
+# [[test]]
+# id = "pass-row-rule-036"
+# severity = "high"
+# instruction = "Inspect `row_rule_036`. Pass only if it does not call `clean_piece` itself."
+
+# [[test]]
+# id = "pass-row-rule-037"
+# severity = "high"
+# instruction = "Inspect `row_rule_037`. Pass only if `record` is forwarded unchanged."
+
+# [[test]]
+# id = "pass-row-rule-038"
+# severity = "high"
+# instruction = "Inspect `row_rule_038`. Pass only if `group` is forwarded unchanged."
+
+# [[test]]
+# id = "pass-row-rule-039"
+# severity = "high"
+# instruction = "Inspect `row_rule_039`. Pass only if `row_rule_039` is the label literal."
+
+# [[test]]
+# id = "pass-row-rule-040"
+# severity = "high"
+# instruction = "Inspect `row_rule_040`. Pass only if it has no `if` expression in its body."
+
+# [[test]]
+# id = "pass-row-rule-041"
+# severity = "high"
+# instruction = "Inspect `row_rule_041`. Pass only if the helper receives `record`, `group`, and `row_rule_041`."
+
+# [[test]]
+# id = "pass-row-rule-042"
+# severity = "high"
+# instruction = "Inspect `row_rule_042`. Pass only if the row label suffix is `042`."
+
+# [[test]]
+# id = "pass-row-rule-043"
+# severity = "high"
+# instruction = "Inspect `row_rule_043`. Pass only if it relies on `row_ok` for row construction."
+
+# [[test]]
+# id = "pass-row-rule-044"
+# severity = "high"
+# instruction = "Inspect `row_rule_044`. Pass only if the first call argument is the record parameter."
+
+# [[test]]
+# id = "pass-row-rule-045"
+# severity = "high"
+# instruction = "Inspect `row_rule_045`. Pass only if the second call argument is the group parameter."
+
+# [[test]]
+# id = "pass-row-rule-046"
+# severity = "high"
+# instruction = "Inspect `row_rule_046`. Pass only if the final helper argument is `row_rule_046`."
+
+# [[test]]
+# id = "pass-row-rule-047"
+# severity = "high"
+# instruction = "Inspect `row_rule_047`. Pass only if no manual string formatting happens there."
+
+# [[test]]
+# id = "pass-row-rule-048"
+# severity = "high"
+# instruction = "Inspect `row_rule_048`. Pass only if the `row_ok` call includes the row label."
+
+# [[test]]
+# id = "pass-row-rule-049"
+# severity = "high"
+# instruction = "Inspect `row_rule_049`. Pass only if the label text carries suffix `049`."
+
+# [[test]]
+# id = "pass-row-rule-050"
+# severity = "high"
+# instruction = "Inspect `row_rule_050`. Pass only if `row_ok` is the only function called."
+
+# [[test]]
+# id = "pass-row-rule-051"
+# severity = "high"
+# instruction = "Inspect `row_rule_051`. Pass only if the helper call begins with `record`."
+
+# [[test]]
+# id = "pass-row-rule-052"
+# severity = "high"
+# instruction = "Inspect `row_rule_052`. Pass only if the helper call keeps `group` in the middle."
+
+# [[test]]
+# id = "pass-row-rule-053"
+# severity = "high"
+# instruction = "Inspect `row_rule_053`. Pass only if the quoted label is `row_rule_053`."
+
+# [[test]]
+# id = "pass-row-rule-054"
+# severity = "high"
+# instruction = "Inspect `row_rule_054`. Pass only if it returns helper output without wrapping it."
+
+# [[test]]
+# id = "pass-row-rule-055"
+# severity = "high"
+# instruction = "Inspect `row_rule_055`. Pass only if the helper call has the expected three fields."
+
+# [[test]]
+# id = "pass-row-rule-056"
+# severity = "high"
+# instruction = "Inspect `row_rule_056`. Pass only if the literal label suffix is `056`."
+
+# [[test]]
+# id = "pass-row-rule-057"
+# severity = "high"
+# instruction = "Inspect `row_rule_057`. Pass only if its body names `row_ok`."
+
+# [[test]]
+# id = "pass-row-rule-058"
+# severity = "high"
+# instruction = "Inspect `row_rule_058`. Pass only if `record` is present inside the helper call."
+
+# [[test]]
+# id = "pass-row-rule-059"
+# severity = "high"
+# instruction = "Inspect `row_rule_059`. Pass only if `group` is present inside the helper call."

@@ -197,6 +197,132 @@ async fn list_review_hunks_uses_review_scope() {
 }
 
 #[tokio::test]
+async fn agents_cannot_read_or_discover_koochi_config() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("src")).unwrap();
+    std::fs::write(
+        temp.path().join("koochi.toml"),
+        "secret = \"control-plane\"\n",
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("src/lib.rs"), "pub fn reviewed() {}\n").unwrap();
+    let search = LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "test".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::LocalChanges,
+            files: vec!["koochi.toml".to_string(), "src/lib.rs".to_string()],
+            hunks: vec![
+                ReviewHunk {
+                    id: "koochi.toml#1".to_string(),
+                    path: "koochi.toml".to_string(),
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec![ReviewHunkLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "secret = \"control-plane\"".to_string(),
+                    }],
+                },
+                ReviewHunk {
+                    id: "src/lib.rs#1".to_string(),
+                    path: "src/lib.rs".to_string(),
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec![ReviewHunkLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "pub fn reviewed() {}".to_string(),
+                    }],
+                },
+            ],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    });
+
+    let all_files = search
+        .list_files(ListFilesRequest {
+            kind: FileKind::All,
+        })
+        .await
+        .unwrap();
+    assert_eq!(all_files.files, vec!["src/lib.rs"]);
+
+    let config_files = search
+        .list_files(ListFilesRequest {
+            kind: FileKind::Configs,
+        })
+        .await
+        .unwrap();
+    assert!(config_files.files.is_empty());
+
+    let review_files = search
+        .list_review_files(ListFilesRequest {
+            kind: FileKind::All,
+        })
+        .await
+        .unwrap();
+    assert_eq!(review_files.files, vec!["src/lib.rs"]);
+
+    let hunks = search.list_review_hunks().await.unwrap();
+    assert_eq!(hunks.hunks.len(), 1);
+    assert_eq!(hunks.hunks[0].path, "src/lib.rs");
+
+    let read_error = search
+        .read_file(ReadFileRequest {
+            path: "koochi.toml".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        read_error,
+        SearchError::BlockedControlPlaneFile(_)
+    ));
+
+    let context_error = search
+        .get_file_context(GetFileContextRequest {
+            path: "koochi.toml".to_string(),
+            line: 1,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        context_error,
+        SearchError::BlockedControlPlaneFile(_)
+    ));
+
+    let hunk_error = search
+        .get_hunk_context(GetHunkContextRequest {
+            hunk_id: "koochi.toml#1".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(hunk_error, SearchError::UnknownHunk(_)));
+
+    let matches = search
+        .search_text(SearchTextRequest {
+            query: "control-plane".to_string(),
+            kind: FileKind::All,
+        })
+        .await
+        .unwrap();
+    assert!(matches.matches.is_empty());
+}
+
+#[tokio::test]
 async fn get_hunk_context_returns_context_around_hunk() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(

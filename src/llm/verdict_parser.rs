@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn parses_provider_verdict_with_default_status() {
         let response = parse_verdict_with_default_status(
-            r#"{"description":"safe marker found","severity":"low","evidence":[{"path":"src/workflows.rs","line":189,"preview":"// KOOCHI_SAFE_WORKFLOW_ROUTE_009"}]}"#,
+            r#"{"description":"safe route found","severity":"low","evidence":[{"path":"src/workflows.rs","line":189,"preview":"ensure_workflow_route();"}]}"#,
             Some(TestStatus::Passed),
         )
         .unwrap();

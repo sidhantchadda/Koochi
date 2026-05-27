@@ -436,7 +436,7 @@ mod tests {
             OpenAiToolCall {
                 function: OpenAiToolCallFunction {
                     name: "final_verdict".to_string(),
-                    arguments: r#"{"description":"safe marker found","severity":"low","evidence":[{"path":"src/workflows.rs","line":189,"preview":"// KOOCHI_SAFE_WORKFLOW_ROUTE_009"}]}"#.to_string(),
+                    arguments: r#"{"description":"safe route found","severity":"low","evidence":[{"path":"src/workflows.rs","line":189,"preview":"ensure_workflow_route();"}]}"#.to_string(),
                 },
             },
             Some(TestStatus::Passed),

@@ -326,9 +326,9 @@ mod tests {
         let action = parse_tool_use(
             "final_verdict",
             json!({
-                "description": "safe marker found",
+                "description": "safe route found",
                 "severity": "low",
-                "evidence": [{"path": "src/workflows.rs", "line": 189, "preview": "// KOOCHI_SAFE_WORKFLOW_ROUTE_009"}]
+                "evidence": [{"path": "src/workflows.rs", "line": 189, "preview": "ensure_workflow_route();"}]
             }),
             Some(TestStatus::Passed),
         )

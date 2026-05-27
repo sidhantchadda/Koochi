@@ -465,6 +465,7 @@ fn head_commit_files(root: &std::path::Path) -> Option<Vec<FilePath>> {
         .lines()
         .map(str::trim)
         .filter(|path| !path.is_empty())
+        .filter(|path| !is_koochi_local_file(path))
         .filter(|path| root.join(path).is_file())
         .map(path_to_unix)
         .collect::<Vec<_>>();
@@ -513,6 +514,7 @@ fn parse_changed_files(stdout: &[u8]) -> Vec<FilePath> {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(path_to_unix)
+        .filter(|path| !is_koochi_local_file(path))
         .collect::<Vec<_>>();
     files.sort();
     files.dedup();
@@ -521,6 +523,7 @@ fn parse_changed_files(stdout: &[u8]) -> Vec<FilePath> {
 
 fn local_changed_hunks(root: &std::path::Path, files: &[FilePath]) -> Option<Vec<ReviewHunk>> {
     let mut hunks = git_diff_hunks(root, &["diff", "--unified=0", "--no-ext-diff", "HEAD"])?;
+    hunks.retain(|hunk| !is_koochi_local_file(&hunk.path));
     let tracked_paths = hunks
         .iter()
         .map(|hunk| hunk.path.clone())
@@ -566,7 +569,9 @@ fn git_diff_hunks(root: &std::path::Path, args: &[&str]) -> Option<Vec<ReviewHun
     if !output.status.success() {
         return None;
     }
-    Some(parse_unified_diff(&String::from_utf8_lossy(&output.stdout)))
+    let mut hunks = parse_unified_diff(&String::from_utf8_lossy(&output.stdout));
+    hunks.retain(|hunk| !is_koochi_local_file(&hunk.path));
+    Some(hunks)
 }
 
 fn untracked_file_hunk(root: &std::path::Path, path: &str) -> Option<ReviewHunk> {
@@ -739,7 +744,10 @@ fn path_to_unix(path: &str) -> String {
 
 fn is_koochi_local_file(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower == "koochi.toml"
+    lower
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == "koochi.toml")
         || lower == ".env.local"
         || lower.starts_with(".koochi/")
         || lower.starts_with("koochi-debug/")
@@ -917,6 +925,29 @@ mod tests {
 
         assert_eq!(review.mode, ReviewMode::HeadCommit);
         assert_eq!(review.files, vec!["second.rs"]);
+    }
+
+    #[test]
+    fn review_scope_excludes_tracked_koochi_config_hunks() {
+        let temp = tempfile::tempdir().unwrap();
+        if !git(temp.path(), ["init"]) {
+            return;
+        }
+        git(temp.path(), ["config", "user.email", "koochi@example.test"]);
+        git(temp.path(), ["config", "user.name", "Koochi"]);
+        fs::write(temp.path().join("koochi.toml"), "tests = []\n").unwrap();
+        fs::write(temp.path().join("lib.rs"), "fn original() {}\n").unwrap();
+        git(temp.path(), ["add", "."]);
+        git(temp.path(), ["commit", "-m", "initial"]);
+        fs::write(temp.path().join("koochi.toml"), "tests = [\"secret\"]\n").unwrap();
+        fs::write(temp.path().join("lib.rs"), "fn changed() {}\n").unwrap();
+
+        let review = build_review_scope(temp.path(), &ReviewTarget::Auto).unwrap();
+
+        assert_eq!(review.mode, ReviewMode::LocalChanges);
+        assert_eq!(review.files, vec!["lib.rs"]);
+        assert_eq!(review.hunks.len(), 1);
+        assert_eq!(review.hunks[0].path, "lib.rs");
     }
 
     #[test]

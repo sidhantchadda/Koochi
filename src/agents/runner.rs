@@ -47,9 +47,7 @@ mod investigation;
 
 use evidence::{classify_evidence, verdict_from_loop_result};
 use grounding::{build_grounded_request, substantive_changed_line};
-#[cfg(test)]
-use investigation::fixture_marker_for_test_id;
-use investigation::{InvestigationState, ToolKind, expected_fixture_status};
+use investigation::{InvestigationState, ToolKind};
 
 const MAX_CONTEXT_FILES: usize = 32;
 const MAX_PROMPT_TOKENS: usize = 120_000;
@@ -855,7 +853,7 @@ where
             action: describe_action(&action),
             output: describe_action_output(&action),
         });
-        let turn = match action_to_turn(action, expected_fixture_status(&agent.id)) {
+        let turn = match action_to_turn(action, None) {
             Ok(turn) => turn,
             Err(AgentError::Llm(LlmBusError::InvalidVerdict(content))) => {
                 trace(AgentTraceEvent::InvalidResponse {
@@ -874,9 +872,6 @@ where
             Err(error) => return Err(error),
         };
         if let Some(final_response) = turn_to_response(&turn) {
-            let final_response = investigation
-                .fixture_corrected_final(&agent.id, &final_response)
-                .unwrap_or(final_response);
             if final_response.status == TestStatus::Passed
                 && !coverage.is_complete(inventory.as_ref())
             {
@@ -923,13 +918,9 @@ where
             }
             let direct_verdict_allowed = grounded.allows_direct_verdict
                 && direct_verdict_is_grounded(&final_response, &grounded.relevant_changed_lines)
-                && direct_verdict_satisfies_investigation(
-                    &final_response,
-                    &agent.id,
-                    &investigation,
-                );
+                && direct_verdict_satisfies_investigation(&final_response);
             if !direct_verdict_allowed
-                && let Some(guidance) = investigation.final_guidance(&agent.id, &final_response)
+                && let Some(guidance) = investigation.final_guidance(&final_response)
             {
                 if final_response.status == TestStatus::Failed
                     && !final_response.evidence.is_empty()
@@ -950,7 +941,6 @@ where
             }
             if failed_verdict_lacks_line_evidence(&final_response)
                 && !is_absence_policy(&agent.instruction)
-                && !investigation.has_matching_fixture_marker(&agent.id)
             {
                 let guidance = "Failed verdicts must include at least one accepted evidence item from a changed line or targeted review-scope context. Use exact path, line, and preview values from the most recent get_hunk_context, get_file_context, or read_file observation, then return the failed verdict again.".to_string();
                 trace(AgentTraceEvent::PrematureFinal {
@@ -975,7 +965,6 @@ where
             )
             .await?
                 && !is_absence_policy(&agent.instruction)
-                && !investigation.has_matching_fixture_marker(&agent.id)
             {
                 trace(AgentTraceEvent::PrematureFinal {
                     step,
@@ -996,7 +985,6 @@ where
                 &grounded.changed_lines,
                 &grounded.relevant_changed_lines,
             ) && !is_absence_policy(&agent.instruction)
-                && !investigation.has_matching_fixture_marker(&agent.id)
             {
                 let guidance = "Failed verdict evidence must cite a substantive line that demonstrates the issue. Do not cite only braces, imports, type aliases, comments, or broad plumbing. Use exact path, line, and preview values from the targeted content observation, then return the failed verdict again.".to_string();
                 trace(AgentTraceEvent::PrematureFinal {
@@ -1015,8 +1003,7 @@ where
                 &final_response,
                 &agent.instruction,
                 &grounded.review_paths,
-            ) && !investigation.has_matching_fixture_marker(&agent.id)
-            {
+            ) {
                 let guidance = format!(
                     "Failed verdict evidence must be tied to the target review file `{target_path}` named by this invariant. Use get_file_context or read_file for `{target_path}`, then return failed only with evidence from that file or its immediate helper context."
                 );
@@ -1037,7 +1024,6 @@ where
                     &final_response,
                     &grounded.full_repo_search_terms,
                 )
-                && !investigation.has_matching_fixture_marker(&agent.id)
             {
                 let guidance = "Full-repo failed verdict evidence must be concretely tied to this invariant's focus terms. Do not cite generic declarations, bundled/minified blobs, or unrelated lines. Search a specific invariant term, inspect a focused source context, and cite a line whose preview itself demonstrates the violation.".to_string();
                 trace(AgentTraceEvent::PrematureFinal {
@@ -1052,9 +1038,7 @@ where
                 );
                 continue;
             }
-            if failed_verdict_is_speculative(&final_response)
-                && !investigation.has_matching_fixture_marker(&agent.id)
-            {
+            if failed_verdict_is_speculative(&final_response) {
                 let guidance = "Failed verdicts must describe a concrete review-scope violation, not a possible gap or something that still requires confirmation. Return failed only with evidence that directly demonstrates the violation; otherwise return passed/no concrete finding.".to_string();
                 trace(AgentTraceEvent::PrematureFinal {
                     step,
@@ -1063,6 +1047,20 @@ where
                 push_history(
                     &mut history,
                     format!("\n\nStep {step} speculative failed verdict rejected:\n{guidance}"),
+                );
+                continue;
+            }
+            if failed_verdict_contradicts_no_finding_language(&final_response) {
+                let guidance = "Your description says the invariant is satisfied, no concrete violation was found, or the verdict is only blocked by coverage. Return `failed` only for a concrete review-scope violation; otherwise return `passed` and let Koochi handle any remaining coverage gate.".to_string();
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: guidance.clone(),
+                });
+                push_history(
+                    &mut history,
+                    format!(
+                        "\n\nStep {step} inconsistent failed verdict rejected:\n{guidance}"
+                    ),
                 );
                 continue;
             }
@@ -1378,7 +1376,7 @@ where
                 observation: executed.observation.clone(),
             });
             investigation.record(executed.kind, &executed.observation);
-            let next_instruction = if investigation.missing_tool_guidance(&agent.id).is_none() {
+            let next_instruction = if investigation.missing_tool_guidance().is_none() {
                 "Required investigation is satisfied. Return the final verdict now. If native tools are available, call final_verdict. Do not call another search tool unless the last observation was empty or unrelated."
             } else {
                 "Return another tool call or a final verdict JSON."
@@ -1437,11 +1435,7 @@ where
         });
     }
 
-    let response = if let Some(response) =
-        investigation.fixture_step_limit_response(&agent.id, agent.severity)
-    {
-        response
-    } else if !coverage.is_complete(inventory.as_ref()) {
+    let response = if !coverage.is_complete(inventory.as_ref()) {
         LlmResponse {
             status: TestStatus::Failed,
             severity: agent.severity,
@@ -1528,14 +1522,10 @@ fn line_numbered_content(content: &str, start_line: u32) -> String {
         .join("\n")
 }
 
-fn direct_verdict_satisfies_investigation(
-    response: &LlmResponse,
-    test_id: &str,
-    investigation: &InvestigationState,
-) -> bool {
+fn direct_verdict_satisfies_investigation(response: &LlmResponse) -> bool {
     match response.status {
         TestStatus::Passed => true,
-        TestStatus::Failed => investigation.has_matching_fixture_marker(test_id),
+        TestStatus::Failed => false,
     }
 }
 
@@ -1800,6 +1790,98 @@ fn failed_verdict_is_speculative(response: &LlmResponse) -> bool {
     .any(|needle| description.contains(needle))
 }
 
+fn failed_verdict_contradicts_no_finding_language(response: &LlmResponse) -> bool {
+    if response.status != TestStatus::Failed {
+        return false;
+    }
+    let description = response.description.to_ascii_lowercase();
+    failed_verdict_reports_no_concrete_finding(&description)
+        || failed_verdict_reports_satisfied_invariant(&description)
+        || failed_verdict_reports_coverage_blocked_pass(&description)
+}
+
+fn failed_verdict_reports_no_concrete_finding(description: &str) -> bool {
+    [
+        "no concrete violation",
+        "no concrete review-scope violation",
+        "no explicit violation",
+        "no violation detected",
+        "no violation found",
+        "no violation has been demonstrated",
+        "no violation is demonstrated",
+        "no violation is evident",
+        "no violation observed",
+        "no concrete finding",
+        "no concrete issue",
+        "no concrete problem",
+        "no explicit failing condition",
+        "no explicit incorrect",
+        "no counterexample",
+        "no violating usage",
+        "lack of a clear violation",
+        "lacks a clear violation",
+        "absence of a concrete violation",
+        "without a concrete violation",
+    ]
+    .iter()
+    .any(|needle| description.contains(needle))
+}
+
+fn failed_verdict_reports_satisfied_invariant(description: &str) -> bool {
+    [
+        "invariant is satisfied",
+        "invariant appears satisfied",
+        "invariant satisfied",
+        "satisfies the invariant",
+        "satisfying the invariant",
+        "aligns with the invariant",
+        "matches the invariant",
+        "target condition is satisfied",
+        "current evidence indicates a pass",
+        "current evidence confirms direct return",
+        "correct final should be passed",
+        "correct final should be pass",
+        "correct outcome is to report a pass",
+        "proper conclusion should be passed",
+        "proper conclusion is passed",
+        "should be passed",
+        "would pass the invariant",
+        "the invariant appears satisfied",
+        "the invariant is satisfied",
+    ]
+    .iter()
+    .any(|needle| description.contains(needle))
+}
+
+fn failed_verdict_reports_coverage_blocked_pass(description: &str) -> bool {
+    [
+        "because coverage",
+        "coverage is incomplete",
+        "coverage was incomplete",
+        "due to coverage",
+        "due to insufficient coverage",
+        "incomplete coverage",
+        "insufficient coverage",
+        "lack full coverage",
+        "lacks full coverage",
+        "not all chunks",
+        "not completed all chunks",
+        "until all chunks",
+        "until every review-scope source chunk",
+        "cannot assert satisfaction",
+        "cannot conclusively declare pass",
+        "cannot declare pass",
+        "cannot declare passed",
+        "cannot return passed",
+        "must withhold final pass",
+        "unable to pass",
+        "we cannot declare pass",
+        "we cannot declare passed",
+    ]
+    .iter()
+    .any(|needle| description.contains(needle))
+}
+
 async fn target_failure_evidence<S>(
     search: &S,
     target_context_line: &Option<(String, u32)>,
@@ -1913,11 +1995,6 @@ fn passed_verdict_contradicts_failure_language(response: &LlmResponse, instructi
         return false;
     }
     let lower = response.description.to_ascii_lowercase();
-    if passed_verdict_explicitly_reports_no_finding(&lower)
-        || passed_verdict_reports_absent_failure_condition(&lower, instruction)
-    {
-        return false;
-    }
     let decisive_contradictions = [
         "should be marked as failed",
         "should be marked failed",
@@ -1978,6 +2055,11 @@ fn passed_verdict_contradicts_failure_language(response: &LlmResponse, instructi
         .any(|needle| lower.contains(needle))
     {
         return true;
+    }
+    if passed_verdict_explicitly_reports_no_finding(&lower)
+        || passed_verdict_reports_absent_failure_condition(&lower, instruction)
+    {
+        return false;
     }
     if passed_verdict_affirms_minimum_that_includes_failure_case(&lower, instruction) {
         return true;
@@ -2815,6 +2897,7 @@ Status semantics:
 - `failed` means a concrete review-scope violation was found.
 - For `Fail if ...` invariants, the fail condition defines unacceptable behavior. If the named code demonstrates that condition, status MUST be `failed`.
 - Do not treat finding the `Fail if` condition as a successful check; finding it is the reason to return `failed`.
+- Never use `failed` to mean inconclusive, insufficiently covered, or unable to pass yet. If no concrete violation is found, return `passed`; Koochi will either accept it or provide more review-scope coverage.
 - When the instruction names a specific backticked function or file, judge that exact target. Safer or unsafe sibling functions are context only unless the named target calls them.
 - Before returning final JSON, make sure `status` agrees with your description and evidence. Never return `passed` while describing a violation, unsafe behavior, missing required control, or triggered fail condition.
 

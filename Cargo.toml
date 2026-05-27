@@ -25,6 +25,6 @@ toml = "0.9"
 tempfile = "3"
 
 [[test]]
-name = "e2e"
-path = "tests/e2e.rs"
+name = "live_provider"
+path = "tests/live_provider.rs"
 required-features = ["integration-tests"]

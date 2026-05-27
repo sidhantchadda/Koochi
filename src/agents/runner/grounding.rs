@@ -369,8 +369,8 @@ fn is_focus_stopword(token: &str) -> bool {
 
 pub(super) fn substantive_changed_line(value: &str) -> bool {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.contains("KOOCHI_SAFE_") || trimmed.contains("KOOCHI_FAIL_") {
-        return !trimmed.is_empty();
+    if trimmed.is_empty() {
+        return false;
     }
     if trimmed.chars().all(|ch| "{}[]();,.".contains(ch)) {
         return false;
