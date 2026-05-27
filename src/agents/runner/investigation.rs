@@ -13,6 +13,22 @@ pub(super) enum ToolKind {
     FindReferences,
 }
 
+impl ToolKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ToolKind::ReviewCoverage => "review_scope_coverage",
+            ToolKind::ListFiles => "list_files",
+            ToolKind::ListReviewHunks => "list_review_hunks",
+            ToolKind::GetHunkContext => "get_hunk_context",
+            ToolKind::SearchText => "search_text",
+            ToolKind::ReadFile => "read_file",
+            ToolKind::GetFileContext => "get_file_context",
+            ToolKind::FindDefinitions => "find_definitions",
+            ToolKind::FindReferences => "find_references",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct InvestigationState {
     observed: HashSet<ToolKind>,

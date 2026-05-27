@@ -20,6 +20,7 @@ pub(crate) fn print_agent_progress(event: &AgentProgressEvent) {
             completed_agents,
             total_agents,
             running_agent_ids,
+            ..
         } => println!(
             "{completed_agents}/{total_agents} invariant agents completed. Last finished: {test_id}. Still running: {}",
             running_agent_ids.join(", ")

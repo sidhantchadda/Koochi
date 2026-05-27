@@ -4,6 +4,7 @@ mod verdict;
 pub use runner::AgentDiagnostics;
 pub use runner::AgentError;
 pub use runner::AgentProgressEvent;
+pub use runner::AgentRunDebugStats;
 pub use runner::AgentTraceEvent;
 pub use runner::EvidenceClassification;
 pub use runner::ReviewScopeInventory;

@@ -491,6 +491,188 @@ async fn pass_waits_until_all_review_scope_coverage_batches_are_delivered() {
 }
 
 #[tokio::test]
+async fn default_diagnostics_do_not_emit_agent_debug_stats() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("changed.rs"), "pub fn changed() {}\n").unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await.unwrap());
+    let bus = Arc::new(ScriptedActionBus::new(vec![
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Passed,
+            severity: None,
+            description: "first pass".to_string(),
+            evidence: Vec::new(),
+        })),
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Passed,
+            severity: None,
+            description: "covered".to_string(),
+            evidence: Vec::new(),
+        })),
+    ]));
+    let mut debug_stats = Vec::new();
+
+    let verdicts = run_agents_with_inventory_and_progress_and_diagnostics(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Pass this invariant.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus,
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+        inventory,
+        AgentDiagnostics::default(),
+        |event| {
+            if let AgentProgressEvent::AgentCompleted {
+                debug_stats: stats, ..
+            } = event
+            {
+                debug_stats.push(stats);
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert_eq!(debug_stats, vec![None]);
+}
+
+#[tokio::test]
+async fn debug_diagnostics_emit_agent_stats_and_dedupe_unique_loc() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn changed() {}\npub fn helper() {}\npub fn third() {}\n",
+    )
+    .unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn changed() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await.unwrap());
+    let bus = Arc::new(ScriptedActionBus::new(vec![
+        Ok(LlmAction::Tool(LlmToolCall::ReadFile {
+            path: "changed.rs".to_string(),
+        })),
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Passed,
+            severity: None,
+            description: "first pass".to_string(),
+            evidence: Vec::new(),
+        })),
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Passed,
+            severity: None,
+            description: "covered".to_string(),
+            evidence: Vec::new(),
+        })),
+    ]));
+    let mut debug_stats = Vec::new();
+
+    let verdicts = run_agents_with_inventory_and_progress_and_diagnostics(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Pass this invariant.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+        inventory,
+        AgentDiagnostics::default().with_debug_analytics(true),
+        |event| {
+            if let AgentProgressEvent::AgentCompleted {
+                debug_stats: stats, ..
+            } = event
+            {
+                debug_stats.push(stats);
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    let stats = debug_stats.pop().flatten().expect("debug stats");
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(stats.test_id, "one");
+    assert_eq!(stats.status, TestStatus::Passed);
+    assert_eq!(stats.llm_calls, 3);
+    assert_eq!(stats.native_tool_calls, 1);
+    assert_eq!(stats.native_final_calls, 2);
+    assert_eq!(stats.coverage_chunks_delivered, 1);
+    assert_eq!(stats.coverage_pass_rejections, 1);
+    assert_eq!(stats.unique_loc_read, 3);
+    assert_eq!(stats.review_scope_loc, 3);
+    assert_eq!(stats.tool_counts.get("read_file"), Some(&1));
+}
+
+#[tokio::test]
 async fn failed_verdict_can_return_before_full_review_scope_coverage() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -2612,9 +2794,7 @@ fn failed_verdict_with_no_finding_or_coverage_language_is_rejected() {
     let real_failure_response = LlmResponse {
         status: TestStatus::Failed,
         severity: Some(Severity::High),
-        description:
-            "Invariant violation detected: the target opens after one stamp."
-                .to_string(),
+        description: "Invariant violation detected: the target opens after one stamp.".to_string(),
         evidence: Vec::new(),
     };
 
@@ -3053,6 +3233,7 @@ async fn tool_cache_coalesces_concurrent_identical_tool_calls() {
                 &search,
                 &cache,
                 &mut evidence,
+                false,
             )
             .await
             .unwrap();
@@ -3068,6 +3249,7 @@ async fn tool_cache_coalesces_concurrent_identical_tool_calls() {
                 &search,
                 &cache,
                 &mut evidence,
+                false,
             )
             .await
             .unwrap();
@@ -3081,6 +3263,53 @@ async fn tool_cache_coalesces_concurrent_identical_tool_calls() {
     let stats = search.stats();
     assert_eq!(stats.search_text_misses, 1);
     assert_eq!(stats.search_text_hits, 0);
+}
+
+#[tokio::test]
+async fn execute_tool_collects_shown_source_lines_only_when_debug_requested() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn first() {}\npub fn second() {}\n",
+    )
+    .unwrap();
+    let search = session(temp.path().to_path_buf());
+    let mut evidence = HashSet::new();
+    let normal_cache = ToolExecutionCache::default();
+    let normal = execute_tool(
+        AgentTurn::ReadFile {
+            path: "lib.rs".to_string(),
+        },
+        &search,
+        &normal_cache,
+        &mut evidence,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(normal.shown_source_lines.is_empty());
+    assert!(evidence.contains(&("lib.rs".to_string(), 1)));
+    assert!(evidence.contains(&("lib.rs".to_string(), 2)));
+
+    let mut debug_evidence = HashSet::new();
+    let debug_cache = ToolExecutionCache::default();
+    let debug = execute_tool(
+        AgentTurn::ReadFile {
+            path: "lib.rs".to_string(),
+        },
+        &search,
+        &debug_cache,
+        &mut debug_evidence,
+        true,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        debug.shown_source_lines,
+        vec![("lib.rs".to_string(), 1), ("lib.rs".to_string(), 2)]
+    );
 }
 
 struct ScriptedToolBus {

@@ -27,6 +27,7 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -107,13 +108,24 @@ struct ReviewSourceChunk {
 #[derive(Debug, Clone, Default)]
 pub struct AgentDiagnostics {
     prompt_dump_dir: Option<PathBuf>,
+    debug_analytics: bool,
 }
 
 impl AgentDiagnostics {
     pub fn with_prompt_dump_dir(path: impl Into<PathBuf>) -> Self {
         Self {
             prompt_dump_dir: Some(path.into()),
+            debug_analytics: false,
         }
+    }
+
+    pub fn with_debug_analytics(mut self, enabled: bool) -> Self {
+        self.debug_analytics = enabled;
+        self
+    }
+
+    fn debug_analytics_enabled(&self) -> bool {
+        self.debug_analytics
     }
 }
 
@@ -149,7 +161,26 @@ pub enum AgentError {
     Join(tokio::task::JoinError),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AgentRunDebugStats {
+    pub test_id: String,
+    pub status: TestStatus,
+    pub elapsed_ms: u128,
+    pub llm_calls: usize,
+    pub native_tool_calls: usize,
+    pub native_final_calls: usize,
+    pub text_fallback_turns: usize,
+    pub tool_cache_hits: usize,
+    pub tool_cache_misses: usize,
+    pub non_progress_terminations: usize,
+    pub coverage_chunks_delivered: usize,
+    pub coverage_pass_rejections: usize,
+    pub unique_loc_read: usize,
+    pub review_scope_loc: u64,
+    pub tool_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum AgentProgressEvent {
     BatchPreparing {
         batch_index: usize,
@@ -166,6 +197,7 @@ pub enum AgentProgressEvent {
         completed_agents: usize,
         total_agents: usize,
         running_agent_ids: Vec<String>,
+        debug_stats: Option<AgentRunDebugStats>,
     },
     ProgressTick {
         completed_agents: usize,
@@ -424,6 +456,7 @@ where
                 completed_agents: completed_agent_count,
                 total_agents: total_agent_count,
                 running_agent_ids,
+                debug_stats: result.debug_stats.clone(),
             });
             indexed_results.push((index, result));
                 }
@@ -595,6 +628,104 @@ struct AgentLoopResult {
     non_progress_terminations: usize,
     coverage_chunks_delivered: usize,
     coverage_pass_rejections: usize,
+    debug_stats: Option<AgentRunDebugStats>,
+}
+
+#[derive(Debug)]
+struct AgentDebugTelemetry {
+    test_id: String,
+    review_scope_loc: u64,
+    tool_counts: BTreeMap<String, usize>,
+    unique_loc_read: HashSet<(String, u32)>,
+}
+
+impl AgentDebugTelemetry {
+    fn new(agent: &AgentSpec, inventory: &ReviewScopeInventory) -> Self {
+        Self {
+            test_id: agent.id.clone(),
+            review_scope_loc: inventory.line_count(),
+            tool_counts: BTreeMap::new(),
+            unique_loc_read: HashSet::new(),
+        }
+    }
+
+    fn record_tool(&mut self, kind: ToolKind) {
+        *self
+            .tool_counts
+            .entry(kind.label().to_string())
+            .or_default() += 1;
+    }
+
+    fn record_lines<I>(&mut self, lines: I)
+    where
+        I: IntoIterator<Item = (String, u32)>,
+    {
+        self.unique_loc_read.extend(lines);
+    }
+
+    fn finish(
+        &self,
+        status: TestStatus,
+        elapsed: Duration,
+        llm_calls: usize,
+        native_tool_calls: usize,
+        native_final_calls: usize,
+        text_fallback_turns: usize,
+        tool_cache_hits: usize,
+        tool_cache_misses: usize,
+        non_progress_terminations: usize,
+        coverage_chunks_delivered: usize,
+        coverage_pass_rejections: usize,
+    ) -> AgentRunDebugStats {
+        AgentRunDebugStats {
+            test_id: self.test_id.clone(),
+            status,
+            elapsed_ms: elapsed.as_millis(),
+            llm_calls,
+            native_tool_calls,
+            native_final_calls,
+            text_fallback_turns,
+            tool_cache_hits,
+            tool_cache_misses,
+            non_progress_terminations,
+            coverage_chunks_delivered,
+            coverage_pass_rejections,
+            unique_loc_read: self.unique_loc_read.len(),
+            review_scope_loc: self.review_scope_loc,
+            tool_counts: self.tool_counts.clone(),
+        }
+    }
+}
+
+fn finish_agent_debug_stats(
+    telemetry: &Option<AgentDebugTelemetry>,
+    response: &LlmResponse,
+    elapsed: Duration,
+    llm_calls: usize,
+    native_tool_calls: usize,
+    native_final_calls: usize,
+    text_fallback_turns: usize,
+    tool_cache_hits: usize,
+    tool_cache_misses: usize,
+    non_progress_terminations: usize,
+    coverage_chunks_delivered: usize,
+    coverage_pass_rejections: usize,
+) -> Option<AgentRunDebugStats> {
+    telemetry.as_ref().map(|telemetry| {
+        telemetry.finish(
+            response.status,
+            elapsed,
+            llm_calls,
+            native_tool_calls,
+            native_final_calls,
+            text_fallback_turns,
+            tool_cache_hits,
+            tool_cache_misses,
+            non_progress_terminations,
+            coverage_chunks_delivered,
+            coverage_pass_rejections,
+        )
+    })
 }
 
 struct GroundedRequest {
@@ -734,6 +865,20 @@ where
 {
     let agent_started = Instant::now();
     let grounded = build_grounded_request(agent, search.as_ref()).await?;
+    let mut debug_telemetry = diagnostics
+        .debug_analytics_enabled()
+        .then(|| AgentDebugTelemetry::new(agent, inventory.as_ref()));
+    if grounded.allows_direct_verdict
+        && let Some(telemetry) = debug_telemetry.as_mut()
+    {
+        telemetry.record_lines(
+            grounded
+                .changed_lines
+                .iter()
+                .filter(|(path, _)| grounded.review_paths.contains(path))
+                .cloned(),
+        );
+    }
     trace(AgentTraceEvent::Started {
         test_id: agent.id.clone(),
         max_steps: max_agent_steps.max(1),
@@ -750,6 +895,21 @@ where
             response: response.clone(),
         });
         trace(AgentTraceEvent::EvidenceClassified { items: Vec::new() });
+        let elapsed = agent_started.elapsed();
+        let debug_stats = finish_agent_debug_stats(
+            &debug_telemetry,
+            &response,
+            elapsed,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
         return Ok(AgentLoopResult {
             response,
             evidence_index: grounded.evidence_index,
@@ -757,7 +917,7 @@ where
             changed_lines: grounded.changed_lines,
             relevant_changed_lines: grounded.relevant_changed_lines,
             review_causal_terms: grounded.review_causal_terms,
-            elapsed: agent_started.elapsed(),
+            elapsed,
             llm_calls: 0,
             native_tool_calls: 0,
             native_final_calls: 0,
@@ -767,6 +927,7 @@ where
             non_progress_terminations: 0,
             coverage_chunks_delivered: 0,
             coverage_pass_rejections: 0,
+            debug_stats,
         });
     }
     let base_prompt = agent_loop_prompt(&agent.id, &grounded.request.instruction);
@@ -898,6 +1059,9 @@ where
                 };
                 for line in &batch.evidence_lines {
                     evidence_index.insert(line.clone());
+                }
+                if let Some(telemetry) = debug_telemetry.as_mut() {
+                    telemetry.record_lines(batch.evidence_lines.iter().cloned());
                 }
                 investigation.record(ToolKind::ReviewCoverage, &batch.observation);
                 trace(AgentTraceEvent::ReviewCoverageDelivered {
@@ -1058,9 +1222,7 @@ where
                 });
                 push_history(
                     &mut history,
-                    format!(
-                        "\n\nStep {step} inconsistent failed verdict rejected:\n{guidance}"
-                    ),
+                    format!("\n\nStep {step} inconsistent failed verdict rejected:\n{guidance}"),
                 );
                 continue;
             }
@@ -1119,6 +1281,21 @@ where
                                 &grounded.relevant_changed_lines,
                             ),
                         });
+                        let elapsed = agent_started.elapsed();
+                        let debug_stats = finish_agent_debug_stats(
+                            &debug_telemetry,
+                            &repaired_response,
+                            elapsed,
+                            llm_calls,
+                            native_tool_calls,
+                            native_final_calls,
+                            text_fallback_turns,
+                            tool_cache_hits,
+                            tool_cache_misses,
+                            non_progress_terminations,
+                            coverage.coverage_chunks_delivered(),
+                            coverage.pass_rejections(),
+                        );
                         return Ok(AgentLoopResult {
                             response: repaired_response,
                             evidence_index,
@@ -1126,7 +1303,7 @@ where
                             changed_lines: grounded.changed_lines,
                             relevant_changed_lines: grounded.relevant_changed_lines,
                             review_causal_terms: grounded.review_causal_terms,
-                            elapsed: agent_started.elapsed(),
+                            elapsed,
                             llm_calls,
                             native_tool_calls,
                             native_final_calls,
@@ -1136,6 +1313,7 @@ where
                             non_progress_terminations,
                             coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
                             coverage_pass_rejections: coverage.pass_rejections(),
+                            debug_stats,
                         });
                     }
                 }
@@ -1163,6 +1341,21 @@ where
                     &grounded.relevant_changed_lines,
                 ),
             });
+            let elapsed = agent_started.elapsed();
+            let debug_stats = finish_agent_debug_stats(
+                &debug_telemetry,
+                &final_response,
+                elapsed,
+                llm_calls,
+                native_tool_calls,
+                native_final_calls,
+                text_fallback_turns,
+                tool_cache_hits,
+                tool_cache_misses,
+                non_progress_terminations,
+                coverage.coverage_chunks_delivered(),
+                coverage.pass_rejections(),
+            );
             return Ok(AgentLoopResult {
                 response: final_response,
                 evidence_index,
@@ -1170,7 +1363,7 @@ where
                 changed_lines: grounded.changed_lines,
                 relevant_changed_lines: grounded.relevant_changed_lines,
                 review_causal_terms: grounded.review_causal_terms,
-                elapsed: agent_started.elapsed(),
+                elapsed,
                 llm_calls,
                 native_tool_calls,
                 native_final_calls,
@@ -1180,6 +1373,7 @@ where
                 non_progress_terminations,
                 coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
                 coverage_pass_rejections: coverage.pass_rejections(),
+                debug_stats,
             });
         } else {
             let tool = describe_turn(&turn);
@@ -1194,6 +1388,7 @@ where
                     search.as_ref(),
                     tool_cache.as_ref(),
                     &mut evidence_index,
+                    debug_telemetry.is_some(),
                 )
                 .await?;
                 if executed.cache_hit {
@@ -1207,6 +1402,7 @@ where
                     cache_hit: executed.cache_hit,
                     observation: executed.observation.clone(),
                 });
+                record_debug_tool(&mut debug_telemetry, &executed, &grounded.review_paths);
                 investigation.record(executed.kind, &executed.observation);
                 let observation_for_prompt =
                     prompt_observation(step, &executed.observation, &mut seen_observations);
@@ -1229,6 +1425,7 @@ where
                         tool_cache.as_ref(),
                         &mut evidence_index,
                         &mut full_repo_rescue_terms,
+                        debug_telemetry.is_some(),
                     )
                     .await?
                 {
@@ -1245,6 +1442,7 @@ where
                             cache_hit: executed.cache_hit,
                             observation: executed.observation.clone(),
                         });
+                        record_debug_tool(&mut debug_telemetry, &executed, &grounded.review_paths);
                         investigation.record(executed.kind, &executed.observation);
                         observations.push(prompt_observation(
                             step,
@@ -1270,6 +1468,7 @@ where
                         search.as_ref(),
                         tool_cache.as_ref(),
                         &mut evidence_index,
+                        debug_telemetry.is_some(),
                     )
                     .await?;
                     if executed.cache_hit {
@@ -1283,6 +1482,7 @@ where
                         cache_hit: executed.cache_hit,
                         observation: executed.observation.clone(),
                     });
+                    record_debug_tool(&mut debug_telemetry, &executed, &grounded.review_paths);
                     investigation.record(executed.kind, &executed.observation);
                     let observation_for_prompt =
                         prompt_observation(step, &executed.observation, &mut seen_observations);
@@ -1312,6 +1512,9 @@ where
                             for line in &batch.evidence_lines {
                                 evidence_index.insert(line.clone());
                             }
+                            if let Some(telemetry) = debug_telemetry.as_mut() {
+                                telemetry.record_lines(batch.evidence_lines.iter().cloned());
+                            }
                             investigation.record(ToolKind::ReviewCoverage, &batch.observation);
                             trace(AgentTraceEvent::ReviewCoverageDelivered {
                                 step,
@@ -1336,6 +1539,21 @@ where
                             response: response.clone(),
                         });
                         trace(AgentTraceEvent::EvidenceClassified { items: Vec::new() });
+                        let elapsed = agent_started.elapsed();
+                        let debug_stats = finish_agent_debug_stats(
+                            &debug_telemetry,
+                            &response,
+                            elapsed,
+                            llm_calls,
+                            native_tool_calls,
+                            native_final_calls,
+                            text_fallback_turns,
+                            tool_cache_hits,
+                            tool_cache_misses,
+                            non_progress_terminations,
+                            coverage.coverage_chunks_delivered(),
+                            coverage.pass_rejections(),
+                        );
                         return Ok(AgentLoopResult {
                             response,
                             evidence_index,
@@ -1343,7 +1561,7 @@ where
                             changed_lines: grounded.changed_lines,
                             relevant_changed_lines: grounded.relevant_changed_lines,
                             review_causal_terms: grounded.review_causal_terms,
-                            elapsed: agent_started.elapsed(),
+                            elapsed,
                             llm_calls,
                             native_tool_calls,
                             native_final_calls,
@@ -1353,6 +1571,7 @@ where
                             non_progress_terminations,
                             coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
                             coverage_pass_rejections: coverage.pass_rejections(),
+                            debug_stats,
                         });
                     }
                 }
@@ -1362,6 +1581,7 @@ where
                 search.as_ref(),
                 tool_cache.as_ref(),
                 &mut evidence_index,
+                debug_telemetry.is_some(),
             )
             .await?;
             if executed.cache_hit {
@@ -1375,6 +1595,7 @@ where
                 cache_hit: executed.cache_hit,
                 observation: executed.observation.clone(),
             });
+            record_debug_tool(&mut debug_telemetry, &executed, &grounded.review_paths);
             investigation.record(executed.kind, &executed.observation);
             let next_instruction = if investigation.missing_tool_guidance().is_none() {
                 "Required investigation is satisfied. Return the final verdict now. If native tools are available, call final_verdict. Do not call another search tool unless the last observation was empty or unrelated."
@@ -1415,6 +1636,21 @@ where
                 &grounded.relevant_changed_lines,
             ),
         });
+        let elapsed = agent_started.elapsed();
+        let debug_stats = finish_agent_debug_stats(
+            &debug_telemetry,
+            &response,
+            elapsed,
+            llm_calls,
+            native_tool_calls,
+            native_final_calls,
+            text_fallback_turns,
+            tool_cache_hits,
+            tool_cache_misses,
+            non_progress_terminations,
+            coverage.coverage_chunks_delivered(),
+            coverage.pass_rejections(),
+        );
         return Ok(AgentLoopResult {
             response,
             evidence_index,
@@ -1422,7 +1658,7 @@ where
             changed_lines: grounded.changed_lines,
             relevant_changed_lines: grounded.relevant_changed_lines,
             review_causal_terms: grounded.review_causal_terms,
-            elapsed: agent_started.elapsed(),
+            elapsed,
             llm_calls,
             native_tool_calls,
             native_final_calls,
@@ -1432,6 +1668,7 @@ where
             non_progress_terminations,
             coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
             coverage_pass_rejections: coverage.pass_rejections(),
+            debug_stats,
         });
     }
 
@@ -1470,6 +1707,21 @@ where
             &grounded.relevant_changed_lines,
         ),
     });
+    let elapsed = agent_started.elapsed();
+    let debug_stats = finish_agent_debug_stats(
+        &debug_telemetry,
+        &response,
+        elapsed,
+        llm_calls,
+        native_tool_calls,
+        native_final_calls,
+        text_fallback_turns,
+        tool_cache_hits,
+        tool_cache_misses,
+        non_progress_terminations,
+        coverage.coverage_chunks_delivered(),
+        coverage.pass_rejections(),
+    );
     Ok(AgentLoopResult {
         response,
         evidence_index,
@@ -1477,7 +1729,7 @@ where
         changed_lines: grounded.changed_lines,
         relevant_changed_lines: grounded.relevant_changed_lines,
         review_causal_terms: grounded.review_causal_terms,
-        elapsed: agent_started.elapsed(),
+        elapsed,
         llm_calls,
         native_tool_calls,
         native_final_calls,
@@ -1487,6 +1739,7 @@ where
         non_progress_terminations,
         coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
         coverage_pass_rejections: coverage.pass_rejections(),
+        debug_stats,
     })
 }
 
@@ -3023,6 +3276,7 @@ struct CachedToolObservation {
     kind: ToolKind,
     observation: String,
     evidence_lines: Vec<(String, u32)>,
+    shown_source_lines: Vec<(String, u32)>,
 }
 
 impl ToolExecutionCache {
@@ -3232,6 +3486,7 @@ async fn execute_tool<S>(
     search: &S,
     cache: &ToolExecutionCache,
     evidence_index: &mut HashSet<(String, u32)>,
+    collect_shown_source_lines: bool,
 ) -> Result<ExecutedTool, AgentError>
 where
     S: CodeSearchApi + ?Sized,
@@ -3253,7 +3508,7 @@ where
         }
         return Ok(ExecutedTool::from_cached(cached, true));
     }
-    let executed = execute_tool_uncached(tool, search).await?;
+    let executed = execute_tool_uncached(tool, search, collect_shown_source_lines).await?;
     for line in &executed.evidence_lines {
         evidence_index.insert(line.clone());
     }
@@ -3314,6 +3569,7 @@ async fn execute_full_repo_rescue<S>(
     cache: &ToolExecutionCache,
     evidence_index: &mut HashSet<(String, u32)>,
     terms: &mut VecDeque<String>,
+    collect_shown_source_lines: bool,
 ) -> Result<Option<Vec<ExecutedTool>>, AgentError>
 where
     S: CodeSearchApi + ?Sized,
@@ -3330,6 +3586,7 @@ where
         search,
         cache,
         evidence_index,
+        collect_shown_source_lines,
     )
     .await?;
     let first_match = first_search_match(&search_result.observation);
@@ -3341,6 +3598,7 @@ where
                 search,
                 cache,
                 evidence_index,
+                collect_shown_source_lines,
             )
             .await?,
         );
@@ -3356,7 +3614,11 @@ fn first_search_match(observation: &str) -> Option<(String, u32)> {
     Some((path, line))
 }
 
-async fn execute_tool_uncached<S>(tool: ToolTurn, search: &S) -> Result<ExecutedTool, AgentError>
+async fn execute_tool_uncached<S>(
+    tool: ToolTurn,
+    search: &S,
+    collect_shown_source_lines: bool,
+) -> Result<ExecutedTool, AgentError>
 where
     S: CodeSearchApi + ?Sized,
     S::Error: Display,
@@ -3413,7 +3675,12 @@ where
                     evidence_lines.push((response.path.clone(), line));
                 }
             }
-            Ok(ExecutedTool::new(
+            let shown_source_lines = if collect_shown_source_lines {
+                evidence_lines.clone()
+            } else {
+                Vec::new()
+            };
+            Ok(ExecutedTool::new_with_shown_lines(
                 ToolKind::GetHunkContext,
                 json!({
                     "hunk_id": response.hunk_id,
@@ -3424,6 +3691,7 @@ where
                 })
                 .to_string(),
                 evidence_lines,
+                shown_source_lines,
             ))
         }
         ToolTurn::SearchText { query, kind } => {
@@ -3459,7 +3727,14 @@ where
             let evidence_lines = (1..=response.line_count)
                 .map(|line| (response.path.clone(), line))
                 .collect::<Vec<_>>();
-            Ok(ExecutedTool::new(
+            let shown_source_lines = if collect_shown_source_lines {
+                (1..=response.line_count.min(MAX_READ_FILE_LINES as u32))
+                    .map(|line| (response.path.clone(), line))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            Ok(ExecutedTool::new_with_shown_lines(
                 ToolKind::ReadFile,
                 json!({
                     "path": response.path,
@@ -3468,6 +3743,7 @@ where
                 })
                 .to_string(),
                 evidence_lines,
+                shown_source_lines,
             ))
         }
         ToolTurn::GetFileContext { path, line } => {
@@ -3493,7 +3769,12 @@ where
                     evidence_lines.push((response.path.clone(), line));
                 }
             }
-            Ok(ExecutedTool::new(
+            let shown_source_lines = if collect_shown_source_lines {
+                evidence_lines.clone()
+            } else {
+                Vec::new()
+            };
+            Ok(ExecutedTool::new_with_shown_lines(
                 ToolKind::GetFileContext,
                 json!({
                     "path": response.path,
@@ -3503,6 +3784,7 @@ where
                 })
                 .to_string(),
                 evidence_lines,
+                shown_source_lines,
             ))
         }
         ToolTurn::FindDefinitions { symbol } => {
@@ -3585,6 +3867,7 @@ struct ExecutedTool {
     kind: ToolKind,
     observation: String,
     evidence_lines: Vec<(String, u32)>,
+    shown_source_lines: Vec<(String, u32)>,
     cache_hit: bool,
 }
 
@@ -3594,6 +3877,22 @@ impl ExecutedTool {
             kind,
             observation,
             evidence_lines,
+            shown_source_lines: Vec::new(),
+            cache_hit: false,
+        }
+    }
+
+    fn new_with_shown_lines(
+        kind: ToolKind,
+        observation: String,
+        evidence_lines: Vec<(String, u32)>,
+        shown_source_lines: Vec<(String, u32)>,
+    ) -> Self {
+        Self {
+            kind,
+            observation,
+            evidence_lines,
+            shown_source_lines,
             cache_hit: false,
         }
     }
@@ -3603,6 +3902,7 @@ impl ExecutedTool {
             kind: cached.kind,
             observation: cached.observation,
             evidence_lines: cached.evidence_lines,
+            shown_source_lines: cached.shown_source_lines,
             cache_hit,
         }
     }
@@ -3612,21 +3912,29 @@ impl ExecutedTool {
             kind: self.kind,
             observation: self.observation.clone(),
             evidence_lines: self.evidence_lines.clone(),
+            shown_source_lines: self.shown_source_lines.clone(),
         }
     }
 
     fn tool_label(&self) -> &'static str {
-        match self.kind {
-            ToolKind::ReviewCoverage => "review_scope_coverage",
-            ToolKind::ListFiles => "list_files",
-            ToolKind::ListReviewHunks => "list_review_hunks",
-            ToolKind::GetHunkContext => "get_hunk_context",
-            ToolKind::SearchText => "search_text",
-            ToolKind::ReadFile => "read_file",
-            ToolKind::GetFileContext => "get_file_context",
-            ToolKind::FindDefinitions => "find_definitions",
-            ToolKind::FindReferences => "find_references",
-        }
+        self.kind.label()
+    }
+}
+
+fn record_debug_tool(
+    debug_telemetry: &mut Option<AgentDebugTelemetry>,
+    executed: &ExecutedTool,
+    review_paths: &HashSet<String>,
+) {
+    if let Some(telemetry) = debug_telemetry.as_mut() {
+        telemetry.record_tool(executed.kind);
+        telemetry.record_lines(
+            executed
+                .shown_source_lines
+                .iter()
+                .filter(|(path, _)| review_paths.contains(path))
+                .cloned(),
+        );
     }
 }
 

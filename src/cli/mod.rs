@@ -1,6 +1,7 @@
 use crate::Severity;
 use crate::agents::AgentDiagnostics;
 use crate::agents::AgentProgressEvent;
+use crate::agents::AgentRunDebugStats;
 use crate::agents::AgentTraceEvent;
 use crate::agents::build_review_scope_inventory;
 use crate::agents::run_agent_with_trace_and_inventory_and_diagnostics;
@@ -206,7 +207,7 @@ pub async fn run(cli: Cli) -> Result<RunExit, CliError> {
     let search = Arc::new(LocalSearchSession::new(scope.clone()));
     let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await?);
     confirm_large_review_scope_if_needed(inventory.as_ref(), cli.yes)?;
-    let agent_diagnostics = agent_diagnostics(&scope.primary_repo.root);
+    let agent_diagnostics = agent_diagnostics(&scope.primary_repo.root, cli.debug);
     let built_bus = build_llm_bus(&config)?;
     if let Some(agent) = trace_agent {
         println!("Tracing 1 agentic invariant: {}", agent.id);
@@ -337,13 +338,14 @@ fn confirm_large_review_scope_if_needed(
     }
 }
 
-fn agent_diagnostics(repo_root: &Path) -> AgentDiagnostics {
+fn agent_diagnostics(repo_root: &Path, debug_analytics: bool) -> AgentDiagnostics {
     AgentDiagnostics::with_prompt_dump_dir(
         repo_root
             .join(".koochi")
             .join("debug")
             .join("prompt-rejections"),
     )
+    .with_debug_analytics(debug_analytics)
 }
 
 async fn write_json_report(
@@ -583,6 +585,15 @@ mod tests {
         let json = std::fs::read_to_string(logs[0].path()).unwrap();
         assert!(json.contains(r#""total_calls""#));
         assert!(json.contains(r#""list_files_calls""#));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["agents"]["total"].as_u64(), Some(1));
+        assert_eq!(parsed["agents"]["runs"].as_array().unwrap().len(), 1);
+        assert!(
+            parsed["agents"]["aggregate"]["prompts"]["mean"]
+                .as_f64()
+                .unwrap()
+                >= 1.0
+        );
     }
 
     #[tokio::test]
