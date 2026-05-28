@@ -1064,6 +1064,45 @@ where
                 );
                 continue;
             }
+            Err(error) if is_provider_invalid_prompt(&error) => {
+                let sanitized_prompt = sanitize_prompt_for_invalid_prompt_retry(&prompt);
+                if sanitized_prompt == prompt {
+                    return Err(contextualize_llm_error(
+                        &agent.id,
+                        step,
+                        prompt_tokens,
+                        &prompt,
+                        diagnostics.as_ref(),
+                        error,
+                    )
+                    .await);
+                }
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: "Provider rejected the original prompt; retrying once with sensitive-data wording generalized.".to_string(),
+                });
+                match bus
+                    .complete_action(LlmRequest {
+                        test_id: agent.id.clone(),
+                        model: agent.model.clone(),
+                        instruction: sanitized_prompt.clone(),
+                    })
+                    .await
+                {
+                    Ok(action) => action,
+                    Err(retry_error) => {
+                        return Err(contextualize_llm_error(
+                            &agent.id,
+                            step,
+                            estimate_tokens(&sanitized_prompt),
+                            &sanitized_prompt,
+                            diagnostics.as_ref(),
+                            retry_error,
+                        )
+                        .await);
+                    }
+                }
+            }
             Err(error) => {
                 return Err(contextualize_llm_error(
                     &agent.id,
@@ -3139,6 +3178,16 @@ fn failure_proof_obligations_prompt(instruction: &str) -> String {
             "- Filesystem path containment invariant: require evidence of a filesystem read/write/serve/trace path derived from user or config input AND evidence that normalization or repository/root containment is missing. Internal relative path calculations, vendored file hashing, and manifest path serialization are not path traversal evidence by themselves.".to_string(),
         );
     }
+    if package_manager_trust_invariant(&lower) {
+        obligations.push(
+            "- Package-manager/lockfile trust invariant: require evidence of package-manager, lockfile, workspace, dependency-resolution, install, script, or command-execution behavior AND evidence that project-controlled metadata can execute commands, escape the repo root, or resolve unintended packages. Module graph traversal and NFT asset tracing alone are not package-manager trust evidence.".to_string(),
+        );
+    }
+    if http_status_boundary_invariant(&lower) {
+        obligations.push(
+            "- HTTP status/error-boundary invariant: require evidence of not-found/error-boundary/redirect/rendering response handling AND evidence of an incorrect HTTP status, cache directive, or response body. Filesystem/package path joins, NFT generation, or deployment manifest paths are not HTTP response status evidence.".to_string(),
+        );
+    }
 
     obligations.join("\n")
 }
@@ -3525,6 +3574,96 @@ fn failed_verdict_lacks_material_proof(
         }
     }
 
+    if package_manager_trust_invariant(&instruction) {
+        let has_package_resolution = contains_any(
+            &evidence,
+            &[
+                "package manager",
+                "package_manager",
+                "lockfile",
+                "workspace",
+                "dependency",
+                "dependencies",
+                "resolve",
+                "resolution",
+                "npm",
+                "pnpm",
+                "yarn",
+                "bun",
+                "package.json",
+            ],
+        );
+        let has_trust_impact = contains_any(
+            &evidence,
+            &[
+                "command",
+                "script",
+                "exec",
+                "execute",
+                "spawn",
+                "repo root",
+                "escape",
+                "unintended package",
+                "project-controlled",
+                "metadata",
+                "trust",
+            ],
+        );
+        if !has_package_resolution || !has_trust_impact {
+            return Some(format!(
+                "Package-manager/lockfile trust failures must cite package/dependency resolution behavior and the command-execution, repo-escape, or unintended-package trust impact. Current evidence is missing {}.",
+                missing_pair(
+                    has_package_resolution,
+                    "package/dependency resolution behavior",
+                    has_trust_impact,
+                    "the command-execution/repo-escape trust impact"
+                )
+            ));
+        }
+    }
+
+    if http_status_boundary_invariant(&instruction) {
+        let has_response_path = contains_any(
+            &evidence,
+            &[
+                "not_found",
+                "not-found",
+                "notfound",
+                "error boundary",
+                "error_boundary",
+                "redirect",
+                "render",
+                "response",
+                "http",
+            ],
+        );
+        let has_status_or_body = contains_any(
+            &evidence,
+            &[
+                "status",
+                "statuscode",
+                "status code",
+                "404",
+                "500",
+                "cache-control",
+                "cache directive",
+                "body",
+                "headers",
+            ],
+        );
+        if !has_response_path || !has_status_or_body {
+            return Some(format!(
+                "HTTP status/error-boundary failures must cite response/error-boundary handling and the incorrect status, cache directive, or response body. Current evidence is missing {}.",
+                missing_pair(
+                    has_response_path,
+                    "response/error-boundary handling",
+                    has_status_or_body,
+                    "the incorrect status/cache/body behavior"
+                )
+            ));
+        }
+    }
+
     None
 }
 
@@ -3617,6 +3756,37 @@ fn filesystem_path_containment_invariant(instruction: &str) -> bool {
                 "repository/root",
             ],
         )
+}
+
+fn package_manager_trust_invariant(instruction: &str) -> bool {
+    contains_any(
+        instruction,
+        &[
+            "package manager",
+            "lockfile",
+            "workspace",
+            "dependency resolution",
+        ],
+    ) && contains_any(
+        instruction,
+        &["execute", "arbitrary commands", "escape the repo root"],
+    )
+}
+
+fn http_status_boundary_invariant(instruction: &str) -> bool {
+    contains_any(
+        instruction,
+        &["not-found", "error boundary", "redirect", "rendering"],
+    ) && contains_any(
+        instruction,
+        &[
+            "http status",
+            "cache directive",
+            "response body",
+            "404",
+            "500",
+        ],
+    )
 }
 
 fn contains_any(value: &str, needles: &[&str]) -> bool {
@@ -4601,6 +4771,54 @@ fn is_provider_invalid_prompt(error: &LlmBusError) -> bool {
     };
     let lower = body.to_ascii_lowercase();
     lower.contains("invalid_prompt") || lower.contains("invalid prompt")
+}
+
+fn sanitize_prompt_for_invalid_prompt_retry(prompt: &str) -> String {
+    let replacements = [
+        ("authorization headers", "access metadata"),
+        ("authorization header", "access metadata"),
+        ("request headers", "request metadata"),
+        ("request header", "request metadata"),
+        ("auth headers", "access metadata"),
+        ("auth header", "access metadata"),
+        ("bearer token", "credential-like value"),
+        ("bearer tokens", "credential-like values"),
+        ("tokens", "credential-like values"),
+        ("token", "credential-like value"),
+        ("cookies", "browser state values"),
+        ("cookie", "browser state value"),
+        ("secrets", "sensitive values"),
+        ("secret", "sensitive value"),
+        ("passwords", "sensitive values"),
+        ("password", "sensitive value"),
+        ("private env values", "non-public configuration values"),
+        ("environment variables", "configuration variables"),
+        ("env variables", "configuration variables"),
+    ];
+    let mut sanitized = prompt.to_string();
+    for (needle, replacement) in replacements {
+        sanitized = replace_ascii_case_insensitive(&sanitized, needle, replacement);
+    }
+    sanitized
+}
+
+fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) -> String {
+    let lower_value = value.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    if !lower_value.contains(&lower_needle) {
+        return value.to_string();
+    }
+
+    let mut result = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while let Some(relative_index) = lower_value[cursor..].find(&lower_needle) {
+        let start = cursor + relative_index;
+        result.push_str(&value[cursor..start]);
+        result.push_str(replacement);
+        cursor = start + needle.len();
+    }
+    result.push_str(&value[cursor..]);
+    result
 }
 
 async fn write_rejected_prompt_dump(

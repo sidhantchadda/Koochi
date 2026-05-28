@@ -2256,6 +2256,47 @@ fn material_proof_gate_rejects_nextjs_false_positive_shapes() {
     )
     .unwrap()
     .contains("Filesystem path"));
+
+    let package_manager_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Module graph changes can trust project metadata.".to_string(),
+        evidence: vec![
+            Evidence {
+                path: "crates/next-api/src/instrumentation.rs".to_string(),
+                line: 189,
+                preview: "NftJsonAsset::new(".to_string(),
+            },
+            Evidence {
+                path: "crates/next-api/src/instrumentation.rs".to_string(),
+                line: 195,
+                preview: "vec![userland_module],".to_string(),
+            },
+        ],
+    };
+    assert!(failed_verdict_lacks_material_proof(
+        &package_manager_false,
+        "Fail if changed package manager, lockfile, workspace, or dependency resolution code trusts project-controlled metadata in a way that can execute arbitrary commands, escape the repo root, or resolve unintended packages."
+    )
+    .unwrap()
+    .contains("Package-manager"));
+
+    let status_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "HTTP status may be wrong.".to_string(),
+        evidence: vec![Evidence {
+            path: "crates/next-api/src/next_server_nft.rs".to_string(),
+            line: 218,
+            preview: "get_next_package(project_path.clone()).await?.join(\"_\")?".to_string(),
+        }],
+    };
+    assert!(failed_verdict_lacks_material_proof(
+        &status_false,
+        "Fail if changed not-found, error boundary, redirect, or rendering code returns an incorrect HTTP status, cache directive, or response body for 404, 500, redirect, or interrupted render paths."
+    )
+    .unwrap()
+    .contains("HTTP status"));
 }
 
 #[test]
@@ -3092,10 +3133,16 @@ async fn invalid_prompt_provider_error_records_prompt_diagnostics() {
     std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
     let search = Arc::new(session(temp.path().to_path_buf()));
     let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await.unwrap());
-    let bus = Arc::new(ScriptedActionBus::new(vec![Err(LlmBusError::HttpStatus {
-        status: reqwest::StatusCode::BAD_REQUEST,
-        body: r#"{"error":{"message":"Invalid prompt","code":"invalid_prompt"}}"#.to_string(),
-    })]));
+    let bus = Arc::new(ScriptedActionBus::new(vec![
+        Err(LlmBusError::HttpStatus {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: r#"{"error":{"message":"Invalid prompt","code":"invalid_prompt"}}"#.to_string(),
+        }),
+        Err(LlmBusError::HttpStatus {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: r#"{"error":{"message":"Invalid prompt","code":"invalid_prompt"}}"#.to_string(),
+        }),
+    ]));
     let dump_dir = temp.path().join(".koochi").join("debug").join("prompts");
     let error = run_agents_with_inventory_and_progress_and_diagnostics(
         vec![AgentSpec {
@@ -3146,6 +3193,63 @@ async fn invalid_prompt_provider_error_records_prompt_diagnostics() {
     assert!(dump.contains("prompt_redacted"));
     assert!(dump.contains("OPENAI_API_KEY=[REDACTED]"));
     assert!(!dump.contains("sk-testsecretvalue1234567890"));
+}
+
+#[tokio::test]
+async fn invalid_prompt_provider_error_retries_with_sanitized_prompt_once() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let bus = Arc::new(ScriptedActionBus::new(vec![
+        Err(LlmBusError::HttpStatus {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: r#"{"error":{"message":"Invalid prompt","code":"invalid_prompt"}}"#.to_string(),
+        }),
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Passed,
+            severity: None,
+            description: "No telemetry exposure found.".to_string(),
+            evidence: Vec::new(),
+        })),
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Passed,
+            severity: None,
+            description: "No telemetry exposure found after coverage.".to_string(),
+            evidence: Vec::new(),
+        })),
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "telemetry-redacts-identifiers".to_string(),
+            name: "telemetry-redacts-identifiers".to_string(),
+            instruction: "Fail if telemetry emits tokens, request headers, cookies, or secrets without redaction.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+}
+
+#[test]
+fn invalid_prompt_retry_sanitizes_sensitive_data_terms() {
+    let prompt = "Find tokens, request headers, cookies, authorization headers, and secrets without redaction.";
+    let sanitized = sanitize_prompt_for_invalid_prompt_retry(prompt);
+    assert!(sanitized.contains("credential-like values"));
+    assert!(sanitized.contains("request metadata"));
+    assert!(sanitized.contains("browser state values"));
+    assert!(sanitized.contains("sensitive values"));
+    assert!(!sanitized.contains("tokens"));
+    assert!(!sanitized.contains("cookies"));
 }
 
 #[test]
