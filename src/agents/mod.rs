@@ -7,6 +7,7 @@ pub use runner::AgentProgressEvent;
 pub use runner::AgentRunDebugStats;
 pub use runner::AgentTraceEvent;
 pub use runner::EvidenceClassification;
+pub use runner::FailureAdjudicationDecision;
 pub use runner::ReviewScopeInventory;
 pub use runner::build_review_scope_inventory;
 pub use runner::run_agent_with_trace;

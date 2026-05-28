@@ -33,6 +33,14 @@ impl FakeLlmBus {
 impl LlmBus for FakeLlmBus {
     async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
         self.requests.lock().await.push(request.clone());
+        if request
+            .instruction
+            .contains("Failure adjudication for Koochi invariant")
+        {
+            return Ok(LlmTextResponse {
+                content: r#"{"decision":"accept_failure","guidance":"Fake provider accepts mechanically valid failed verdicts."}"#.to_string(),
+            });
+        }
         let instruction = fake_test_instruction(&request.instruction);
         if let Some(content) = scripted_response(&request.test_id, instruction, &self.turns).await {
             return Ok(LlmTextResponse { content });

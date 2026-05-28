@@ -198,6 +198,26 @@ pub(crate) fn print_trace_event(event: AgentTraceEvent, verbose: bool) {
             );
             println!("  observation: {}", summarize_observation(&observation));
         }
+        AgentTraceEvent::FailureAdjudicated {
+            step: _,
+            decision,
+            guidance,
+            prompt_tokens,
+        } => {
+            let label = match decision {
+                crate::agents::FailureAdjudicationDecision::AcceptFailure => {
+                    green("accept_failure")
+                }
+                crate::agents::FailureAdjudicationDecision::RejectFailure => {
+                    yellow("reject_failure")
+                }
+                crate::agents::FailureAdjudicationDecision::NeedsMoreContext => {
+                    yellow("needs_more_context")
+                }
+            };
+            println!("  failure adjudication: {label} ({prompt_tokens} tokens)");
+            println!("    {}", compact_for_trace(&guidance, 1200));
+        }
         AgentTraceEvent::FinalVerdict { step: _, response } => {
             println!(
                 "  final: {:?} severity={:?} evidence={}",

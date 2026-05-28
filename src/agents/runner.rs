@@ -23,6 +23,7 @@ use crate::search::GetHunkContextRequest;
 use crate::search::ListFilesRequest;
 use crate::search::ReadFileRequest;
 use crate::search::SearchTextRequest;
+use crate::search::kind_matches;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use serde::Deserialize;
@@ -57,6 +58,7 @@ const MAX_OBSERVATION_CHARS: usize = 12_000;
 const MAX_READ_FILE_LINES: usize = 120;
 const MAX_SEARCH_MATCHES: usize = 40;
 const MAX_REFERENCE_MATCHES: usize = 80;
+const MAX_FAILURE_ADJUDICATION_EVIDENCE: usize = 6;
 const MAX_HUNK_SUMMARY_PREVIEW_LINES: usize = 4;
 const REVIEW_COVERAGE_CHUNK_LINES: usize = MAX_READ_FILE_LINES;
 const MAX_REVIEW_COVERAGE_BATCH_CHARS: usize = 10_000;
@@ -64,10 +66,17 @@ const FULL_REPO_REQUIRED_SEARCH_TERMS: usize = 30;
 
 #[derive(Debug, Clone)]
 pub struct ReviewScopeInventory {
+    coverage_kind: ReviewCoverageKind,
     file_count: usize,
     line_count: u64,
     byte_count: u64,
     chunks: Vec<ReviewSourceChunk>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewCoverageKind {
+    ChangedSourceLines,
+    FullSourceFiles,
 }
 
 impl ReviewScopeInventory {
@@ -91,6 +100,24 @@ impl ReviewScopeInventory {
         REVIEW_COVERAGE_CHUNK_LINES
     }
 
+    pub fn covers_changed_source_lines(&self) -> bool {
+        self.coverage_kind == ReviewCoverageKind::ChangedSourceLines
+    }
+
+    pub fn coverage_loc_label(&self) -> &'static str {
+        match self.coverage_kind {
+            ReviewCoverageKind::ChangedSourceLines => "changed source LOC",
+            ReviewCoverageKind::FullSourceFiles => "source LOC",
+        }
+    }
+
+    pub fn coverage_scope_label(&self) -> &'static str {
+        match self.coverage_kind {
+            ReviewCoverageKind::ChangedSourceLines => "changed source lines",
+            ReviewCoverageKind::FullSourceFiles => "source files",
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.file_count == 0 || self.chunks.is_empty()
     }
@@ -103,6 +130,8 @@ struct ReviewSourceChunk {
     start_line: u32,
     end_line: u32,
     content: String,
+    evidence_lines: Vec<(String, u32)>,
+    debug_line_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -271,6 +300,12 @@ pub enum AgentTraceEvent {
         total_chunks: usize,
         guidance: String,
     },
+    FailureAdjudicated {
+        step: usize,
+        decision: FailureAdjudicationDecision,
+        guidance: String,
+        prompt_tokens: usize,
+    },
     FinalVerdict {
         step: usize,
         response: LlmResponse,
@@ -294,6 +329,21 @@ pub enum EvidenceClassification {
     UnfocusedChanged,
     ReviewContext,
     OutsideReview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureAdjudicationDecision {
+    AcceptFailure,
+    RejectFailure,
+    NeedsMoreContext,
+}
+
+fn failure_adjudication_decision_label(decision: FailureAdjudicationDecision) -> &'static str {
+    match decision {
+        FailureAdjudicationDecision::AcceptFailure => "accept_failure",
+        FailureAdjudicationDecision::RejectFailure => "reject_failure",
+        FailureAdjudicationDecision::NeedsMoreContext => "needs_more_context",
+    }
 }
 
 pub async fn run_agents<S, B>(
@@ -641,7 +691,7 @@ struct AgentDebugTelemetry {
     test_id: String,
     review_scope_loc: u64,
     tool_counts: BTreeMap<String, usize>,
-    unique_loc_read: HashSet<(String, u32)>,
+    unique_loc_read: HashSet<String>,
 }
 
 impl AgentDebugTelemetry {
@@ -664,6 +714,17 @@ impl AgentDebugTelemetry {
     fn record_lines<I>(&mut self, lines: I)
     where
         I: IntoIterator<Item = (String, u32)>,
+    {
+        self.unique_loc_read.extend(
+            lines
+                .into_iter()
+                .map(|(path, line)| format!("{path}:{line}")),
+        );
+    }
+
+    fn record_line_keys<I>(&mut self, lines: I)
+    where
+        I: IntoIterator<Item = String>,
     {
         self.unique_loc_read.extend(lines);
     }
@@ -757,6 +818,7 @@ struct ReviewCoverageState {
 struct ReviewCoverageBatch {
     observation: String,
     evidence_lines: Vec<(String, u32)>,
+    debug_line_keys: Vec<String>,
     chunk_count: usize,
     remaining_chunks: usize,
 }
@@ -791,6 +853,7 @@ impl ReviewCoverageState {
         let mut rendered_chars = 0usize;
         let mut chunks = Vec::new();
         let mut evidence_lines = Vec::new();
+        let mut debug_line_keys = Vec::new();
         while end < inventory.chunks.len() {
             let chunk = &inventory.chunks[end];
             let rendered = coverage_chunk_json(chunk);
@@ -799,8 +862,8 @@ impl ReviewCoverageState {
                 break;
             }
             rendered_chars += rendered_len;
-            evidence_lines
-                .extend((chunk.start_line..=chunk.end_line).map(|line| (chunk.path.clone(), line)));
+            evidence_lines.extend(chunk.evidence_lines.iter().cloned());
+            debug_line_keys.extend(chunk.debug_line_keys.iter().cloned());
             chunks.push(rendered);
             end += 1;
         }
@@ -819,6 +882,7 @@ impl ReviewCoverageState {
             })
             .to_string(),
             evidence_lines,
+            debug_line_keys,
             chunk_count: end - start,
             remaining_chunks,
         })
@@ -954,14 +1018,17 @@ where
     let mut non_progress_terminations = 0;
     let mut non_progress = NonProgressState::default();
     let mut deferred_failed_response = None;
+    let mut rejected_failure_claims: HashMap<String, usize> = HashMap::new();
     let mut contradictory_pass_rejections = 0usize;
     push_history(
         &mut history,
         format!(
-            "\n\nReview-scope coverage gate:\nKoochi has indexed {} source files, {} LOC, and {} deterministic source chunks for this review scope. You may return `failed` as soon as concrete review-scope evidence demonstrates a violation. Koochi will not accept `passed` until it has shown this agent every review-scope source chunk.",
+            "\n\nReview-scope coverage gate:\nKoochi has indexed {} source files, {} {}, and {} deterministic source chunks for this review scope. You may return `failed` as soon as concrete review-scope evidence demonstrates a violation. Koochi will not accept `passed` until it has shown this agent every review-scope {} chunk.",
             inventory.file_count(),
             inventory.line_count(),
-            inventory.chunk_count()
+            inventory.coverage_loc_label(),
+            inventory.chunk_count(),
+            inventory.coverage_scope_label()
         ),
     );
 
@@ -1146,7 +1213,7 @@ where
                     evidence_index.insert(line.clone());
                 }
                 if let Some(telemetry) = debug_telemetry.as_mut() {
-                    telemetry.record_lines(batch.evidence_lines.iter().cloned());
+                    telemetry.record_line_keys(batch.debug_line_keys.iter().cloned());
                 }
                 investigation.record(ToolKind::ReviewCoverage, &batch.observation);
                 trace(AgentTraceEvent::ReviewCoverageDelivered {
@@ -1159,7 +1226,7 @@ where
                 push_history(
                     &mut history,
                     format!(
-                        "\n\nStep {step} passed verdict rejected:\n{guidance}\n\nReview-scope source coverage batch ({} chunks, {} remaining):\n{}\n\nStudy this exact source. Return `failed` immediately if this batch demonstrates a concrete violation. Return `passed` only if you have no concrete finding after Koochi has delivered every review-scope source chunk.",
+                        "\n\nStep {step} passed verdict rejected:\n{guidance}\n\nYou previously found no concrete violation. Continue reviewing the remaining scope. Only switch to `failed` if new evidence proves every material part of the invariant violation.\n\nReview-scope source coverage batch ({} chunks, {} remaining):\n{}\n\nStudy this exact source. Return `failed` immediately if this batch demonstrates a concrete violation. Return `passed` only if you have no concrete finding after Koochi has delivered every review-scope source chunk.",
                         batch.chunk_count, batch.remaining_chunks, batch.observation
                     ),
                 );
@@ -1328,6 +1395,122 @@ where
                     format!("\n\nStep {step} inconsistent failed verdict rejected:\n{guidance}"),
                 );
                 continue;
+            }
+            if final_response.status == TestStatus::Failed && !is_absence_policy(&agent.instruction)
+            {
+                let claim_signature = failure_claim_signature(&final_response);
+                if rejected_failure_claims.contains_key(&claim_signature) {
+                    let guidance = "This failed verdict uses the same cited evidence bundle as a failure claim that Koochi's reduced-context adjudicator already rejected. Add new causal evidence, inspect more targeted context, or return passed/no concrete finding.".to_string();
+                    trace(AgentTraceEvent::PrematureFinal {
+                        step,
+                        guidance: guidance.clone(),
+                    });
+                    if !coverage.is_complete(inventory.as_ref())
+                        && let Some(batch) = coverage.next_batch(inventory.as_ref())
+                    {
+                        for line in &batch.evidence_lines {
+                            evidence_index.insert(line.clone());
+                        }
+                        if let Some(telemetry) = debug_telemetry.as_mut() {
+                            telemetry.record_line_keys(batch.debug_line_keys.iter().cloned());
+                        }
+                        investigation.record(ToolKind::ReviewCoverage, &batch.observation);
+                        trace(AgentTraceEvent::ReviewCoverageDelivered {
+                            step,
+                            delivered_chunks: coverage.delivered_chunks(),
+                            total_chunks: inventory.chunk_count(),
+                            remaining_chunks: batch.remaining_chunks,
+                            observation: batch.observation.clone(),
+                        });
+                        push_history(
+                            &mut history,
+                            format!(
+                                "\n\nStep {step} repeated failed verdict rejected:\n{guidance}\n\nKoochi is continuing review-scope coverage. Coverage batch ({} chunks, {} remaining):\n{}\n\nStudy this exact source. Return `failed` only if this or other new evidence proves the invariant violation; otherwise continue or return `passed` after full coverage.",
+                                batch.chunk_count, batch.remaining_chunks, batch.observation
+                            ),
+                        );
+                    } else {
+                        push_history(
+                            &mut history,
+                            format!(
+                                "\n\nStep {step} repeated failed verdict rejected:\n{guidance}\n\nReturn one targeted tool call for new causal evidence, or return a passed verdict if no concrete review-scope issue remains."
+                            ),
+                        );
+                    }
+                    continue;
+                }
+
+                let adjudication = adjudicate_failed_verdict(
+                    agent,
+                    search.as_ref(),
+                    bus.as_ref(),
+                    diagnostics.as_ref(),
+                    step,
+                    inventory.as_ref(),
+                    &final_response,
+                    &evidence_index,
+                    &grounded.review_paths,
+                    &grounded.changed_lines,
+                    &grounded.relevant_changed_lines,
+                )
+                .await?;
+                llm_calls += 1;
+                trace(AgentTraceEvent::FailureAdjudicated {
+                    step,
+                    decision: adjudication.decision,
+                    guidance: adjudication.guidance.clone(),
+                    prompt_tokens: adjudication.prompt_tokens,
+                });
+                match adjudication.decision {
+                    FailureAdjudicationDecision::AcceptFailure => {}
+                    FailureAdjudicationDecision::RejectFailure
+                    | FailureAdjudicationDecision::NeedsMoreContext => {
+                        *rejected_failure_claims.entry(claim_signature).or_default() += 1;
+                        let decision_label =
+                            failure_adjudication_decision_label(adjudication.decision);
+                        let guidance = format!(
+                            "Failure adjudicator returned `{decision_label}`: {}",
+                            adjudication.guidance
+                        );
+                        trace(AgentTraceEvent::PrematureFinal {
+                            step,
+                            guidance: guidance.clone(),
+                        });
+                        if !coverage.is_complete(inventory.as_ref())
+                            && let Some(batch) = coverage.next_batch(inventory.as_ref())
+                        {
+                            for line in &batch.evidence_lines {
+                                evidence_index.insert(line.clone());
+                            }
+                            if let Some(telemetry) = debug_telemetry.as_mut() {
+                                telemetry.record_line_keys(batch.debug_line_keys.iter().cloned());
+                            }
+                            investigation.record(ToolKind::ReviewCoverage, &batch.observation);
+                            trace(AgentTraceEvent::ReviewCoverageDelivered {
+                                step,
+                                delivered_chunks: coverage.delivered_chunks(),
+                                total_chunks: inventory.chunk_count(),
+                                remaining_chunks: batch.remaining_chunks,
+                                observation: batch.observation.clone(),
+                            });
+                            push_history(
+                                &mut history,
+                                format!(
+                                    "\n\nStep {step} failed verdict rejected by reduced-context adjudication:\n{guidance}\n\nDo not retry the same failure claim with the same cited lines. Koochi is continuing review-scope coverage. Coverage batch ({} chunks, {} remaining):\n{}\n\nStudy this exact source. Return `failed` only if new evidence proves every material part of the invariant violation; otherwise continue or return `passed` after full coverage.",
+                                    batch.chunk_count, batch.remaining_chunks, batch.observation
+                                ),
+                            );
+                        } else {
+                            push_history(
+                                &mut history,
+                                format!(
+                                    "\n\nStep {step} failed verdict rejected by reduced-context adjudication:\n{guidance}\n\nDo not retry the same failure claim with the same cited lines. Return one targeted tool call for new causal evidence, or return a passed verdict if no concrete review-scope issue remains."
+                                ),
+                            );
+                        }
+                        continue;
+                    }
+                }
             }
             if passed_verdict_contradicts_failure_language(&final_response, &agent.instruction) {
                 contradictory_pass_rejections += 1;
@@ -1616,7 +1799,7 @@ where
                                 evidence_index.insert(line.clone());
                             }
                             if let Some(telemetry) = debug_telemetry.as_mut() {
-                                telemetry.record_lines(batch.evidence_lines.iter().cloned());
+                                telemetry.record_line_keys(batch.debug_line_keys.iter().cloned());
                             }
                             investigation.record(ToolKind::ReviewCoverage, &batch.observation);
                             trace(AgentTraceEvent::ReviewCoverageDelivered {
@@ -1629,7 +1812,7 @@ where
                             push_history(
                                 &mut history,
                                 format!(
-                                    "\n\nStep {step} repeated or broad tool use stopped: {reason}\n\nKoochi is continuing review-scope coverage before any pass can be accepted. Coverage batch ({} chunks, {} remaining):\n{}\n\nStudy this exact source. Return `failed` immediately if this batch demonstrates a concrete violation. Return `passed` only after Koochi has delivered every review-scope source chunk.",
+                                    "\n\nStep {step} repeated or broad tool use stopped: {reason}\n\nKoochi is continuing review-scope coverage before any pass can be accepted. You previously have not proven a violation; only switch to `failed` if the new source batch proves every material part of the invariant violation. Coverage batch ({} chunks, {} remaining):\n{}\n\nStudy this exact source. Return `failed` immediately if this batch demonstrates a concrete violation. Return `passed` only after Koochi has delivered every review-scope source chunk.",
                                     batch.chunk_count, batch.remaining_chunks, batch.observation
                                 ),
                             );
@@ -1726,52 +1909,94 @@ where
             &grounded.review_paths,
         )
         .is_none()
-    {
-        trace(AgentTraceEvent::StepLimit {
-            response: response.clone(),
-        });
-        trace(AgentTraceEvent::EvidenceClassified {
-            items: classify_evidence(
-                &response.evidence,
-                &evidence_index,
-                &grounded.review_paths,
-                &grounded.changed_lines,
-                &grounded.relevant_changed_lines,
-            ),
-        });
-        let elapsed = agent_started.elapsed();
-        let debug_stats = finish_agent_debug_stats(
-            &debug_telemetry,
+        && !failed_verdict_lacks_substantive_accepted_evidence(
             &response,
-            elapsed,
-            llm_calls,
-            native_tool_calls,
-            native_final_calls,
-            text_fallback_turns,
-            tool_cache_hits,
-            tool_cache_misses,
-            non_progress_terminations,
-            coverage.coverage_chunks_delivered(),
-            coverage.pass_rejections(),
-        );
-        return Ok(AgentLoopResult {
-            response,
-            evidence_index,
-            review_paths: grounded.review_paths,
-            changed_lines: grounded.changed_lines,
-            relevant_changed_lines: grounded.relevant_changed_lines,
-            review_causal_terms: grounded.review_causal_terms,
-            elapsed,
-            llm_calls,
-            native_tool_calls,
-            native_final_calls,
-            text_fallback_turns,
-            tool_cache_hits,
-            tool_cache_misses,
-            non_progress_terminations,
-            coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
-            coverage_pass_rejections: coverage.pass_rejections(),
-            debug_stats,
+            &evidence_index,
+            &grounded.review_paths,
+            &grounded.changed_lines,
+            &grounded.relevant_changed_lines,
+        )
+        && !failed_verdict_is_speculative(&response)
+        && !failed_verdict_contradicts_no_finding_language(&response)
+    {
+        let adjudication = adjudicate_failed_verdict(
+            agent,
+            search.as_ref(),
+            bus.as_ref(),
+            diagnostics.as_ref(),
+            max_agent_steps.max(1),
+            inventory.as_ref(),
+            &response,
+            &evidence_index,
+            &grounded.review_paths,
+            &grounded.changed_lines,
+            &grounded.relevant_changed_lines,
+        )
+        .await?;
+        llm_calls += 1;
+        trace(AgentTraceEvent::FailureAdjudicated {
+            step: max_agent_steps.max(1),
+            decision: adjudication.decision,
+            guidance: adjudication.guidance.clone(),
+            prompt_tokens: adjudication.prompt_tokens,
+        });
+        if matches!(
+            adjudication.decision,
+            FailureAdjudicationDecision::AcceptFailure
+        ) {
+            trace(AgentTraceEvent::StepLimit {
+                response: response.clone(),
+            });
+            trace(AgentTraceEvent::EvidenceClassified {
+                items: classify_evidence(
+                    &response.evidence,
+                    &evidence_index,
+                    &grounded.review_paths,
+                    &grounded.changed_lines,
+                    &grounded.relevant_changed_lines,
+                ),
+            });
+            let elapsed = agent_started.elapsed();
+            let debug_stats = finish_agent_debug_stats(
+                &debug_telemetry,
+                &response,
+                elapsed,
+                llm_calls,
+                native_tool_calls,
+                native_final_calls,
+                text_fallback_turns,
+                tool_cache_hits,
+                tool_cache_misses,
+                non_progress_terminations,
+                coverage.coverage_chunks_delivered(),
+                coverage.pass_rejections(),
+            );
+            return Ok(AgentLoopResult {
+                response,
+                evidence_index,
+                review_paths: grounded.review_paths,
+                changed_lines: grounded.changed_lines,
+                relevant_changed_lines: grounded.relevant_changed_lines,
+                review_causal_terms: grounded.review_causal_terms,
+                elapsed,
+                llm_calls,
+                native_tool_calls,
+                native_final_calls,
+                text_fallback_turns,
+                tool_cache_hits,
+                tool_cache_misses,
+                non_progress_terminations,
+                coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
+                coverage_pass_rejections: coverage.pass_rejections(),
+                debug_stats,
+            });
+        }
+        trace(AgentTraceEvent::PrematureFinal {
+            step: max_agent_steps.max(1),
+            guidance: format!(
+                "Deferred failed verdict rejected by reduced-context adjudication: {}",
+                adjudication.guidance
+            ),
         });
     }
 
@@ -1865,7 +2090,7 @@ fn coverage_chunk_json(chunk: &ReviewSourceChunk) -> serde_json::Value {
         "path": chunk.path,
         "start_line": chunk.start_line,
         "end_line": chunk.end_line,
-        "content": line_numbered_content(&chunk.content, chunk.start_line),
+        "content": chunk.content,
     })
 }
 
@@ -2666,6 +2891,296 @@ fn failed_verdict_reports_coverage_blocked_pass(description: &str) -> bool {
     ]
     .iter()
     .any(|needle| description.contains(needle))
+}
+
+#[derive(Debug, Clone)]
+struct FailureAdjudication {
+    decision: FailureAdjudicationDecision,
+    guidance: String,
+    prompt_tokens: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailureAdjudicationJson {
+    decision: FailureAdjudicationDecisionJson,
+    #[serde(default)]
+    guidance: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureAdjudicationDecisionJson {
+    AcceptFailure,
+    RejectFailure,
+    NeedsMoreContext,
+}
+
+impl From<FailureAdjudicationDecisionJson> for FailureAdjudicationDecision {
+    fn from(value: FailureAdjudicationDecisionJson) -> Self {
+        match value {
+            FailureAdjudicationDecisionJson::AcceptFailure => {
+                FailureAdjudicationDecision::AcceptFailure
+            }
+            FailureAdjudicationDecisionJson::RejectFailure => {
+                FailureAdjudicationDecision::RejectFailure
+            }
+            FailureAdjudicationDecisionJson::NeedsMoreContext => {
+                FailureAdjudicationDecision::NeedsMoreContext
+            }
+        }
+    }
+}
+
+async fn adjudicate_failed_verdict<S, B>(
+    agent: &AgentSpec,
+    search: &S,
+    bus: &B,
+    diagnostics: &AgentDiagnostics,
+    step: usize,
+    inventory: &ReviewScopeInventory,
+    response: &LlmResponse,
+    evidence_index: &HashSet<(String, u32)>,
+    review_paths: &HashSet<String>,
+    changed_lines: &HashSet<(String, u32)>,
+    relevant_changed_lines: &HashSet<(String, u32)>,
+) -> Result<FailureAdjudication, AgentError>
+where
+    S: CodeSearchApi + ?Sized,
+    S::Error: Display,
+    B: LlmBus + ?Sized,
+{
+    let prompt = failure_adjudication_prompt(
+        agent,
+        search,
+        inventory,
+        response,
+        evidence_index,
+        review_paths,
+        changed_lines,
+        relevant_changed_lines,
+    )
+    .await?;
+    let prompt_tokens = estimate_tokens(&prompt);
+    let adjudication_test_id = format!("{}:failure-adjudication", agent.id);
+    let text = match bus
+        .complete_text(LlmRequest {
+            test_id: adjudication_test_id.clone(),
+            model: agent.model.clone(),
+            instruction: prompt.clone(),
+        })
+        .await
+    {
+        Ok(response) => response.content,
+        Err(error) => {
+            return Err(contextualize_llm_error(
+                &adjudication_test_id,
+                step,
+                prompt_tokens,
+                &prompt,
+                diagnostics,
+                error,
+            )
+            .await);
+        }
+    };
+
+    let mut adjudication =
+        parse_failure_adjudication_response(&text).unwrap_or_else(|| FailureAdjudication {
+            decision: FailureAdjudicationDecision::NeedsMoreContext,
+            guidance: format!(
+                "Failure adjudicator did not return valid adjudication JSON: {}",
+                compact_text(&text, 500)
+            ),
+            prompt_tokens,
+        });
+    adjudication.prompt_tokens = prompt_tokens;
+    Ok(adjudication)
+}
+
+async fn failure_adjudication_prompt<S>(
+    agent: &AgentSpec,
+    search: &S,
+    inventory: &ReviewScopeInventory,
+    response: &LlmResponse,
+    evidence_index: &HashSet<(String, u32)>,
+    review_paths: &HashSet<String>,
+    changed_lines: &HashSet<(String, u32)>,
+    relevant_changed_lines: &HashSet<(String, u32)>,
+) -> Result<String, AgentError>
+where
+    S: CodeSearchApi + ?Sized,
+    S::Error: Display,
+{
+    let evidence_bundle = failure_evidence_bundle(
+        search,
+        response,
+        evidence_index,
+        review_paths,
+        changed_lines,
+        relevant_changed_lines,
+    )
+    .await;
+    let candidate = serde_json::to_string_pretty(&json!({
+        "description": response.description.clone(),
+        "evidence": response.evidence.clone(),
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+    let evidence_bundle =
+        serde_json::to_string_pretty(&evidence_bundle).unwrap_or_else(|_| "[]".to_string());
+    let review_scope = serde_json::to_string_pretty(&json!({
+        "coverage_kind": inventory.coverage_scope_label(),
+        "source_files": inventory.file_count(),
+        "loc": inventory.line_count(),
+        "chunks": inventory.chunk_count(),
+        "changed_line_count": changed_lines.len(),
+        "relevant_changed_line_count": relevant_changed_lines.len(),
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+
+    Ok(format!(
+        r#"Failure adjudication for Koochi invariant.
+
+You are a fresh reduced-context verifier. Decide whether the candidate failed verdict is actually proven by the cited evidence. Do not rely on the previous agent's conversation, search history, or confidence.
+
+Decision semantics:
+- `accept_failure`: the cited evidence and context prove a concrete review-scope violation of every material part of the invariant.
+- `reject_failure`: the evidence is only lexically related, speculative, generic plumbing, a nearby but different concept, or does not prove the invariant.
+- `needs_more_context`: the evidence could become meaningful, but the bundle lacks a necessary source/sink/guard/caller/callee line to prove or reject the failure.
+
+Be skeptical. Terms that overlap with the invariant are discovery hints, not proof. For data-flow or cache/privacy/security invariants, require a causal chain: source of unsafe data or action, sink/behavior, missing guard/key/scope, and why the review-scope code creates or affects that path. Distinguish build/deployment metadata caches from runtime user/request data caches.
+
+Invariant:
+{invariant}
+
+Review scope facts:
+{review_scope}
+
+Candidate failed verdict:
+{candidate}
+
+Cited evidence bundle:
+{evidence_bundle}
+
+Return only JSON:
+{{"decision":"accept_failure","guidance":"one short reason"}}
+{{"decision":"reject_failure","guidance":"one short reason"}}
+{{"decision":"needs_more_context","guidance":"name the exact missing context needed"}}"#,
+        invariant = agent.instruction,
+        review_scope = review_scope,
+        candidate = candidate,
+        evidence_bundle = evidence_bundle
+    ))
+}
+
+async fn failure_evidence_bundle<S>(
+    search: &S,
+    response: &LlmResponse,
+    evidence_index: &HashSet<(String, u32)>,
+    review_paths: &HashSet<String>,
+    changed_lines: &HashSet<(String, u32)>,
+    relevant_changed_lines: &HashSet<(String, u32)>,
+) -> Vec<serde_json::Value>
+where
+    S: CodeSearchApi + ?Sized,
+    S::Error: Display,
+{
+    let classifications = classify_evidence(
+        &response.evidence,
+        evidence_index,
+        review_paths,
+        changed_lines,
+        relevant_changed_lines,
+    );
+    let mut bundle = Vec::new();
+    for (evidence, classification) in response.evidence.iter().zip(classifications) {
+        if !classification.accepted {
+            continue;
+        }
+        if bundle.len() >= MAX_FAILURE_ADJUDICATION_EVIDENCE {
+            break;
+        }
+        let key = (evidence.path.clone(), evidence.line);
+        let context = match search
+            .get_file_context(GetFileContextRequest {
+                path: evidence.path.clone(),
+                line: evidence.line,
+            })
+            .await
+        {
+            Ok(context) if context.start_line > 0 => json!({
+                "start_line": context.start_line,
+                "end_line": context.end_line,
+                "content": line_numbered_content(&context.content, context.start_line),
+            }),
+            Ok(_) => json!({"error": "empty file context"}),
+            Err(err) => json!({"error": err.to_string()}),
+        };
+        bundle.push(json!({
+            "path": evidence.path.clone(),
+            "line": evidence.line,
+            "preview": evidence.preview.clone(),
+            "classification": evidence_classification_label(classification.classification),
+            "is_changed_line": changed_lines.contains(&key),
+            "is_focus_matched_changed_line": relevant_changed_lines.contains(&key),
+            "context": context,
+        }));
+    }
+    bundle
+}
+
+fn parse_failure_adjudication_response(content: &str) -> Option<FailureAdjudication> {
+    let json = extract_json_object(content).unwrap_or(content).trim();
+    if let Ok(response) = serde_json::from_str::<FailureAdjudicationJson>(json) {
+        let decision = FailureAdjudicationDecision::from(response.decision);
+        let guidance = if response.guidance.trim().is_empty() {
+            format!(
+                "Adjudicator returned `{}`.",
+                failure_adjudication_decision_label(decision)
+            )
+        } else {
+            response.guidance.trim().to_string()
+        };
+        return Some(FailureAdjudication {
+            decision,
+            guidance,
+            prompt_tokens: 0,
+        });
+    }
+
+    parse_verdict_with_default_status(content, None)
+        .ok()
+        .map(|response| FailureAdjudication {
+            decision: match response.status {
+                TestStatus::Failed => FailureAdjudicationDecision::AcceptFailure,
+                TestStatus::Passed => FailureAdjudicationDecision::RejectFailure,
+            },
+            guidance: response.description,
+            prompt_tokens: 0,
+        })
+}
+
+fn evidence_classification_label(classification: EvidenceClassification) -> &'static str {
+    match classification {
+        EvidenceClassification::Changed => "changed",
+        EvidenceClassification::UnfocusedChanged => "unfocused_changed",
+        EvidenceClassification::ReviewContext => "review_context",
+        EvidenceClassification::OutsideReview => "outside_review",
+    }
+}
+
+fn failure_claim_signature(response: &LlmResponse) -> String {
+    let mut evidence_lines = response
+        .evidence
+        .iter()
+        .map(|evidence| format!("{}:{}", normalize_tool_path(&evidence.path), evidence.line))
+        .collect::<Vec<_>>();
+    evidence_lines.sort();
+    evidence_lines.dedup();
+    if evidence_lines.is_empty() {
+        compact_text(&response.description.to_ascii_lowercase(), 200)
+    } else {
+        evidence_lines.join("|")
+    }
 }
 
 async fn target_failure_evidence<S>(
@@ -3693,7 +4208,7 @@ Status semantics:
 
 You may either request one tool call or return the final verdict.
 
-Koochi enforces review-scope coverage outside the prompt. You may return `failed` as soon as concrete evidence demonstrates a violation. Koochi will reject `passed` until it has shown this agent every review-scope source chunk: all source files in `--all`/full-repo mode, or changed source files in commit, range, and local-change modes.
+Koochi enforces review-scope coverage outside the prompt. You may return `failed` as soon as concrete evidence demonstrates a violation. Koochi will reject `passed` until it has shown this agent every review-scope source chunk: all source files in `--all`/full-repo mode, or changed source lines in commit, range, and local-change modes.
 
 Tool call JSON forms:
 {{"action":"list_files","kind":"source"}}
@@ -4057,6 +4572,21 @@ where
     S: CodeSearchApi + ?Sized,
     S::Error: Display,
 {
+    if !matches!(
+        search.review_mode(),
+        Some(ReviewMode::FullRepo | ReviewMode::FullRepoFallback)
+    ) {
+        return build_changed_source_inventory(search).await;
+    }
+
+    build_full_source_inventory(search).await
+}
+
+async fn build_full_source_inventory<S>(search: &S) -> Result<ReviewScopeInventory, AgentError>
+where
+    S: CodeSearchApi + ?Sized,
+    S::Error: Display,
+{
     let mut files = search
         .list_review_files(ListFilesRequest {
             kind: FileKind::Source,
@@ -4082,17 +4612,122 @@ where
         for (chunk_index, chunk_lines) in lines.chunks(REVIEW_COVERAGE_CHUNK_LINES).enumerate() {
             let start_line = (chunk_index * REVIEW_COVERAGE_CHUNK_LINES + 1) as u32;
             let end_line = start_line + chunk_lines.len() as u32 - 1;
+            let content = chunk_lines.join("\n");
             chunks.push(ReviewSourceChunk {
                 index: chunks.len(),
                 path: response.path.clone(),
                 start_line,
                 end_line,
-                content: chunk_lines.join("\n"),
+                content: line_numbered_content(&content, start_line),
+                evidence_lines: (start_line..=end_line)
+                    .map(|line| (response.path.clone(), line))
+                    .collect(),
+                debug_line_keys: (start_line..=end_line)
+                    .map(|line| format!("{}:{line}", response.path))
+                    .collect(),
             });
         }
     }
 
     Ok(ReviewScopeInventory {
+        coverage_kind: ReviewCoverageKind::FullSourceFiles,
+        file_count,
+        line_count,
+        byte_count,
+        chunks,
+    })
+}
+
+async fn build_changed_source_inventory<S>(search: &S) -> Result<ReviewScopeInventory, AgentError>
+where
+    S: CodeSearchApi + ?Sized,
+    S::Error: Display,
+{
+    let mut hunks = search
+        .list_review_hunks()
+        .await
+        .map_err(|err| AgentError::Search(err.to_string()))?
+        .hunks;
+    hunks.retain(|hunk| kind_matches(&hunk.path, FileKind::Source));
+    hunks.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.new_start.cmp(&right.new_start))
+            .then(left.old_start.cmp(&right.old_start))
+            .then(left.id.cmp(&right.id))
+    });
+
+    let file_count = hunks
+        .iter()
+        .map(|hunk| hunk.path.clone())
+        .collect::<HashSet<_>>()
+        .len();
+    let mut line_count = 0u64;
+    let mut byte_count = 0u64;
+    let mut chunks = Vec::new();
+
+    for hunk in hunks {
+        let changed_lines = hunk
+            .lines
+            .iter()
+            .filter(|line| {
+                matches!(
+                    line.kind,
+                    crate::scope::ReviewLineKind::Added | crate::scope::ReviewLineKind::Removed
+                )
+            })
+            .collect::<Vec<_>>();
+        if changed_lines.is_empty() {
+            continue;
+        }
+
+        for chunk_lines in changed_lines.chunks(REVIEW_COVERAGE_CHUNK_LINES) {
+            let mut rendered_lines = Vec::new();
+            let mut evidence_lines = Vec::new();
+            let mut debug_line_keys = Vec::new();
+            let mut min_line = u32::MAX;
+            let mut max_line = 0u32;
+            for line in chunk_lines {
+                let (prefix, line_number) = match line.kind {
+                    crate::scope::ReviewLineKind::Added => ("+", line.new_line),
+                    crate::scope::ReviewLineKind::Removed => ("-", line.old_line),
+                    crate::scope::ReviewLineKind::Context => (" ", line.new_line.or(line.old_line)),
+                };
+                let Some(line_number) = line_number else {
+                    continue;
+                };
+                min_line = min_line.min(line_number);
+                max_line = max_line.max(line_number);
+                line_count += 1;
+                byte_count += line.content.len() as u64;
+                rendered_lines.push(format!("{prefix}{line_number}: {}", line.content));
+                evidence_lines.push((hunk.path.clone(), line_number));
+                let debug_line_key = match line.kind {
+                    crate::scope::ReviewLineKind::Added => format!("{}:{line_number}", hunk.path),
+                    crate::scope::ReviewLineKind::Removed => {
+                        format!("{}:-{line_number}", hunk.path)
+                    }
+                    crate::scope::ReviewLineKind::Context => format!("{}:{line_number}", hunk.path),
+                };
+                debug_line_keys.push(debug_line_key);
+            }
+            if rendered_lines.is_empty() {
+                continue;
+            }
+            chunks.push(ReviewSourceChunk {
+                index: chunks.len(),
+                path: hunk.path.clone(),
+                start_line: min_line,
+                end_line: max_line,
+                content: rendered_lines.join("\n"),
+                evidence_lines,
+                debug_line_keys,
+            });
+        }
+    }
+
+    Ok(ReviewScopeInventory {
+        coverage_kind: ReviewCoverageKind::ChangedSourceLines,
         file_count,
         line_count,
         byte_count,

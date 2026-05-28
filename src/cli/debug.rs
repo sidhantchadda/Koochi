@@ -13,6 +13,7 @@ pub(crate) struct DebugRunStats {
     non_progress_terminations: usize,
     coverage_source_files: usize,
     coverage_loc: u64,
+    coverage_loc_label: &'static str,
     coverage_bytes: u64,
     coverage_chunks: usize,
     coverage_chunk_line_limit: usize,
@@ -26,6 +27,7 @@ impl DebugRunStats {
     pub(crate) fn set_inventory(&mut self, inventory: &crate::agents::ReviewScopeInventory) {
         self.coverage_source_files = inventory.file_count();
         self.coverage_loc = inventory.line_count();
+        self.coverage_loc_label = inventory.coverage_loc_label();
         self.coverage_bytes = inventory.byte_count();
         self.coverage_chunks = inventory.chunk_count();
         self.coverage_chunk_line_limit = inventory.chunk_line_limit();
@@ -79,6 +81,9 @@ impl DebugRunStats {
             } else if action.starts_with("text ") {
                 self.text_fallback_turns += 1;
             }
+        }
+        if matches!(event, AgentTraceEvent::FailureAdjudicated { .. }) {
+            self.llm_turns += 1;
         }
         if let AgentTraceEvent::ToolExecuted { cache_hit, .. } = event {
             if *cache_hit {
@@ -149,9 +154,10 @@ pub(crate) fn print_debug_report(
     );
     if debug.coverage_source_files > 0 {
         println!(
-            "  review coverage: {} source files, {} LOC, {} chunks ({} lines/chunk)",
+            "  review coverage: {} source files, {} {}, {} chunks ({} lines/chunk)",
             format_count(debug.coverage_source_files as u64),
             format_count(debug.coverage_loc),
+            debug.coverage_loc_label,
             format_count(debug.coverage_chunks as u64),
             debug.coverage_chunk_line_limit
         );
@@ -219,6 +225,7 @@ struct DebugReviewLog {
 struct DebugCoverageLog {
     source_files: usize,
     loc: u64,
+    loc_label: &'static str,
     bytes: u64,
     chunks: usize,
     chunk_line_limit: usize,
@@ -360,6 +367,7 @@ fn build_debug_log(
             coverage: DebugCoverageLog {
                 source_files: debug.coverage_source_files,
                 loc: debug.coverage_loc,
+                loc_label: debug.coverage_loc_label,
                 bytes: debug.coverage_bytes,
                 chunks: debug.coverage_chunks,
                 chunk_line_limit: debug.coverage_chunk_line_limit,

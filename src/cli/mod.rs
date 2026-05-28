@@ -316,11 +316,19 @@ fn confirm_large_review_scope_if_needed(
             files: inventory.file_count(),
         });
     }
-    print!(
-        "Review scope contains {} LOC across {} source files. Each agent must review all of it before passing. Continue? [y/N] ",
-        inventory.line_count(),
-        inventory.file_count()
-    );
+    if inventory.covers_changed_source_lines() {
+        print!(
+            "Review scope contains {} changed source LOC across {} source files. Each agent must review those changed lines before passing. Continue? [y/N] ",
+            inventory.line_count(),
+            inventory.file_count()
+        );
+    } else {
+        print!(
+            "Review scope contains {} LOC across {} source files. Each agent must review all of it before passing. Continue? [y/N] ",
+            inventory.line_count(),
+            inventory.file_count()
+        );
+    }
     std::io::stdout()
         .flush()
         .map_err(CliError::ReadConfirmation)?;

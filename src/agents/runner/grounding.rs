@@ -77,7 +77,7 @@ where
         )
     } else {
         format!(
-            "{file_inventory}\n\n{focus_summary}\n\nKoochi will not accept a passed verdict until it has shown this agent every review-scope source chunk. In commit, range, and local-change modes, review-scope source files are the changed source files for that review target. Only fail when the concrete issue is in one of these review-scope files. You may use list_files, search_text, read_file, get_file_context, find_definitions, or find_references to gather context from the wider repository when needed, but final failed evidence must come from review-scope files or delivered coverage chunks."
+            "{file_inventory}\n\n{focus_summary}\n\nKoochi will not accept a passed verdict until it has shown this agent every review-scope source chunk. In commit, range, and local-change modes, review-scope coverage is the changed source lines for that review target, not the full contents of every changed file. Only fail when the concrete issue is in one of these review-scope files. You may use list_files, search_text, read_file, get_file_context, find_definitions, or find_references to gather context from the wider repository when needed, but final failed evidence must come from review-scope files or delivered coverage chunks."
         )
     };
     let evidence_index = HashSet::new();

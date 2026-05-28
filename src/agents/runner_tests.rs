@@ -344,7 +344,7 @@ async fn review_scope_inventory_chunks_source_lines() {
 }
 
 #[tokio::test]
-async fn commit_mode_inventory_reads_only_review_scope_source_files() {
+async fn commit_mode_inventory_uses_changed_source_hunks_without_reading_files() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("changed.rs"), "pub fn changed() {}\n").unwrap();
     std::fs::write(temp.path().join("unchanged.rs"), "pub fn unchanged() {}\n").unwrap();
@@ -358,7 +358,36 @@ async fn commit_mode_inventory_reads_only_review_scope_source_files() {
         review: ReviewScope {
             mode: ReviewMode::HeadCommit,
             files: vec!["changed.rs".to_string(), "notes.md".to_string()],
-            hunks: Vec::new(),
+            hunks: vec![
+                ReviewHunk {
+                    id: "changed.rs#1".to_string(),
+                    path: "changed.rs".to_string(),
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec![ReviewHunkLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "pub fn changed() {}".to_string(),
+                    }],
+                },
+                ReviewHunk {
+                    id: "notes.md#1".to_string(),
+                    path: "notes.md".to_string(),
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec![ReviewHunkLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "# notes".to_string(),
+                    }],
+                },
+            ],
             commit: None,
         },
         accessible_repos: Vec::new(),
@@ -390,7 +419,7 @@ async fn commit_mode_inventory_reads_only_review_scope_source_files() {
 
     assert_eq!(verdicts[0].status, TestStatus::Passed);
     let stats = search.stats();
-    assert_eq!(stats.read_file_misses, 1);
+    assert_eq!(stats.read_file_misses, 0);
     assert_eq!(stats.read_file_hits, 0);
 }
 
@@ -708,7 +737,7 @@ async fn debug_diagnostics_emit_agent_stats_and_dedupe_unique_loc() {
     assert_eq!(stats.coverage_chunks_delivered, 1);
     assert_eq!(stats.coverage_pass_rejections, 1);
     assert_eq!(stats.unique_loc_read, 3);
-    assert_eq!(stats.review_scope_loc, 3);
+    assert_eq!(stats.review_scope_loc, 1);
     assert_eq!(stats.tool_counts.get("read_file"), Some(&1));
 }
 
@@ -902,7 +931,7 @@ async fn failed_verdict_can_return_before_full_review_scope_coverage() {
     .unwrap();
 
     assert_eq!(verdicts[0].status, TestStatus::Failed);
-    assert_eq!(bus.request_count().await, 2);
+    assert_eq!(bus.request_count().await, 3);
 }
 
 #[tokio::test]
@@ -945,7 +974,7 @@ async fn full_repo_broad_listing_loop_gets_targeted_search_rescue() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(bus.request_count().await, 4);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence.len(), 1);
     let stats = search.stats();
@@ -1215,7 +1244,7 @@ async fn rejects_direct_failed_verdict_until_targeted_content_inspection() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(bus.request_count().await, 4);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(
         verdicts[0].description,
@@ -1520,7 +1549,7 @@ async fn broad_and_search_tools_do_not_satisfy_failed_verdict_content_requiremen
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 6);
+    assert_eq!(bus.request_count().await, 7);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(
         verdicts[0].description,
@@ -1602,7 +1631,7 @@ async fn repeated_broad_tools_after_rejected_failure_use_targeted_rescue() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 4);
+    assert_eq!(bus.request_count().await, 5);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].description, "targeted rescue shows unsafe code");
 }
@@ -1677,7 +1706,7 @@ async fn repeated_broad_tools_after_content_observation_are_reprompted_not_termi
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 4);
+    assert_eq!(bus.request_count().await, 5);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(
         verdicts[0].description,
@@ -1754,7 +1783,7 @@ async fn step_limit_after_content_uses_deferred_failed_verdict() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(bus.request_count().await, 4);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].description, "changed line is unsafe");
 }
@@ -1938,6 +1967,152 @@ async fn failed_verdict_with_changed_line_evidence_is_accepted() {
 }
 
 #[tokio::test]
+async fn failed_verdict_rejected_by_adjudicator_continues_to_pass_after_coverage() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn trace_asset() {\n    let userland_module = entry_module();\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"get_file_context","path":"lib.rs","line":2}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"Private request data is stored in a shared cache through userland_module.",
+                "evidence":[{"path":"lib.rs","line":2,"preview":"let userland_module = entry_module();"}]
+            }"#,
+        r#"{"decision":"reject_failure","guidance":"The cited line is a module entry reference, not private request data entering a shared cache."}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"No private data cache violation remains after coverage.","evidence":[]}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "private-data-not-static-cached".to_string(),
+            name: "private-data-not-static-cached".to_string(),
+            instruction: "Fail if private request data is stored in a static or shared cache."
+                .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 4);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+}
+
+#[tokio::test]
+async fn rejected_failure_claim_cannot_be_retried_with_same_evidence_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn trace_asset() {\n    let userland_module = entry_module();\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let repeated_failure = r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"The userland module is private data cached globally.",
+                "evidence":[{"path":"lib.rs","line":2,"preview":"let userland_module = entry_module();"}]
+            }"#;
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"get_file_context","path":"lib.rs","line":2}"#,
+        repeated_failure,
+        r#"{"decision":"reject_failure","guidance":"The evidence does not prove private data enters a shared cache."}"#,
+        repeated_failure,
+        r#"{"action":"final","status":"passed","severity":null,"description":"The repeated assertion was not proven.","evidence":[]}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "private-data-not-static-cached".to_string(),
+            name: "private-data-not-static-cached".to_string(),
+            instruction: "Fail if private request data is stored in a static or shared cache."
+                .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 5);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+}
+
+#[tokio::test]
+async fn failed_verdict_can_add_context_after_adjudicator_requests_more_context() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn handler() {\n    let value = request_cookie();\n    shared_cache_store(value);\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"get_file_context","path":"lib.rs","line":3}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"Private request data is stored in a shared cache.",
+                "evidence":[{"path":"lib.rs","line":3,"preview":"shared_cache_store(value);"}]
+            }"#,
+        r#"{"decision":"needs_more_context","guidance":"Show the source of value before accepting the cache sink claim."}"#,
+        r#"{"action":"get_file_context","path":"lib.rs","line":2}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"Request cookie data flows into the shared cache store.",
+                "evidence":[
+                    {"path":"lib.rs","line":2,"preview":"let value = request_cookie();"},
+                    {"path":"lib.rs","line":3,"preview":"shared_cache_store(value);"}
+                ]
+            }"#,
+        r#"{"decision":"accept_failure","guidance":"The bundle shows request-derived data and the shared cache sink."}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "private-data-not-static-cached".to_string(),
+            name: "private-data-not-static-cached".to_string(),
+            instruction: "Fail if private request data is stored in a static or shared cache."
+                .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 6);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence.len(), 2);
+}
+
+#[tokio::test]
 async fn failed_verdict_with_unrelated_review_context_is_downgraded() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -2061,7 +2236,7 @@ async fn failed_verdict_for_named_target_rejects_sibling_evidence() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(bus.request_count().await, 4);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence[0].line, 1);
 }
@@ -2592,7 +2767,7 @@ async fn agent_can_search_before_final_verdict() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(bus.request_count().await, 4);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence.len(), 1);
     assert_eq!(verdicts[0].evidence[0].line, 2);
@@ -2636,7 +2811,7 @@ async fn malformed_provider_json_is_rejected_and_reprompted() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 4);
+    assert_eq!(bus.request_count().await, 5);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence.len(), 1);
 }
@@ -2723,7 +2898,7 @@ async fn malformed_native_tool_arguments_are_rejected_and_reprompted() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 4);
+    assert_eq!(bus.request_count().await, 5);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence.len(), 1);
 }
@@ -3656,7 +3831,7 @@ async fn fail_prefixed_real_invariant_does_not_require_answer_key_search() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 2);
+    assert_eq!(bus.request_count().await, 3);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence.len(), 1);
 }
@@ -3915,14 +4090,26 @@ impl ScriptedToolBus {
 
 #[async_trait]
 impl LlmBus for ScriptedToolBus {
-    async fn complete_text(&self, _request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
+    async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
         *self.requests.lock().await += 1;
-        let content = self
-            .responses
-            .lock()
-            .await
-            .pop()
-            .expect("scripted response");
+        let is_adjudication = request
+            .instruction
+            .contains("Failure adjudication for Koochi invariant");
+        let content = if is_adjudication {
+            let mut responses = self.responses.lock().await;
+            if responses
+                .last()
+                .is_some_and(|response| response.contains(r#""decision""#))
+            {
+                responses.pop().unwrap()
+            } else {
+                r#"{"decision":"accept_failure","guidance":"test adjudicator accepts"}"#.to_string()
+            }
+        } else if let Some(content) = self.responses.lock().await.pop() {
+            content
+        } else {
+            panic!("scripted response")
+        };
         Ok(LlmTextResponse { content })
     }
 }
@@ -3947,7 +4134,17 @@ impl ScriptedActionBus {
 
 #[async_trait]
 impl LlmBus for ScriptedActionBus {
-    async fn complete_text(&self, _request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
+    async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, LlmBusError> {
+        *self.requests.lock().await += 1;
+        if request
+            .instruction
+            .contains("Failure adjudication for Koochi invariant")
+        {
+            return Ok(LlmTextResponse {
+                content: r#"{"decision":"accept_failure","guidance":"test adjudicator accepts"}"#
+                    .to_string(),
+            });
+        }
         unreachable!("ScriptedActionBus uses native actions")
     }
 
