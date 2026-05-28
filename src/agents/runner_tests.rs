@@ -1967,7 +1967,7 @@ async fn failed_verdict_with_changed_line_evidence_is_accepted() {
 }
 
 #[tokio::test]
-async fn failed_verdict_rejected_by_adjudicator_continues_to_pass_after_coverage() {
+async fn failed_verdict_rejected_by_material_gate_continues_to_pass_after_coverage() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("lib.rs"),
@@ -1984,8 +1984,52 @@ async fn failed_verdict_rejected_by_adjudicator_continues_to_pass_after_coverage
                 "description":"Private request data is stored in a shared cache through userland_module.",
                 "evidence":[{"path":"lib.rs","line":2,"preview":"let userland_module = entry_module();"}]
             }"#,
-        r#"{"decision":"reject_failure","guidance":"The cited line is a module entry reference, not private request data entering a shared cache."}"#,
         r#"{"action":"final","status":"passed","severity":null,"description":"No private data cache violation remains after coverage.","evidence":[]}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "private-data-not-static-cached".to_string(),
+            name: "private-data-not-static-cached".to_string(),
+            instruction: "Fail if private request data is stored in a static or shared cache."
+                .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+}
+
+#[tokio::test]
+async fn rejected_failure_claim_cannot_be_retried_with_same_evidence_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn trace_asset() {\n    let userland_module = entry_module();\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let repeated_failure = r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"The userland module is private data cached globally.",
+                "evidence":[{"path":"lib.rs","line":2,"preview":"let userland_module = entry_module();"}]
+            }"#;
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"get_file_context","path":"lib.rs","line":2}"#,
+        repeated_failure,
+        repeated_failure,
+        r#"{"action":"final","status":"passed","severity":null,"description":"The repeated assertion was not proven.","evidence":[]}"#,
     ]));
 
     let verdicts = run_agents(
@@ -2011,52 +2055,6 @@ async fn failed_verdict_rejected_by_adjudicator_continues_to_pass_after_coverage
 }
 
 #[tokio::test]
-async fn rejected_failure_claim_cannot_be_retried_with_same_evidence_bundle() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        temp.path().join("lib.rs"),
-        "pub fn trace_asset() {\n    let userland_module = entry_module();\n}\n",
-    )
-    .unwrap();
-    let search = Arc::new(session(temp.path().to_path_buf()));
-    let repeated_failure = r#"{
-                "action":"final",
-                "status":"failed",
-                "severity":"high",
-                "description":"The userland module is private data cached globally.",
-                "evidence":[{"path":"lib.rs","line":2,"preview":"let userland_module = entry_module();"}]
-            }"#;
-    let bus = Arc::new(ScriptedToolBus::new(vec![
-        r#"{"action":"get_file_context","path":"lib.rs","line":2}"#,
-        repeated_failure,
-        r#"{"decision":"reject_failure","guidance":"The evidence does not prove private data enters a shared cache."}"#,
-        repeated_failure,
-        r#"{"action":"final","status":"passed","severity":null,"description":"The repeated assertion was not proven.","evidence":[]}"#,
-    ]));
-
-    let verdicts = run_agents(
-        vec![AgentSpec {
-            id: "private-data-not-static-cached".to_string(),
-            name: "private-data-not-static-cached".to_string(),
-            instruction: "Fail if private request data is stored in a static or shared cache."
-                .to_string(),
-            model: "gpt-5-nano".to_string(),
-            severity: Some(Severity::High),
-            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
-        }],
-        search,
-        bus.clone(),
-        128,
-        crate::config::DEFAULT_MAX_AGENT_STEPS,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(bus.request_count().await, 5);
-    assert_eq!(verdicts[0].status, TestStatus::Passed);
-}
-
-#[tokio::test]
 async fn failed_verdict_can_add_context_after_adjudicator_requests_more_context() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -2074,7 +2072,6 @@ async fn failed_verdict_can_add_context_after_adjudicator_requests_more_context(
                 "description":"Private request data is stored in a shared cache.",
                 "evidence":[{"path":"lib.rs","line":3,"preview":"shared_cache_store(value);"}]
             }"#,
-        r#"{"decision":"needs_more_context","guidance":"Show the source of value before accepting the cache sink claim."}"#,
         r#"{"action":"get_file_context","path":"lib.rs","line":2}"#,
         r#"{
                 "action":"final",
@@ -2107,9 +2104,137 @@ async fn failed_verdict_can_add_context_after_adjudicator_requests_more_context(
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 6);
+    assert_eq!(bus.request_count().await, 5);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence.len(), 2);
+}
+
+#[test]
+fn material_proof_gate_rejects_nextjs_false_positive_shapes() {
+    let private_cache_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Private request data is stored in a shared cache.".to_string(),
+        evidence: vec![Evidence {
+            path: "crates/next-api/src/next_server_nft.rs".to_string(),
+            line: 178,
+            preview: "file.read().hash(HashAlgorithm::Xxh3Hash128Hex).await?".to_string(),
+        }],
+    };
+    assert!(
+        failed_verdict_lacks_material_proof(
+            &private_cache_false,
+            "Fail if private request data is stored in a static or shared cache."
+        )
+        .unwrap()
+        .contains("private request-derived data")
+    );
+
+    let client_only_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Client-only modules can execute on the server.".to_string(),
+        evidence: vec![Evidence {
+            path: "crates/next-api/src/instrumentation.rs".to_string(),
+            line: 187,
+            preview: "let userland_module = self.entry_module();".to_string(),
+        }],
+    };
+    assert!(failed_verdict_lacks_material_proof(
+        &client_only_false,
+        "Fail if changed bundling, module graph, or runtime code executes client-only modules in a server context where browser globals, side effects, or hydration assumptions can break rendering."
+    )
+    .unwrap()
+    .contains("client-only"));
+
+    let server_only_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Server-only modules can be bundled client-side.".to_string(),
+        evidence: vec![Evidence {
+            path: "crates/next-api/src/middleware.rs".to_string(),
+            line: 237,
+            preview: "client_paths: vec![],".to_string(),
+        }],
+    };
+    assert!(failed_verdict_lacks_material_proof(
+        &server_only_false,
+        "Fail if changed bundling, module graph, or import analysis allows modules marked server-only or containing server-only APIs to be imported into client components or browser bundles."
+    )
+    .unwrap()
+    .to_ascii_lowercase()
+    .contains("server-only"));
+
+    let source_map_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Production source maps are exposed.".to_string(),
+        evidence: vec![Evidence {
+            path: "crates/next-api/src/next_server_nft.rs".to_string(),
+            line: 97,
+            preview: "ServerNftType::Minimal => \"next-minimal-server.js.nft.json\",".to_string(),
+        }],
+    };
+    assert!(failed_verdict_lacks_material_proof(
+        &source_map_false,
+        "Fail if production server source maps or internal source paths are emitted without a config gate."
+    )
+    .unwrap()
+    .contains("Source-map"));
+
+    let redirect_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Redirect targets can use protocol-relative URLs.".to_string(),
+        evidence: vec![Evidence {
+            path: "crates/next-api/src/next_server_nft.rs".to_string(),
+            line: 135,
+            preview: "get_relative_path_to(&m.ident().await?.path)".to_string(),
+        }],
+    };
+    assert!(failed_verdict_lacks_material_proof(
+        &redirect_false,
+        "Fail if redirect targets accept absolute or protocol-relative URLs without sanitization."
+    )
+    .unwrap()
+    .contains("Redirect-target"));
+}
+
+#[test]
+fn material_proof_gate_accepts_complete_source_sink_evidence() {
+    let response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Request cookie data flows into a shared cache.".to_string(),
+        evidence: vec![
+            Evidence {
+                path: "lib.rs".to_string(),
+                line: 2,
+                preview: "let value = request_cookie();".to_string(),
+            },
+            Evidence {
+                path: "lib.rs".to_string(),
+                line: 3,
+                preview: "shared_cache_store(value);".to_string(),
+            },
+        ],
+    };
+    assert!(
+        failed_verdict_lacks_material_proof(
+            &response,
+            "Fail if private request data is stored in a static or shared cache."
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn adjudicator_prompt_includes_material_proof_obligations() {
+    let prompt = failure_proof_obligations_prompt(
+        "Fail if redirect targets accept absolute or protocol-relative URLs without sanitization.",
+    );
+    assert!(prompt.contains("Redirect-target"));
+    assert!(prompt.contains("get_relative_path_to"));
 }
 
 #[tokio::test]

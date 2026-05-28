@@ -408,6 +408,11 @@ fn changed_line_number(line: &crate::scope::ReviewHunkLine) -> Option<u32> {
 fn invariant_focus_terms(id: &str, instruction: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut terms = Vec::new();
+    for term in invariant_focus_phrase_terms(id, instruction) {
+        if seen.insert(term.clone()) {
+            terms.push(term);
+        }
+    }
     for source in [id, instruction] {
         for token in symbol_tokens(source) {
             let token = token.to_ascii_lowercase();
@@ -415,6 +420,33 @@ fn invariant_focus_terms(id: &str, instruction: &str) -> Vec<String> {
                 continue;
             }
             terms.push(token);
+        }
+    }
+    terms
+}
+
+fn invariant_focus_phrase_terms(id: &str, instruction: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let haystack = format!("{id}\n{instruction}").to_ascii_lowercase();
+    for (needle, term) in [
+        ("source map", "source_map"),
+        ("source-map", "source_map"),
+        ("sourcemap", "source_map"),
+        ("source maps", "source_map"),
+        ("protocol-relative", "protocol_relative"),
+        ("protocol relative", "protocol_relative"),
+        ("client-only", "client_only"),
+        ("client only", "client_only"),
+        ("server-only", "server_only"),
+        ("server only", "server_only"),
+        ("browser bundle", "browser_bundle"),
+        ("client component", "client_component"),
+        ("static cache", "static_cache"),
+        ("shared cache", "shared_cache"),
+        ("private data", "private_data"),
+    ] {
+        if haystack.contains(needle) && !terms.iter().any(|existing| existing == term) {
+            terms.push(term.to_string());
         }
     }
     terms
@@ -431,11 +463,15 @@ fn is_focus_stopword(token: &str) -> bool {
             | "before"
             | "being"
             | "browser"
+            | "bundle"
+            | "bundles"
+            | "bundling"
             | "changed"
             | "changes"
             | "check"
             | "claim"
             | "claims"
+            | "client"
             | "code"
             | "configured"
             | "concrete"
@@ -460,10 +496,17 @@ fn is_focus_stopword(token: &str) -> bool {
             | "immediate"
             | "intended"
             | "logic"
+            | "map"
+            | "maps"
             | "must"
+            | "module"
+            | "modules"
+            | "graph"
             | "other"
+            | "only"
             | "path"
             | "paths"
+            | "relative"
             | "request"
             | "requests"
             | "response"
@@ -475,6 +518,8 @@ fn is_focus_stopword(token: &str) -> bool {
             | "server"
             | "should"
             | "safe"
+            | "source"
+            | "sources"
             | "static"
             | "that"
             | "this"

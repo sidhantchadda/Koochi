@@ -1399,6 +1399,50 @@ where
             if final_response.status == TestStatus::Failed && !is_absence_policy(&agent.instruction)
             {
                 let claim_signature = failure_claim_signature(&final_response);
+                if let Some(guidance) =
+                    failed_verdict_lacks_material_proof(&final_response, &agent.instruction)
+                {
+                    *rejected_failure_claims
+                        .entry(claim_signature.clone())
+                        .or_default() += 1;
+                    trace(AgentTraceEvent::PrematureFinal {
+                        step,
+                        guidance: guidance.clone(),
+                    });
+                    if !coverage.is_complete(inventory.as_ref())
+                        && let Some(batch) = coverage.next_batch(inventory.as_ref())
+                    {
+                        for line in &batch.evidence_lines {
+                            evidence_index.insert(line.clone());
+                        }
+                        if let Some(telemetry) = debug_telemetry.as_mut() {
+                            telemetry.record_line_keys(batch.debug_line_keys.iter().cloned());
+                        }
+                        investigation.record(ToolKind::ReviewCoverage, &batch.observation);
+                        trace(AgentTraceEvent::ReviewCoverageDelivered {
+                            step,
+                            delivered_chunks: coverage.delivered_chunks(),
+                            total_chunks: inventory.chunk_count(),
+                            remaining_chunks: batch.remaining_chunks,
+                            observation: batch.observation.clone(),
+                        });
+                        push_history(
+                            &mut history,
+                            format!(
+                                "\n\nStep {step} failed verdict rejected because material proof is incomplete:\n{guidance}\n\nKoochi is continuing review-scope coverage. Coverage batch ({} chunks, {} remaining):\n{}\n\nStudy this exact source. Return `failed` only with evidence that proves every named material predicate of the invariant; otherwise continue or return `passed` after full coverage.",
+                                batch.chunk_count, batch.remaining_chunks, batch.observation
+                            ),
+                        );
+                    } else {
+                        push_history(
+                            &mut history,
+                            format!(
+                                "\n\nStep {step} failed verdict rejected because material proof is incomplete:\n{guidance}\n\nReturn one targeted tool call for the missing source/sink/guard evidence, or return a passed verdict if no concrete review-scope issue remains."
+                            ),
+                        );
+                    }
+                    continue;
+                }
                 if rejected_failure_claims.contains_key(&claim_signature) {
                     let guidance = "This failed verdict uses the same cited evidence bundle as a failure claim that Koochi's reduced-context adjudicator already rejected. Add new causal evidence, inspect more targeted context, or return passed/no concrete finding.".to_string();
                     trace(AgentTraceEvent::PrematureFinal {
@@ -1514,96 +1558,11 @@ where
             }
             if passed_verdict_contradicts_failure_language(&final_response, &agent.instruction) {
                 contradictory_pass_rejections += 1;
-                if contradictory_pass_rejections >= 2 {
-                    let mut repaired_response = final_response.clone();
-                    repaired_response.status = TestStatus::Failed;
-                    if repaired_response.severity.is_none() {
-                        repaired_response.severity = agent.severity;
-                    }
-                    if let Some(evidence) = target_failure_evidence(
-                        search.as_ref(),
-                        &grounded.target_context_line,
-                        &agent.instruction,
-                    )
-                    .await?
-                    {
-                        evidence_index.insert((evidence.path.clone(), evidence.line));
-                        repaired_response.evidence = vec![evidence];
-                    }
-                    repaired_response.description = format!(
-                        "The provider described the `Fail if` condition for `{}` while returning `passed`; treating it as failed because status must agree with concrete review-scope evidence.",
-                        agent.id
-                    );
-                    if !failed_verdict_lacks_line_evidence(&repaired_response)
-                        && failed_verdict_lacks_target_path_evidence(
-                            &repaired_response,
-                            &agent.instruction,
-                            &grounded.review_paths,
-                        )
-                        .is_none()
-                        && !failed_verdict_lacks_substantive_accepted_evidence(
-                            &repaired_response,
-                            &evidence_index,
-                            &grounded.review_paths,
-                            &grounded.changed_lines,
-                            &grounded.relevant_changed_lines,
-                        )
-                        && (!grounded.full_repo_mode
-                            || !failed_verdict_lacks_full_repo_focus_evidence(
-                                &repaired_response,
-                                &grounded.full_repo_search_terms,
-                            ))
-                    {
-                        trace(AgentTraceEvent::FinalVerdict {
-                            step,
-                            response: repaired_response.clone(),
-                        });
-                        trace(AgentTraceEvent::EvidenceClassified {
-                            items: classify_evidence(
-                                &repaired_response.evidence,
-                                &evidence_index,
-                                &grounded.review_paths,
-                                &grounded.changed_lines,
-                                &grounded.relevant_changed_lines,
-                            ),
-                        });
-                        let elapsed = agent_started.elapsed();
-                        let debug_stats = finish_agent_debug_stats(
-                            &debug_telemetry,
-                            &repaired_response,
-                            elapsed,
-                            llm_calls,
-                            native_tool_calls,
-                            native_final_calls,
-                            text_fallback_turns,
-                            tool_cache_hits,
-                            tool_cache_misses,
-                            non_progress_terminations,
-                            coverage.coverage_chunks_delivered(),
-                            coverage.pass_rejections(),
-                        );
-                        return Ok(AgentLoopResult {
-                            response: repaired_response,
-                            evidence_index,
-                            review_paths: grounded.review_paths,
-                            changed_lines: grounded.changed_lines,
-                            relevant_changed_lines: grounded.relevant_changed_lines,
-                            review_causal_terms: grounded.review_causal_terms,
-                            elapsed,
-                            llm_calls,
-                            native_tool_calls,
-                            native_final_calls,
-                            text_fallback_turns,
-                            tool_cache_hits,
-                            tool_cache_misses,
-                            non_progress_terminations,
-                            coverage_chunks_delivered: coverage.coverage_chunks_delivered(),
-                            coverage_pass_rejections: coverage.pass_rejections(),
-                            debug_stats,
-                        });
-                    }
-                }
-                let guidance = "Your description says the invariant is violated; return `failed` with evidence, or rewrite the description if it is actually satisfied.".to_string();
+                let guidance = if contradictory_pass_rejections >= 2 {
+                    "Your description still says the invariant is violated, but Koochi will not convert a `passed` verdict into `failed` on your behalf. Return `failed` with concrete evidence that proves every material predicate of the invariant, or rewrite the passed description so it clearly says the invariant is satisfied.".to_string()
+                } else {
+                    "Your description says the invariant is violated; return `failed` with evidence, or rewrite the description if it is actually satisfied.".to_string()
+                };
                 trace(AgentTraceEvent::PrematureFinal {
                     step,
                     guidance: guidance.clone(),
@@ -3049,6 +3008,9 @@ Decision semantics:
 
 Be skeptical. Terms that overlap with the invariant are discovery hints, not proof. For data-flow or cache/privacy/security invariants, require a causal chain: source of unsafe data or action, sink/behavior, missing guard/key/scope, and why the review-scope code creates or affects that path. Distinguish build/deployment metadata caches from runtime user/request data caches.
 
+Material proof obligations:
+{proof_obligations}
+
 Invariant:
 {invariant}
 
@@ -3068,7 +3030,8 @@ Return only JSON:
         invariant = agent.instruction,
         review_scope = review_scope,
         candidate = candidate,
-        evidence_bundle = evidence_bundle
+        evidence_bundle = evidence_bundle,
+        proof_obligations = failure_proof_obligations_prompt(&agent.instruction)
     ))
 }
 
@@ -3126,6 +3089,344 @@ where
         }));
     }
     bundle
+}
+
+fn failure_proof_obligations_prompt(instruction: &str) -> String {
+    let lower = instruction.to_ascii_lowercase();
+    let mut obligations = vec![
+        "- The cited evidence must prove every material predicate in the invariant, not merely contain overlapping words.".to_string(),
+        "- If the invariant describes a source-to-sink risk, require evidence for the source, the sink, and the missing guard or boundary.".to_string(),
+        "- Reject evidence that only shows build metadata, file tracing, names, hashes, wrapper calls, imports, type declarations, or nearby plumbing unless that exact line participates in the violation.".to_string(),
+    ];
+
+    if private_static_cache_invariant(&lower) {
+        obligations.push(
+            "- Private/static cache invariant: require evidence of request/private data such as cookies, headers, auth/session/token/secret/user-specific data AND evidence of a static/shared/global/runtime cache sink. File hashes, build artifacts, NFT manifests, and deployment tracing are not private runtime cache evidence.".to_string(),
+        );
+    }
+    if client_only_server_execution_invariant(&lower) {
+        obligations.push(
+            "- Client-only/server-execution invariant: require evidence that the module is actually client-only or browser-dependent (`use client`, client-only marker, browser globals, hydration-only assumptions) AND evidence that review-scope code executes or evaluates it in a server context. Module graph traversal, NFT tracing, or server manifest generation alone is not server execution of client-only code.".to_string(),
+        );
+    }
+    if server_only_client_import_invariant(&lower) {
+        obligations.push(
+            "- Server-only/client-import invariant: require evidence that the imported module is server-only or uses server-only APIs AND evidence that review-scope code imports/bundles it into a client component or browser bundle. Server-side module graph analysis, NFT tracing, or `client_paths: []` plumbing alone is not client importability.".to_string(),
+        );
+    }
+    if source_map_invariant(&lower) {
+        obligations.push(
+            "- Source-map invariant: require evidence of actual sourcemap generation, emission, serving, or sourceMappingURL behavior in production plus the missing configuration gate. `.nft.json`, file lists, relative deployment paths, content hashes, `module.source()`, and ordinary `.map(...)` collection calls are not source-map exposure evidence.".to_string(),
+        );
+    }
+    if redirect_target_invariant(&lower) {
+        obligations.push(
+            "- Redirect-target invariant: require evidence of redirect/rewrite/navigation/Location handling AND URL/destination/target sanitization behavior. Filesystem `relative` paths, `get_relative_path_to`, module paths, or deployment manifest paths are not redirect-target evidence.".to_string(),
+        );
+    }
+
+    obligations.join("\n")
+}
+
+fn failed_verdict_lacks_material_proof(
+    response: &LlmResponse,
+    instruction: &str,
+) -> Option<String> {
+    if response.status != TestStatus::Failed || response.evidence.is_empty() {
+        return None;
+    }
+    let instruction = instruction.to_ascii_lowercase();
+    let evidence = semantic_evidence_haystack(response);
+
+    if private_static_cache_invariant(&instruction) {
+        let has_private_source = contains_any(
+            &evidence,
+            &[
+                "request",
+                "cookie",
+                "cookies",
+                "header",
+                "headers",
+                "auth",
+                "session",
+                "token",
+                "secret",
+                "private",
+                "user",
+                "personal",
+                "credential",
+                "payload",
+            ],
+        );
+        let has_cache_sink = contains_any(
+            &evidence,
+            &[
+                "cache",
+                "cached",
+                "caching",
+                "shared",
+                "static",
+                "global",
+                "store",
+                "insert",
+                "set(",
+                "unstable_cache",
+            ],
+        );
+        if !has_private_source || !has_cache_sink {
+            return Some(format!(
+                "Private/static-cache failures must cite both private request-derived data and a static/shared cache sink. Current evidence is missing {}.",
+                missing_pair(
+                    has_private_source,
+                    "the private/request data source",
+                    has_cache_sink,
+                    "the static/shared cache sink"
+                )
+            ));
+        }
+    }
+
+    if client_only_server_execution_invariant(&instruction) {
+        let has_client_only_source = contains_any(
+            &evidence,
+            &[
+                "client-only",
+                "client_only",
+                "\"use client\"",
+                "'use client'",
+                "window",
+                "document",
+                "navigator",
+                "localstorage",
+                "sessionstorage",
+                "hydration",
+                "browser global",
+            ],
+        );
+        let has_server_execution = contains_any(
+            &evidence,
+            &[
+                "execute",
+                "executes",
+                "executed",
+                "evaluate",
+                "evaluates",
+                "render",
+                "server",
+                "node",
+                "server context",
+                "server_chunk",
+            ],
+        );
+        if !has_client_only_source || !has_server_execution {
+            return Some(format!(
+                "Client-only/server-execution failures must cite both a client-only or browser-dependent module and a server execution/evaluation path. Current evidence is missing {}.",
+                missing_pair(
+                    has_client_only_source,
+                    "the client-only/browser-dependent source",
+                    has_server_execution,
+                    "the server execution path"
+                )
+            ));
+        }
+    }
+
+    if server_only_client_import_invariant(&instruction) {
+        let has_server_only_source = contains_any(
+            &evidence,
+            &[
+                "server-only",
+                "server_only",
+                "\"use server\"",
+                "'use server'",
+                "cookies(",
+                "headers(",
+                "draftmode(",
+                "server-only api",
+                "server only api",
+            ],
+        );
+        let has_client_sink = contains_any(
+            &evidence,
+            &[
+                "client component",
+                "browser bundle",
+                "client bundle",
+                "client_chunk",
+                "client reference",
+                "client import",
+                "client_paths",
+                "\"use client\"",
+                "'use client'",
+            ],
+        );
+        if !has_server_only_source || !has_client_sink {
+            return Some(format!(
+                "Server-only/client-import failures must cite both a server-only module/API and a client component or browser-bundle sink. Current evidence is missing {}.",
+                missing_pair(
+                    has_server_only_source,
+                    "the server-only source/API",
+                    has_client_sink,
+                    "the client/browser import sink"
+                )
+            ));
+        }
+    }
+
+    if source_map_invariant(&instruction) {
+        let has_source_map_artifact = contains_any(
+            &evidence,
+            &[
+                "sourcemap",
+                "source map",
+                "source_map",
+                "source-maps",
+                ".js.map",
+                ".map\"",
+                ".map'",
+                "sourcemappingurl",
+            ],
+        );
+        if !has_source_map_artifact {
+            return Some(
+                "Source-map failures must cite actual sourcemap generation, emission, serving, sourceMappingURL behavior, or `.map` artifacts. NFT manifests, relative file paths, content hashes, and `module.source()` are not enough.".to_string(),
+            );
+        }
+        if contains_any(
+            &evidence,
+            &[".nft.json", "nftjsonasset", "filehashes", "file hashes"],
+        ) && !contains_any(
+            &evidence,
+            &[
+                "sourcemap",
+                "source map",
+                "source_map",
+                ".js.map",
+                "sourcemappingurl",
+            ],
+        ) {
+            return Some(
+                "Source-map failures cannot rest on NFT/file-tracing manifest evidence alone; cite the actual source-map artifact or serving path.".to_string(),
+            );
+        }
+    }
+
+    if redirect_target_invariant(&instruction) {
+        let has_redirect_behavior = contains_any(
+            &evidence,
+            &[
+                "redirect",
+                "rewrite",
+                "navigation",
+                "location",
+                "nextresponse.redirect",
+                "permanentredirect",
+                "redirect(",
+            ],
+        );
+        let has_url_target = contains_any(
+            &evidence,
+            &[
+                "url",
+                "uri",
+                "destination",
+                "target",
+                "href",
+                "protocol",
+                "hostname",
+                "origin",
+                "pathname",
+            ],
+        );
+        if !has_redirect_behavior || !has_url_target {
+            return Some(format!(
+                "Redirect-target failures must cite both redirect/rewrite/navigation behavior and URL destination sanitization evidence. Current evidence is missing {}.",
+                missing_pair(
+                    has_redirect_behavior,
+                    "redirect/rewrite/navigation behavior",
+                    has_url_target,
+                    "URL destination/target handling"
+                )
+            ));
+        }
+    }
+
+    None
+}
+
+fn semantic_evidence_haystack(response: &LlmResponse) -> String {
+    let mut text = String::new();
+    for evidence in &response.evidence {
+        text.push_str(&normalize_tool_path(&evidence.path).to_ascii_lowercase());
+        text.push('\n');
+        text.push_str(&evidence.preview.to_ascii_lowercase());
+        text.push('\n');
+    }
+    text
+}
+
+fn private_static_cache_invariant(instruction: &str) -> bool {
+    contains_any(
+        instruction,
+        &["private", "cookie", "header", "session", "auth", "token"],
+    ) && contains_any(instruction, &["cache", "cached", "static", "shared"])
+}
+
+fn client_only_server_execution_invariant(instruction: &str) -> bool {
+    contains_any(instruction, &["client-only", "client only"])
+        || (contains_any(instruction, &["browser globals", "browser-dependent"])
+            && contains_any(instruction, &["server context", "executes", "executed"]))
+}
+
+fn server_only_client_import_invariant(instruction: &str) -> bool {
+    contains_any(
+        instruction,
+        &["server-only", "server only", "server-only api"],
+    ) && contains_any(
+        instruction,
+        &["client component", "browser bundle", "client", "import"],
+    )
+}
+
+fn source_map_invariant(instruction: &str) -> bool {
+    contains_any(
+        instruction,
+        &["source map", "source-map", "sourcemap", "source maps"],
+    )
+}
+
+fn redirect_target_invariant(instruction: &str) -> bool {
+    contains_any(
+        instruction,
+        &["redirect", "rewrite", "navigation", "location"],
+    ) && contains_any(
+        instruction,
+        &[
+            "target",
+            "destination",
+            "url",
+            "protocol-relative",
+            "absolute",
+        ],
+    )
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn missing_pair(
+    first_present: bool,
+    first_label: &str,
+    second_present: bool,
+    second_label: &str,
+) -> String {
+    match (first_present, second_present) {
+        (false, false) => format!("{first_label} and {second_label}"),
+        (false, true) => first_label.to_string(),
+        (true, false) => second_label.to_string(),
+        (true, true) => "nothing".to_string(),
+    }
 }
 
 fn parse_failure_adjudication_response(content: &str) -> Option<FailureAdjudication> {
