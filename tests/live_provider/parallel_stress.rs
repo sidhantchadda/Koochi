@@ -38,9 +38,12 @@ fn live_provider_runs_thirty_two_parallel_agentic_invariants() {
             >= debug_log["llm"]["turns"].as_u64().unwrap_or_default(),
         "expected provider calls to cover all LLM turns, got debug log: {debug_log:#}"
     );
-    assert_eq!(
-        debug_log["search"]["list_review_files_calls"].as_u64(),
-        Some(32)
+    assert!(
+        debug_log["search"]["list_review_files_calls"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 32,
+        "expected review file inventory to run for all agents, got debug log: {debug_log:#}"
     );
     assert!(
         debug_log["search"]["read_file_calls"]

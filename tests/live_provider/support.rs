@@ -146,6 +146,13 @@ pub fn try_latest_debug_log(root: &Path) -> Option<Value> {
         .ok()?
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
+    entries.retain(|entry| {
+        entry.path().is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+    });
     entries.sort_by_key(|entry| entry.file_name());
     entries.last().map(|entry| read_json(&entry.path()))
 }

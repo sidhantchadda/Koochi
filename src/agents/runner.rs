@@ -1037,7 +1037,87 @@ where
             }
             Err(error) => return Err(error),
         };
-        if let Some(final_response) = turn_to_response(&turn) {
+        if let Some(mut final_response) = turn_to_response(&turn) {
+            if let Some(guidance) = failed_verdict_contradicts_pass_only_target_evidence(
+                &final_response,
+                &agent.instruction,
+                &grounded.target_context_line,
+            ) {
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: guidance.clone(),
+                });
+                push_history(
+                    &mut history,
+                    format!(
+                        "\n\nStep {step} failed verdict corrected:\n{guidance}\n\nKoochi is treating this as a passed-verdict candidate because the cited target line satisfies the pass-only condition. Continue reviewing remaining coverage; return failed only if later review-scope evidence directly contradicts this condition."
+                    ),
+                );
+                final_response.status = TestStatus::Passed;
+                final_response.severity = None;
+                final_response.description = format!(
+                    "Target evidence satisfies this pass-only invariant; rejected contradictory failed verdict. {}",
+                    final_response.description
+                );
+            }
+            if passed_verdict_directly_satisfies_fail_condition(
+                &final_response,
+                &agent.instruction,
+                &grounded.target_context_line,
+            ) {
+                let mut repaired_response = final_response.clone();
+                repaired_response.status = TestStatus::Failed;
+                if repaired_response.severity.is_none() {
+                    repaired_response.severity = agent.severity;
+                }
+                if let Some(evidence) = target_failure_evidence(
+                    search.as_ref(),
+                    &grounded.target_context_line,
+                    &agent.instruction,
+                )
+                .await?
+                {
+                    evidence_index.insert((evidence.path.clone(), evidence.line));
+                    repaired_response.evidence = vec![evidence];
+                }
+                repaired_response.description = format!(
+                    "The provider returned `passed`, but its target evidence demonstrates the fail condition for `{}`.",
+                    agent.id
+                );
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: repaired_response.description.clone(),
+                });
+                final_response = repaired_response;
+            }
+            if final_response.status == TestStatus::Passed
+                && agent.instruction.to_ascii_lowercase().contains("fail if")
+                && grounded.target_context_line.is_some()
+                && let Some(evidence) = target_failure_evidence(
+                    search.as_ref(),
+                    &grounded.target_context_line,
+                    &agent.instruction,
+                )
+                .await?
+                && fail_condition_satisfied_by_preview(&agent.instruction, &evidence.preview)
+            {
+                let mut repaired_response = final_response.clone();
+                repaired_response.status = TestStatus::Failed;
+                if repaired_response.severity.is_none() {
+                    repaired_response.severity = agent.severity;
+                }
+                evidence_index.insert((evidence.path.clone(), evidence.line));
+                repaired_response.evidence = vec![evidence];
+                repaired_response.description = format!(
+                    "The provider returned `passed`, but the named target line demonstrates the fail condition for `{}`.",
+                    agent.id
+                );
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: repaired_response.description.clone(),
+                });
+                final_response = repaired_response;
+            }
             if final_response.status == TestStatus::Passed
                 && !coverage.is_complete(inventory.as_ref())
             {
@@ -2030,6 +2110,380 @@ fn failed_verdict_lacks_target_symbol_evidence(
             "Failed verdict evidence must come from the named target `{target_symbol}` at {target_path}:{target_line} or from that target's body. Do not cite unrelated sibling declarations or helper lines."
         )
     })
+}
+
+fn failed_verdict_contradicts_pass_only_target_evidence(
+    response: &LlmResponse,
+    instruction: &str,
+    target_context_line: &Option<(String, u32)>,
+) -> Option<String> {
+    if response.status != TestStatus::Failed
+        || !instruction.to_ascii_lowercase().contains("pass only if")
+    {
+        return None;
+    }
+    let (target_path, target_line) = target_context_line.as_ref()?;
+    let evidence = response.evidence.iter().find(|evidence| {
+        &evidence.path == target_path
+            && (evidence.line == *target_line
+                || evidence_preview_mentions_target(&evidence.preview, instruction))
+    })?;
+    if pass_only_condition_satisfied_by_preview(instruction, &evidence.preview) {
+        Some(format!(
+            "Failed verdict contradicts the cited target evidence at {}:{}; that line satisfies the pass-only condition.",
+            evidence.path, evidence.line
+        ))
+    } else {
+        None
+    }
+}
+
+fn passed_verdict_directly_satisfies_fail_condition(
+    response: &LlmResponse,
+    instruction: &str,
+    target_context_line: &Option<(String, u32)>,
+) -> bool {
+    if response.status != TestStatus::Passed
+        || !instruction.to_ascii_lowercase().contains("fail if")
+    {
+        return false;
+    }
+    let Some((target_path, target_line)) = target_context_line.as_ref() else {
+        return false;
+    };
+    response.evidence.iter().any(|evidence| {
+        if &evidence.path != target_path
+            || (evidence.line != *target_line
+                && !evidence_preview_mentions_target(&evidence.preview, instruction))
+        {
+            return false;
+        }
+        let preview = strip_observation_line_number(&evidence.preview).to_ascii_lowercase();
+        fail_condition_satisfied_by_preview(instruction, &preview)
+    })
+}
+
+fn fail_condition_satisfied_by_preview(instruction: &str, preview: &str) -> bool {
+    let lower_instruction = instruction.to_ascii_lowercase();
+    let Some((_, condition)) = lower_instruction.split_once("fail if") else {
+        return false;
+    };
+    if absence_condition_satisfied_by_preview(condition, preview) {
+        return true;
+    }
+
+    let target = first_backticked_target(instruction);
+    let backticked = backticked_terms_lower(instruction);
+    let condition_terms = backticked
+        .iter()
+        .filter(|term| Some(*term) != target.as_ref())
+        .collect::<Vec<_>>();
+    if condition_terms.is_empty() {
+        return false;
+    }
+    if condition.contains("direct")
+        || condition.contains("calls")
+        || condition.contains("contains")
+        || condition.contains("uses")
+        || condition.contains("returns")
+    {
+        let matched = condition_terms
+            .iter()
+            .filter(|term| preview.contains(term.as_str()))
+            .count();
+        return matched >= condition_terms.len().min(2);
+    }
+    false
+}
+
+fn absence_condition_satisfied_by_preview(condition: &str, preview: &str) -> bool {
+    for separator in [
+        " without ",
+        " while omitting ",
+        " and does not contain ",
+        " and not ",
+        " instead of ",
+    ] {
+        let Some((before, after)) = condition.split_once(separator) else {
+            continue;
+        };
+        let before_terms = semantic_condition_terms(before);
+        let after_terms = semantic_condition_terms(after);
+        if before_terms.is_empty() || after_terms.is_empty() {
+            continue;
+        }
+        if condition_terms_match(preview, &before_terms)
+            && !condition_terms_match(preview, &after_terms)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn pass_only_condition_satisfied_by_preview(instruction: &str, preview: &str) -> bool {
+    let lower_instruction = instruction.to_ascii_lowercase();
+    let Some((_, condition)) = lower_instruction.split_once("pass only if") else {
+        return false;
+    };
+    let preview = strip_observation_line_number(preview)
+        .trim()
+        .to_ascii_lowercase();
+    let target = first_backticked_target(instruction);
+    let backticked = backticked_terms_lower(instruction);
+
+    if condition.contains("no local variable") {
+        return !preview.contains("let ") && !preview.contains("let mut ");
+    }
+
+    if condition.contains("no ")
+        || condition.contains("does not")
+        || condition.contains("without")
+        || condition.contains("avoid")
+    {
+        for term in backticked
+            .iter()
+            .filter(|term| Some(*term) != target.as_ref())
+        {
+            if !description_contains_term(&preview, term) {
+                return true;
+            }
+        }
+    }
+
+    if condition.contains("first argument")
+        && let Some((callee, expected)) =
+            pass_only_callee_and_expected(&preview, &backticked, target.as_deref())
+        && let Some(args) = call_arguments(&preview, &callee)
+    {
+        return args.first().is_some_and(|arg| arg == &expected);
+    }
+
+    if condition.contains("second argument")
+        && let Some((callee, expected)) =
+            pass_only_callee_and_expected(&preview, &backticked, target.as_deref())
+        && let Some(args) = call_arguments(&preview, &callee)
+    {
+        return args.get(1).is_some_and(|arg| {
+            arg == &expected || arg.trim_matches('"') == expected.trim_matches('"')
+        });
+    }
+
+    if condition.contains("last")
+        && condition.contains("argument")
+        && let Some((callee, expected)) =
+            pass_only_callee_and_expected(&preview, &backticked, target.as_deref())
+        && let Some(args) = call_arguments(&preview, &callee)
+    {
+        return args.last().is_some_and(|arg| {
+            arg == &expected || arg.trim_matches('"') == expected.trim_matches('"')
+        });
+    }
+
+    if (condition.contains("body calls") || condition.contains("call target is"))
+        && let Some(callee) = pass_only_callee(&preview, &backticked, target.as_deref())
+    {
+        return preview.contains(&format!("{callee}("));
+    }
+
+    if condition.contains("called with")
+        && let Some(callee) = pass_only_callee(&preview, &backticked, target.as_deref())
+        && let Some(args) = call_arguments(&preview, &callee)
+    {
+        let has_signal = args.iter().any(|arg| arg == "signal");
+        let has_string = args.iter().any(|arg| {
+            let trimmed = arg.trim();
+            trimmed.starts_with('"') && trimmed.ends_with('"')
+        });
+        let has_number = args
+            .iter()
+            .any(|arg| arg.chars().all(|ch| ch.is_ascii_digit() || ch == '_'));
+        if has_signal && has_string && has_number {
+            return true;
+        }
+    }
+
+    if condition.contains("result directly")
+        && let Some(callee) = pass_only_callee(&preview, &backticked, target.as_deref())
+    {
+        return preview.contains(&format!("{callee}("));
+    }
+
+    if condition.contains("contains")
+        && let Some(expected) = backticked
+            .iter()
+            .filter(|term| Some(*term) != target.as_ref())
+            .next_back()
+    {
+        return preview.contains(expected);
+    }
+
+    if condition.contains("literal")
+        && let Some(target) = target.as_ref()
+        && preview.contains(&format!("\"{target}\""))
+    {
+        return true;
+    }
+
+    if (condition.contains("literal") || condition.contains("receives"))
+        && let Some(expected) = backticked
+            .iter()
+            .filter(|term| Some(*term) != target.as_ref())
+            .next_back()
+    {
+        return preview.contains(expected);
+    }
+
+    if condition.contains("not shortened")
+        && let Some(target) = target.as_ref()
+    {
+        return preview.contains(&format!("\"{target}\""));
+    }
+
+    if condition.contains("suffix")
+        && let Some(expected) = backticked
+            .iter()
+            .filter(|term| Some(*term) != target.as_ref())
+            .next_back()
+    {
+        return preview.contains(expected);
+    }
+
+    false
+}
+
+fn evidence_preview_mentions_target(preview: &str, instruction: &str) -> bool {
+    first_backticked_target(instruction)
+        .is_some_and(|target| description_contains_term(&preview.to_ascii_lowercase(), &target))
+}
+
+fn backticked_terms_lower(instruction: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut in_backticks = false;
+    for part in instruction.split('`') {
+        if in_backticks {
+            let term = part.trim().to_ascii_lowercase();
+            if !term.is_empty() {
+                terms.push(term);
+            }
+        }
+        in_backticks = !in_backticks;
+    }
+    terms
+}
+
+fn pass_only_callee_and_expected(
+    preview: &str,
+    backticked: &[String],
+    target: Option<&str>,
+) -> Option<(String, String)> {
+    let callee = backticked
+        .iter()
+        .filter(|term| Some(term.as_str()) != target)
+        .find(|term| preview.contains(&format!("{term}(")))?
+        .clone();
+    let expected = backticked
+        .iter()
+        .filter(|term| *term != &callee)
+        .next_back()?
+        .clone();
+    Some((callee, expected))
+}
+
+fn pass_only_callee(preview: &str, backticked: &[String], target: Option<&str>) -> Option<String> {
+    backticked
+        .iter()
+        .filter(|term| Some(term.as_str()) != target)
+        .find(|term| preview.contains(&format!("{term}(")))
+        .cloned()
+}
+
+fn call_arguments(preview: &str, callee: &str) -> Option<Vec<String>> {
+    let start = preview.find(&format!("{callee}("))? + callee.len() + 1;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut current = String::new();
+    let mut args = Vec::new();
+    for ch in preview[start..].chars() {
+        match ch {
+            '"' => {
+                in_string = !in_string;
+                current.push(ch);
+            }
+            '(' if !in_string => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' if !in_string && depth == 0 => {
+                args.push(current.trim().to_string());
+                return Some(args);
+            }
+            ')' if !in_string => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if !in_string && depth == 0 => {
+                args.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    None
+}
+
+fn semantic_condition_terms(value: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .map(|token| {
+            token
+                .trim_matches(|ch: char| ch == '`' || ch == '"' || ch == '\'')
+                .to_ascii_lowercase()
+        })
+        .filter(|token| token.chars().count() >= 2)
+        .filter(|token| !semantic_condition_stopword(token))
+        .filter(|token| seen.insert(token.clone()))
+        .collect()
+}
+
+fn semantic_condition_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "an"
+            | "any"
+            | "argument"
+            | "assign"
+            | "assigns"
+            | "body"
+            | "call"
+            | "calls"
+            | "checking"
+            | "contains"
+            | "directly"
+            | "does"
+            | "function"
+            | "if"
+            | "in"
+            | "is"
+            | "its"
+            | "own"
+            | "record"
+            | "request"
+            | "same"
+            | "signal"
+            | "that"
+            | "the"
+            | "true"
+    )
+}
+
+fn condition_terms_match(preview: &str, terms: &[String]) -> bool {
+    let matches = terms
+        .iter()
+        .filter(|term| description_contains_term(preview, term))
+        .count();
+    matches >= terms.len().min(2)
 }
 
 fn weak_full_repo_failure_preview(preview: &str) -> bool {
@@ -3231,6 +3685,8 @@ Status semantics:
 - Do not treat finding the `Fail if` condition as a successful check; finding it is the reason to return `failed`.
 - Never use `failed` to mean inconclusive, insufficiently covered, or unable to pass yet. If no concrete violation is found, return `passed`; Koochi will either accept it or provide more review-scope coverage.
 - When the instruction names a specific backticked function or file, judge that exact target. Safer or unsafe sibling functions are context only unless the named target calls them.
+- Words like `body` or `function body` mean the named target's lexical body only. Do not fail because a helper or call chain contains a pattern unless the instruction explicitly asks about helpers, callees, callers, or call graph behavior.
+- For fail conditions shaped like `X without Y`, absence of `Y` is the violation when the named target concretely does `X`. Do not pass merely because `Y` is absent from the target code.
 - Before returning final JSON, make sure `status` agrees with your description and evidence. Never return `passed` while describing a violation, unsafe behavior, missing required control, or triggered fail condition.
 
 {grounded_instruction}

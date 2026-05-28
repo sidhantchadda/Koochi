@@ -1024,6 +1024,12 @@ async fn grounds_agent_instruction_with_small_changed_hunk_packet() {
     );
     assert!(request.instruction.contains("For `Fail if ...` invariants"));
     assert!(request.instruction.contains("judge that exact target"));
+    assert!(request.instruction.contains("lexical body only"));
+    assert!(
+        request
+            .instruction
+            .contains("absence of `Y` is the violation")
+    );
     assert!(request.instruction.contains("hunk_id=lib.rs#1 lib.rs:1"));
     assert!(
         request
@@ -2058,6 +2064,309 @@ async fn failed_verdict_for_named_target_rejects_sibling_evidence() {
     assert_eq!(bus.request_count().await, 3);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence[0].line, 1);
+}
+
+#[test]
+fn passed_without_failure_condition_is_repaired_from_target_evidence() {
+    let response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "No violation found.".to_string(),
+        evidence: vec![Evidence {
+            path: "src/gates.rs".to_string(),
+            line: 11,
+            preview: "pub fn gate_bad_missing_label(request: &GateRequest) -> GateDecision { let mut decision = base_decision(\"gate_bad_missing_label\"); if request.amount < 10_000 { decision.open = true; } decision }".to_string(),
+        }],
+    };
+
+    assert!(passed_verdict_directly_satisfies_fail_condition(
+        &response,
+        "Inspect `gate_bad_missing_label`. Fail if its own body assigns `decision.open = true` without checking `label_present(request)` in that same body.",
+        &Some(("src/gates.rs".to_string(), 11)),
+    ));
+
+    let direct_call_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "No violation found.".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 12,
+            preview: "pub fn meter_bad_empty_label(signal: &Signal) -> Option<MeterItem> { if signal.value > 12_000 { Some(meter_item(\"meter_bad_empty_label\", \"red\", format!(\"{} accepted\", signal.name))) } else { None } }".to_string(),
+        }],
+    };
+
+    assert!(passed_verdict_directly_satisfies_fail_condition(
+        &direct_call_response,
+        "Inspect `meter_bad_empty_label`. Fail if its body calls `meter_item` directly instead of `meter_ok`.",
+        &Some(("src/meter.rs".to_string(), 12)),
+    ));
+
+    let direct_zone_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "No violation found.".to_string(),
+        evidence: vec![Evidence {
+            path: "src/rows.rs".to_string(),
+            line: 12,
+            preview: "pub fn row_bad_plain_zone(record: &RowRecord, group: &str) -> Option<String> { if !same_group(record, group) || !record.open { return None; } Some(format!(\"{},{}\", record.zone, clean_piece(&record.item))) }".to_string(),
+        }],
+    };
+
+    assert!(passed_verdict_directly_satisfies_fail_condition(
+        &direct_zone_response,
+        "Inspect `row_bad_plain_zone`. Fail if its `format!` call uses `record.zone` directly.",
+        &Some(("src/rows.rs".to_string(), 12)),
+    ));
+
+    let open_limit_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "No violation found.".to_string(),
+        evidence: vec![Evidence {
+            path: "src/gates.rs".to_string(),
+            line: 13,
+            preview: "pub fn gate_bad_open_limit(request: &GateRequest) -> GateDecision { let mut decision = base_decision(\"gate_bad_open_limit\"); if label_present(request) && request.stamp_count >= 2 { decision.open = true; } decision }".to_string(),
+        }],
+    };
+
+    assert!(passed_verdict_directly_satisfies_fail_condition(
+        &open_limit_response,
+        "Inspect `gate_bad_open_limit`. Fail if it opens without an amount limit comparison.",
+        &Some(("src/gates.rs".to_string(), 13)),
+    ));
+
+    let row_ok_absence_response = LlmResponse {
+        status: TestStatus::Passed,
+        severity: None,
+        description: "No violation found.".to_string(),
+        evidence: vec![Evidence {
+            path: "src/rows.rs".to_string(),
+            line: 11,
+            preview: "pub fn row_bad_group_skip(record: &RowRecord, _group: &str) -> Option<String> { if !record.open { return None; } Some(format!(\"{},{}\", clean_piece(&record.zone), clean_piece(&record.item))) }".to_string(),
+        }],
+    };
+
+    assert!(passed_verdict_directly_satisfies_fail_condition(
+        &row_ok_absence_response,
+        "Inspect `row_bad_group_skip`. Fail if its own body contains `Some(format!` and does not contain a `row_ok(` call.",
+        &Some(("src/rows.rs".to_string(), 11)),
+    ));
+}
+
+#[test]
+fn failed_pass_only_verdict_is_repaired_when_target_line_satisfies_condition() {
+    let body_calls_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "meter_rule_002 does not call meter_ok".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 18,
+            preview: "pub fn meter_rule_002(signal: &Signal) -> Option<MeterItem> { meter_ok(signal, \"meter_rule_002\", 6002) }".to_string(),
+        }],
+    };
+
+    assert!(
+        failed_verdict_contradicts_pass_only_target_evidence(
+            &body_calls_response,
+            "Inspect `meter_rule_002`. Pass only if the body calls `meter_ok`.",
+            &Some(("src/meter.rs".to_string(), 18)),
+        )
+        .is_some()
+    );
+
+    let no_if_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "meter_rule_013 lexical body contains an if token".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 29,
+            preview: "pub fn meter_rule_013(signal: &Signal) -> Option<MeterItem> { meter_ok(signal, \"meter_rule_013\", 6013) }".to_string(),
+        }],
+    };
+
+    assert!(failed_verdict_contradicts_pass_only_target_evidence(
+        &no_if_response,
+        "Inspect `meter_rule_013`. Pass only if the lexical body of `meter_rule_013` contains no `if` token; ignore helper bodies.",
+        &Some(("src/meter.rs".to_string(), 29)),
+    )
+    .is_some());
+
+    let first_arg_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "first argument is not signal".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 33,
+            preview: "pub fn meter_rule_017(signal: &Signal) -> Option<MeterItem> { meter_ok(signal, \"meter_rule_017\", 6017) }".to_string(),
+        }],
+    };
+
+    assert!(failed_verdict_contradicts_pass_only_target_evidence(
+        &first_arg_response,
+        "Inspect `meter_rule_017`. Pass only if the first argument to `meter_ok` is exactly `signal`.",
+        &Some(("src/meter.rs".to_string(), 33)),
+    )
+    .is_some());
+
+    let second_arg_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "second argument is not literal".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 37,
+            preview: "pub fn meter_rule_021(signal: &Signal) -> Option<MeterItem> { meter_ok(signal, \"meter_rule_021\", 6021) }".to_string(),
+        }],
+    };
+
+    assert!(failed_verdict_contradicts_pass_only_target_evidence(
+        &second_arg_response,
+        "Inspect `meter_rule_021`. Pass only if the second argument to `meter_ok` is the string literal `meter_rule_021`.",
+        &Some(("src/meter.rs".to_string(), 37)),
+    )
+    .is_some());
+
+    let last_arg_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "last argument is not 6012".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 28,
+            preview: "pub fn meter_rule_012(signal: &Signal) -> Option<MeterItem> { meter_ok(signal, \"meter_rule_012\", 6012) }".to_string(),
+        }],
+    };
+
+    assert!(
+        failed_verdict_contradicts_pass_only_target_evidence(
+            &last_arg_response,
+            "Inspect `meter_rule_012`. Pass only if the last `meter_ok` argument is `6012`.",
+            &Some(("src/meter.rs".to_string(), 28)),
+        )
+        .is_some()
+    );
+
+    let call_target_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "call target is not meter_ok".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 32,
+            preview: "pub fn meter_rule_016(signal: &Signal) -> Option<MeterItem> { meter_ok(signal, \"meter_rule_016\", 6016) }".to_string(),
+        }],
+    };
+
+    assert!(
+        failed_verdict_contradicts_pass_only_target_evidence(
+            &call_target_response,
+            "Inspect `meter_rule_016`. Pass only if the call target is `meter_ok`.",
+            &Some(("src/meter.rs".to_string(), 32)),
+        )
+        .is_some()
+    );
+
+    let direct_result_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "does not return helper directly".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 22,
+            preview: "pub fn meter_rule_006(signal: &Signal) -> Option<MeterItem> { meter_ok(signal, \"meter_rule_006\", 6006) }".to_string(),
+        }],
+    };
+
+    assert!(failed_verdict_contradicts_pass_only_target_evidence(
+        &direct_result_response,
+        "Inspect `meter_rule_006`. Pass only if the rule returns the `meter_ok` result directly.",
+        &Some(("src/meter.rs".to_string(), 22)),
+    )
+    .is_some());
+
+    let literal_contains_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "literal lacks 015".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 31,
+            preview: "pub fn meter_rule_015(signal: &Signal) -> Option<MeterItem> { meter_ok(signal, \"meter_rule_015\", 6015) }".to_string(),
+        }],
+    };
+
+    assert!(
+        failed_verdict_contradicts_pass_only_target_evidence(
+            &literal_contains_response,
+            "Inspect `meter_rule_015`. Pass only if its literal label contains `015`.",
+            &Some(("src/meter.rs".to_string(), 31)),
+        )
+        .is_some()
+    );
+
+    let avoids_helper_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "calls bounded_value through helper".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 39,
+            preview: "pub fn meter_rule_023(signal: &Signal) -> Option<MeterItem> { meter_ok(signal, \"meter_rule_023\", 6023) }".to_string(),
+        }],
+    };
+
+    assert!(
+        failed_verdict_contradicts_pass_only_target_evidence(
+            &avoids_helper_response,
+            "Inspect `meter_rule_023`. Pass only if it avoids calling `bounded_value` itself.",
+            &Some(("src/meter.rs".to_string(), 39)),
+        )
+        .is_some()
+    );
+
+    let route_literal_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "literal is wrong".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 20,
+            preview: "pub fn meter_rule_004(signal: &Signal) -> Option<MeterItem> { meter_ok(signal, \"meter_rule_004\", 6004) }".to_string(),
+        }],
+    };
+
+    assert!(
+        failed_verdict_contradicts_pass_only_target_evidence(
+            &route_literal_response,
+            "Inspect `meter_rule_004`. Pass only if the route name literal is `meter_rule_004`.",
+            &Some(("src/meter.rs".to_string(), 20)),
+        )
+        .is_some()
+    );
+
+    let no_local_variable_response = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "has a local variable".to_string(),
+        evidence: vec![Evidence {
+            path: "src/meter.rs".to_string(),
+            line: 36,
+            preview: "pub fn meter_rule_020(signal: &Signal) -> Option<MeterItem> { meter_ok(signal, \"meter_rule_020\", 6020) }".to_string(),
+        }],
+    };
+
+    assert!(
+        failed_verdict_contradicts_pass_only_target_evidence(
+            &no_local_variable_response,
+            "Inspect `meter_rule_020`. Pass only if it has no local variable before returning.",
+            &Some(("src/meter.rs".to_string(), 36)),
+        )
+        .is_some()
+    );
 }
 
 #[tokio::test]

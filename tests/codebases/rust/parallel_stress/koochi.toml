@@ -30,7 +30,7 @@ instruction = "Inspect `meter_bad_short_key`. Fail if the `format!` call uses `n
 [[test]]
 id = "fail-row-group-skip"
 severity = "critical"
-instruction = "Inspect `row_bad_group_skip`. Fail if its body returns `Some(format!(...))` without any `row_ok` call."
+instruction = "Inspect `row_bad_group_skip`. Fail if its own body contains `Some(format!` and does not contain a `row_ok(` call."
 
 [[test]]
 id = "fail-row-plain-zone"
@@ -45,7 +45,7 @@ instruction = "Inspect `row_bad_closed_item`. Fail if its body returns `Some(for
 [[test]]
 id = "fail-gate-missing-label"
 severity = "critical"
-instruction = "Inspect `gate_bad_missing_label`. Fail if `decision.open` becomes true without `label_present(request)`."
+instruction = "Inspect `gate_bad_missing_label`. Fail if its own body assigns `decision.open = true` without checking `label_present(request)` in that same body."
 
 [[test]]
 id = "fail-gate-single-stamp"
@@ -95,7 +95,7 @@ instruction = "Inspect `meter_rule_008`. Pass only if the string literal ends wi
 [[test]]
 id = "pass-meter-rule-009"
 severity = "medium"
-instruction = "Inspect `meter_rule_009`. Pass only if no `meter_item` call appears in its body."
+instruction = "Inspect `meter_rule_009`. Pass only if no `meter_item` text appears in the lexical body of `meter_rule_009`; ignore helper bodies."
 
 [[test]]
 id = "pass-meter-rule-010"
@@ -115,7 +115,7 @@ instruction = "Inspect `meter_rule_012`. Pass only if the last `meter_ok` argume
 [[test]]
 id = "pass-meter-rule-013"
 severity = "medium"
-instruction = "Inspect `meter_rule_013`. Pass only if the function body contains no `if` branch."
+instruction = "Inspect `meter_rule_013`. Pass only if the lexical body of `meter_rule_013` contains no `if` token; ignore helper bodies."
 
 [[test]]
 id = "pass-meter-rule-014"
@@ -135,7 +135,7 @@ instruction = "Inspect `meter_rule_016`. Pass only if the call target is `meter_
 [[test]]
 id = "pass-meter-rule-017"
 severity = "medium"
-instruction = "Inspect `meter_rule_017`. Pass only if the original `signal` reference is forwarded."
+instruction = "Inspect `meter_rule_017`. Pass only if the first argument to `meter_ok` is exactly `signal`."
 
 [[test]]
 id = "pass-meter-rule-018"
@@ -155,12 +155,12 @@ instruction = "Inspect `meter_rule_020`. Pass only if it has no local variable b
 [[test]]
 id = "pass-meter-rule-021"
 severity = "medium"
-instruction = "Inspect `meter_rule_021`. Pass only if the helper call includes a label argument."
+instruction = "Inspect `meter_rule_021`. Pass only if the second argument to `meter_ok` is the string literal `meter_rule_021`."
 
 [[test]]
 id = "pass-meter-rule-022"
 severity = "medium"
-instruction = "Inspect `meter_rule_022`. Pass only if the label suffix is `022`."
+instruction = "Inspect `meter_rule_022`. Pass only if the `meter_ok` string literal ends with suffix `022`."
 
 [[test]]
 id = "pass-meter-rule-023"
