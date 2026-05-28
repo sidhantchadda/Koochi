@@ -451,12 +451,17 @@ where
                 .filter(|(candidate_index, _)| !completed_batch_indexes.contains(candidate_index))
                 .map(|(_, agent)| agent.id.clone())
                 .collect::<Vec<_>>();
+            let validated_status = verdict_from_loop_result(&chunk[index], &result).status;
+            let debug_stats = result.debug_stats.clone().map(|mut stats| {
+                stats.status = validated_status;
+                stats
+            });
             progress(AgentProgressEvent::AgentCompleted {
                 test_id: chunk[index].id.clone(),
                 completed_agents: completed_agent_count,
                 total_agents: total_agent_count,
                 running_agent_ids,
-                debug_stats: result.debug_stats.clone(),
+                debug_stats,
             });
             indexed_results.push((index, result));
                 }
@@ -532,7 +537,7 @@ where
             coverage_pass_rejections,
             llm_elapsed,
         });
-        for (agent, loop_result) in chunk.iter().zip(loop_results) {
+        for (agent, loop_result) in chunk.iter().zip(&loop_results) {
             verdicts.push(verdict_from_loop_result(agent, loop_result));
         }
     }
@@ -608,7 +613,7 @@ where
         trace,
     )
     .await?;
-    Ok(verdict_from_loop_result(&agent, loop_result))
+    Ok(verdict_from_loop_result(&agent, &loop_result))
 }
 
 struct AgentLoopResult {
@@ -1138,6 +1143,24 @@ where
                     &mut history,
                     format!(
                         "\n\nStep {step} failed verdict evidence rejected:\n{guidance}\n\nUse exact path, line, and preview values from a targeted content observation, then return failed only if that exact line demonstrates the issue. Otherwise return passed/no concrete finding."
+                    ),
+                );
+                continue;
+            }
+            if let Some(guidance) = failed_verdict_lacks_target_symbol_evidence(
+                &final_response,
+                &agent.instruction,
+                &grounded.target_context_line,
+            ) && !is_absence_policy(&agent.instruction)
+            {
+                trace(AgentTraceEvent::PrematureFinal {
+                    step,
+                    guidance: guidance.clone(),
+                });
+                push_history(
+                    &mut history,
+                    format!(
+                        "\n\nStep {step} failed verdict rejected:\n{guidance}\n\nUse exact evidence from the named target's own source line or body. Return failed only if that target demonstrates the issue; otherwise return passed/no concrete finding."
                     ),
                 );
                 continue;
@@ -1896,7 +1919,7 @@ where
 }
 
 fn evidence_preview_matches_actual_line(preview: &str, actual: &str) -> bool {
-    let preview = preview.trim();
+    let preview = strip_observation_line_number(preview.trim());
     let actual = actual.trim();
     if preview == actual || actual.contains(preview) {
         return true;
@@ -1919,6 +1942,17 @@ fn evidence_preview_matches_actual_line(preview: &str, actual: &str) -> bool {
         return true;
     }
     false
+}
+
+fn strip_observation_line_number(value: &str) -> &str {
+    let Some((prefix, rest)) = value.split_once(':') else {
+        return value;
+    };
+    if prefix.chars().all(|ch| ch.is_ascii_digit()) {
+        rest.trim_start()
+    } else {
+        value
+    }
 }
 
 fn failed_verdict_lacks_full_repo_focus_evidence(
@@ -1950,6 +1984,51 @@ fn failed_verdict_lacks_full_repo_focus_evidence(
             .filter(|term| description_contains_term(&path, term))
             .count();
         preview_matches >= 2 || (preview_matches >= 1 && path_matches >= 2)
+    })
+}
+
+fn failed_verdict_lacks_target_symbol_evidence(
+    response: &LlmResponse,
+    instruction: &str,
+    target_context_line: &Option<(String, u32)>,
+) -> Option<String> {
+    if response.status != TestStatus::Failed || response.evidence.is_empty() {
+        return None;
+    }
+    let target_symbol = first_backticked_target(instruction)?;
+    let (target_path, target_line) = target_context_line.as_ref()?;
+    let lower_instruction = instruction.to_ascii_lowercase();
+    let failure_condition = lower_instruction
+        .split_once("fail if")
+        .map(|(_, condition)| condition)
+        .and_then(|condition| condition.split(['.', '\n']).next())
+        .unwrap_or(&lower_instruction);
+    let failure_terms = failure_condition_terms(failure_condition);
+
+    let has_target_evidence = response.evidence.iter().any(|evidence| {
+        if &evidence.path != target_path {
+            return false;
+        }
+        let preview = evidence.preview.to_ascii_lowercase();
+        if description_contains_term(&preview, &target_symbol) {
+            return true;
+        }
+        if evidence.line == *target_line && substantive_failure_preview(&preview) {
+            return true;
+        }
+        if evidence.line < *target_line || starts_new_rust_function(&preview) {
+            return false;
+        }
+        let matched_failure_terms = failure_terms
+            .iter()
+            .filter(|term| description_contains_term(&preview, term))
+            .count();
+        matched_failure_terms >= failure_terms.len().min(2)
+    });
+    (!has_target_evidence).then(|| {
+        format!(
+            "Failed verdict evidence must come from the named target `{target_symbol}` at {target_path}:{target_line} or from that target's body. Do not cite unrelated sibling declarations or helper lines."
+        )
     })
 }
 
@@ -3321,17 +3400,18 @@ impl NonProgressState {
         let count = self.tool_calls.entry(key.clone()).or_default();
         *count += 1;
         let repeated = *count > 1;
-        let broad_without_content = matches!(
+        let broad_tool = matches!(
             key,
             ToolCacheKey::ListFiles(_) | ToolCacheKey::ListReviewHunks
-        ) && !has_content_observation;
+        );
+        let broad_without_content = broad_tool && !has_content_observation;
         if broad_without_content {
             self.broad_without_content += 1;
         }
         if repeated || self.broad_without_content > 3 {
-            if self.warned && !has_content_observation {
+            if self.warned && (broad_tool || !has_content_observation) {
                 return Some(NonProgressDecision::Terminate(format!(
-                    "Repeated non-progress tool use ({}) without concrete content inspection.",
+                    "Repeated non-progress tool use ({}) after prior guidance.",
                     tool_cache_key_label(&key)
                 )));
             }
@@ -3687,7 +3767,7 @@ where
                     "path": response.path,
                     "start_line": response.start_line,
                     "end_line": response.end_line,
-                    "content": response.content
+                    "content": line_numbered_content(&response.content, response.start_line)
                 })
                 .to_string(),
                 evidence_lines,
@@ -3739,7 +3819,10 @@ where
                 json!({
                     "path": response.path,
                     "line_count": response.line_count,
-                    "content": response.content.lines().take(MAX_READ_FILE_LINES).collect::<Vec<_>>().join("\n")
+                    "content": line_numbered_content(
+                        &response.content.lines().take(MAX_READ_FILE_LINES).collect::<Vec<_>>().join("\n"),
+                        1
+                    )
                 })
                 .to_string(),
                 evidence_lines,
@@ -3780,7 +3863,7 @@ where
                     "path": response.path,
                     "start_line": response.start_line,
                     "end_line": response.end_line,
-                    "content": response.content
+                    "content": line_numbered_content(&response.content, response.start_line)
                 })
                 .to_string(),
                 evidence_lines,

@@ -252,6 +252,46 @@ async fn full_repo_prompt_maps_changed_wording_to_repo_code() {
 }
 
 #[tokio::test]
+async fn full_repo_prompt_includes_exact_backticked_target_line() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn helper() {}\npub fn dangerous_target() { risky_call(); }\n",
+    )
+    .unwrap();
+    let search = Arc::new(session_with_mode(
+        temp.path().to_path_buf(),
+        ReviewMode::FullRepoFallback,
+    ));
+    let bus = Arc::new(FakeLlmBus::new());
+    run_agents(
+        vec![AgentSpec {
+            id: "dangerous-target".to_string(),
+            name: "dangerous-target".to_string(),
+            instruction: "Inspect `dangerous_target`. Fail if its body calls `risky_call`."
+                .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    let request = bus.requests().await.remove(0);
+    assert!(request.instruction.contains("Full-repo mode is active"));
+    assert!(
+        request
+            .instruction
+            .contains("Exact target symbol line for get_file_context: lib.rs:2")
+    );
+}
+
+#[tokio::test]
 async fn full_repo_inventory_reads_all_source_files_before_first_llm_step() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("lib.rs"), "pub fn first() {}\n").unwrap();
@@ -670,6 +710,155 @@ async fn debug_diagnostics_emit_agent_stats_and_dedupe_unique_loc() {
     assert_eq!(stats.unique_loc_read, 3);
     assert_eq!(stats.review_scope_loc, 3);
     assert_eq!(stats.tool_counts.get("read_file"), Some(&1));
+}
+
+#[tokio::test]
+async fn debug_stats_report_validated_status_after_failed_verdict_downgrade() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("changed.rs"), "pub fn safe() {}\n").unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "pub fn safe() {}".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await.unwrap());
+    let bus = Arc::new(ScriptedActionBus::new(vec![
+        Ok(LlmAction::Tool(LlmToolCall::ReadFile {
+            path: "changed.rs".to_string(),
+        })),
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Failed,
+            severity: Some(Severity::High),
+            description: "claimed issue with no accepted evidence".to_string(),
+            evidence: vec![Evidence {
+                path: "changed.rs".to_string(),
+                line: 99,
+                preview: "pub fn dangerous() {}".to_string(),
+            }],
+        })),
+    ]));
+    let mut debug_stats = Vec::new();
+
+    let verdicts = run_agents_with_inventory_and_progress_and_diagnostics(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Fail if code calls dangerous with concrete evidence.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus,
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+        inventory,
+        AgentDiagnostics::default().with_debug_analytics(true),
+        |event| {
+            if let AgentProgressEvent::AgentCompleted {
+                debug_stats: stats, ..
+            } = event
+            {
+                debug_stats.push(stats);
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    let stats = debug_stats.pop().flatten().expect("debug stats");
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert_eq!(stats.status, TestStatus::Passed);
+    assert!(verdicts[0].description.contains("No changed or causal"));
+}
+
+#[tokio::test]
+async fn repeated_broad_tools_after_coverage_terminate_without_spinning() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "pub fn safe() {}\n").unwrap();
+    let search = Arc::new(session(temp.path().to_path_buf()));
+    let inventory = Arc::new(build_review_scope_inventory(search.as_ref()).await.unwrap());
+    let bus = Arc::new(ScriptedActionBus::new(vec![
+        Ok(LlmAction::Final(LlmResponse {
+            status: TestStatus::Passed,
+            severity: None,
+            description: "first pass".to_string(),
+            evidence: Vec::new(),
+        })),
+        Ok(LlmAction::Tool(LlmToolCall::ListFiles {
+            kind: Some("source".to_string()),
+        })),
+        Ok(LlmAction::Tool(LlmToolCall::ListFiles {
+            kind: Some("source".to_string()),
+        })),
+        Ok(LlmAction::Tool(LlmToolCall::ListFiles {
+            kind: Some("source".to_string()),
+        })),
+    ]));
+    let mut debug_stats = Vec::new();
+
+    let verdicts = run_agents_with_inventory_and_progress_and_diagnostics(
+        vec![AgentSpec {
+            id: "one".to_string(),
+            name: "one".to_string(),
+            instruction: "Pass this invariant after review.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: None,
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+        inventory,
+        AgentDiagnostics::default().with_debug_analytics(true),
+        |event| {
+            if let AgentProgressEvent::AgentCompleted {
+                debug_stats: stats, ..
+            } = event
+            {
+                debug_stats.push(stats);
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    let stats = debug_stats.pop().flatten().expect("debug stats");
+    assert_eq!(bus.request_count().await, 4);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert!(
+        verdicts[0]
+            .description
+            .contains("Repeated non-progress tool use")
+    );
+    assert_eq!(stats.non_progress_terminations, 1);
+    assert_eq!(stats.coverage_chunks_delivered, 1);
 }
 
 #[tokio::test]
@@ -1815,6 +2004,60 @@ async fn failed_verdict_with_unrelated_review_context_is_downgraded() {
             .description
             .contains("No changed or causal review evidence")
     );
+}
+
+#[tokio::test]
+async fn failed_verdict_for_named_target_rejects_sibling_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("lib.rs"),
+        "pub fn danger_target(signal: &Signal) -> i64 { signal.value * 100 }\npub fn sibling(signal: &Signal) -> i64 { signal.value * 100 }\n",
+    )
+    .unwrap();
+    let search = Arc::new(session_with_mode(
+        temp.path().to_path_buf(),
+        ReviewMode::FullRepoFallback,
+    ));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"read_file","path":"lib.rs"}"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"sibling multiplies signal.value directly",
+                "evidence":[{"path":"lib.rs","line":2,"preview":"pub fn sibling(signal: &Signal) -> i64 { signal.value * 100 }"}]
+            }"#,
+        r#"{
+                "action":"final",
+                "status":"failed",
+                "severity":"high",
+                "description":"danger_target multiplies signal.value directly",
+                "evidence":[{"path":"lib.rs","line":1,"preview":"pub fn danger_target(signal: &Signal) -> i64 { signal.value * 100 }"}]
+            }"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "danger-target".to_string(),
+            name: "danger-target".to_string(),
+            instruction:
+                "Inspect `danger_target`. Fail if its body contains direct multiplication of `signal.value`."
+                    .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 3);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence[0].line, 1);
 }
 
 #[tokio::test]
@@ -3001,6 +3244,31 @@ async fn failed_verdict_requires_preview_to_match_actual_source_line() {
         failed_verdict_has_mismatched_evidence_preview(
             &search,
             &exact,
+            &evidence_index,
+            &review_paths,
+            &changed_lines,
+            &relevant_changed_lines
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+
+    let line_numbered_preview = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "status boundary issue".to_string(),
+        evidence: vec![Evidence {
+            path: "src/lib.rs".to_string(),
+            line: 2,
+            preview: "2: return make_network_error();".to_string(),
+        }],
+    };
+
+    assert!(
+        failed_verdict_has_mismatched_evidence_preview(
+            &search,
+            &line_numbered_preview,
             &evidence_index,
             &review_paths,
             &changed_lines,

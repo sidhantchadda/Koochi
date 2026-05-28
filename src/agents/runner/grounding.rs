@@ -1,4 +1,5 @@
 use super::*;
+use crate::search::TextMatch;
 
 pub(super) async fn build_grounded_request<S>(
     agent: &AgentSpec,
@@ -21,6 +22,10 @@ where
         .map_err(|err| AgentError::Search(err.to_string()))?
         .hunks;
     let full_repo_mode = matches!(search.review_mode(), Some(ReviewMode::FullRepo));
+    let full_repo_context_mode = matches!(
+        search.review_mode(),
+        Some(ReviewMode::FullRepo | ReviewMode::FullRepoFallback)
+    );
 
     let file_count = files.len();
     let review_paths = files.iter().cloned().collect::<HashSet<_>>();
@@ -39,7 +44,8 @@ where
     };
     let hunk_packet = format_review_hunk_packet(&hunks);
     let focus = InvariantFocus::new(&agent.id, &agent.instruction, &hunks);
-    let target_context_line = instruction_target_context_line(&agent.instruction, &hunks);
+    let target_context_line =
+        instruction_target_context_line(&agent.instruction, &hunks, &review_paths, search).await?;
     let focus_summary = focus.format_summary(target_context_line.as_ref());
     let hunk_packet_tokens = estimate_tokens(&hunk_packet);
     let full_packet_tokens = estimate_tokens(&format!(
@@ -59,7 +65,7 @@ where
             hunk_packet_tokens,
             hunk_summary
         )
-    } else if full_repo_mode {
+    } else if full_repo_context_mode {
         let search_terms = full_repo_search_terms(&focus.terms);
         let search_terms_hint = if search_terms.is_empty() {
             "(none)".to_string()
@@ -67,11 +73,11 @@ where
             search_terms.join(", ")
         };
         format!(
-            "{file_inventory}\n\nFull-repo mode is active. There is no changed diff or hunk packet. The review-scope source files above are the repository code under review for this run. Koochi will not accept a passed verdict until it has shown this agent every review-scope source chunk. If an invariant says \"changed code\", \"changed <area>\", or similar diff-oriented wording, interpret that as \"review-scope repository code\" in full-repo mode; do not return passed merely because no diff exists. Suggested full-repo search terms from this invariant: {search_terms_hint}. Use search_text, get_file_context, read_file, find_definitions, or find_references for targeted investigation when useful. Do not call list_files first; Koochi already supplied a source-file inventory preview, and broad file listing is not investigation. Failed verdicts require targeted content inspection first with get_file_context or read_file, and final failed evidence may come from any inspected review-scope source file or delivered coverage chunk that demonstrates the invariant violation."
+            "{file_inventory}\n\n{focus_summary}\n\nFull-repo mode is active. There is no changed diff or hunk packet. The review-scope source files above are the repository code under review for this run. Koochi will not accept a passed verdict until it has shown this agent every review-scope source chunk. If an invariant says \"changed code\", \"changed <area>\", or similar diff-oriented wording, interpret that as \"review-scope repository code\" in full-repo mode; do not return passed merely because no diff exists. Suggested full-repo search terms from this invariant: {search_terms_hint}. Use search_text, get_file_context, read_file, find_definitions, or find_references for targeted investigation when useful. Do not call list_files first; Koochi already supplied a source-file inventory preview, and broad file listing is not investigation. Failed verdicts require targeted content inspection first with get_file_context or read_file, and final failed evidence may come from any inspected review-scope source file or delivered coverage chunk that demonstrates the invariant violation."
         )
     } else {
         format!(
-            "{file_inventory}\nKoochi will not accept a passed verdict until it has shown this agent every review-scope source chunk. In commit, range, and local-change modes, review-scope source files are the changed source files for that review target. Only fail when the concrete issue is in one of these review-scope files. You may use list_files, search_text, read_file, get_file_context, find_definitions, or find_references to gather context from the wider repository when needed, but final failed evidence must come from review-scope files or delivered coverage chunks."
+            "{file_inventory}\n\n{focus_summary}\n\nKoochi will not accept a passed verdict until it has shown this agent every review-scope source chunk. In commit, range, and local-change modes, review-scope source files are the changed source files for that review target. Only fail when the concrete issue is in one of these review-scope files. You may use list_files, search_text, read_file, get_file_context, find_definitions, or find_references to gather context from the wider repository when needed, but final failed evidence must come from review-scope files or delivered coverage chunks."
         )
     };
     let evidence_index = HashSet::new();
@@ -237,17 +243,46 @@ impl InvariantFocus {
     }
 }
 
-fn instruction_target_context_line(
+async fn instruction_target_context_line<S>(
+    instruction: &str,
+    hunks: &[ReviewHunk],
+    review_paths: &HashSet<String>,
+    search: &S,
+) -> Result<Option<(String, u32)>, AgentError>
+where
+    S: CodeSearchApi + ?Sized,
+    S::Error: Display,
+{
+    if let Some(target) = instruction_hunk_target_context_line(instruction, hunks) {
+        return Ok(Some(target));
+    }
+
+    let Some(target_symbol) = instruction_target_symbol(instruction) else {
+        return Ok(None);
+    };
+    let target_path = instruction_target_path(instruction);
+    let response = search
+        .search_text(SearchTextRequest {
+            query: target_symbol.clone(),
+            kind: FileKind::Source,
+        })
+        .await
+        .map_err(|err| AgentError::Search(err.to_string()))?;
+    Ok(best_target_symbol_match(
+        &target_symbol,
+        target_path.as_deref(),
+        &review_paths,
+        response.matches,
+    ))
+}
+
+fn instruction_hunk_target_context_line(
     instruction: &str,
     hunks: &[ReviewHunk],
 ) -> Option<(String, u32)> {
     let backticked = backticked_terms(instruction);
-    let target_symbol = backticked.iter().find(|term| {
-        !term.contains('/') && !term.contains('.') && term.chars().any(|ch| ch == '_')
-    })?;
-    let target_path = backticked
-        .iter()
-        .find(|term| term.contains('/') || term.ends_with(".rs"));
+    let target_symbol = instruction_target_symbol_from_terms(&backticked)?;
+    let target_path = instruction_target_path_from_terms(&backticked);
     for hunk in hunks {
         if let Some(path) = target_path
             && hunk.path != *path
@@ -263,6 +298,92 @@ fn instruction_target_context_line(
         }
     }
     None
+}
+
+fn instruction_target_symbol(instruction: &str) -> Option<String> {
+    instruction_target_symbol_from_terms(&backticked_terms(instruction)).cloned()
+}
+
+fn instruction_target_symbol_from_terms(terms: &[String]) -> Option<&String> {
+    terms
+        .iter()
+        .find(|term| is_target_symbol_term(term) && term.chars().any(|ch| ch == '_'))
+        .or_else(|| terms.iter().find(|term| is_target_symbol_term(term)))
+}
+
+fn instruction_target_path(instruction: &str) -> Option<String> {
+    instruction_target_path_from_terms(&backticked_terms(instruction)).cloned()
+}
+
+fn instruction_target_path_from_terms(terms: &[String]) -> Option<&String> {
+    terms
+        .iter()
+        .find(|term| term.contains('/') || looks_like_source_path(term))
+}
+
+fn is_target_symbol_term(term: &str) -> bool {
+    !term.is_empty()
+        && !term.contains('/')
+        && !term.contains('.')
+        && term
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && term.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+fn looks_like_source_path(term: &str) -> bool {
+    [
+        ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".kt", ".swift", ".c", ".cc",
+        ".cpp", ".h", ".hpp",
+    ]
+    .iter()
+    .any(|suffix| term.ends_with(suffix))
+}
+
+fn best_target_symbol_match(
+    target_symbol: &str,
+    target_path: Option<&str>,
+    review_paths: &HashSet<String>,
+    matches: Vec<TextMatch>,
+) -> Option<(String, u32)> {
+    let mut candidates = matches
+        .into_iter()
+        .filter(|text_match| review_paths.contains(&text_match.path))
+        .filter(|text_match| target_path.is_none_or(|target_path| text_match.path == target_path))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|text_match| {
+        (
+            target_symbol_match_rank(target_symbol, &text_match.preview),
+            text_match.path.clone(),
+            text_match.line,
+        )
+    });
+    candidates
+        .into_iter()
+        .next()
+        .map(|text_match| (text_match.path, text_match.line))
+}
+
+fn target_symbol_match_rank(target_symbol: &str, preview: &str) -> u8 {
+    let lower = preview.to_ascii_lowercase();
+    let target = target_symbol.to_ascii_lowercase();
+    let definition_needles = [
+        format!("fn {target}"),
+        format!("function {target}"),
+        format!("const {target}"),
+        format!("let {target}"),
+        format!("def {target}"),
+        format!("class {target}"),
+        format!("struct {target}"),
+    ];
+    if definition_needles
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        0
+    } else {
+        1
+    }
 }
 
 fn backticked_terms(value: &str) -> Vec<String> {

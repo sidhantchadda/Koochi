@@ -2,21 +2,21 @@ use super::*;
 
 pub(super) fn verdict_from_loop_result(
     agent: &AgentSpec,
-    loop_result: AgentLoopResult,
+    loop_result: &AgentLoopResult,
 ) -> AgentVerdict {
     let elapsed_ms = loop_result.elapsed.as_millis();
-    let response = loop_result.response;
-    let evidence_index = loop_result.evidence_index;
-    let review_paths = loop_result.review_paths;
-    let changed_lines = loop_result.changed_lines;
-    let relevant_changed_lines = loop_result.relevant_changed_lines;
-    let review_causal_terms = loop_result.review_causal_terms;
+    let response = &loop_result.response;
+    let evidence_index = &loop_result.evidence_index;
+    let review_paths = &loop_result.review_paths;
+    let changed_lines = &loop_result.changed_lines;
+    let relevant_changed_lines = &loop_result.relevant_changed_lines;
+    let review_causal_terms = &loop_result.review_causal_terms;
     let classifications = classify_evidence(
         &response.evidence,
-        &evidence_index,
-        &review_paths,
-        &changed_lines,
-        &relevant_changed_lines,
+        evidence_index,
+        review_paths,
+        changed_lines,
+        relevant_changed_lines,
     );
     let has_changed_evidence = classifications
         .iter()
@@ -30,17 +30,17 @@ pub(super) fn verdict_from_loop_result(
     let has_accepted_failure_evidence = has_changed_evidence || has_causal_review_context;
     let response_status = response.status;
     let response_severity = response.severity;
-    let response_description = response.description;
+    let response_description = response.description.clone();
     let accepted_evidence = response
         .evidence
-        .into_iter()
+        .iter()
         .filter(|evidence| {
             classify_single_evidence(
                 evidence,
-                &evidence_index,
-                &review_paths,
-                &changed_lines,
-                &relevant_changed_lines,
+                evidence_index,
+                review_paths,
+                changed_lines,
+                relevant_changed_lines,
             )
             .is_some_and(|classification| {
                 matches!(
@@ -49,6 +49,7 @@ pub(super) fn verdict_from_loop_result(
                 )
             })
         })
+        .cloned()
         .collect::<Vec<_>>();
     let (status, description) = if response_status == TestStatus::Failed
         && !has_accepted_failure_evidence
