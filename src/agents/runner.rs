@@ -3188,6 +3188,16 @@ fn failure_proof_obligations_prompt(instruction: &str) -> String {
             "- HTTP status/error-boundary invariant: require evidence of not-found/error-boundary/redirect/rendering response handling AND evidence of an incorrect HTTP status, cache directive, or response body. Filesystem/package path joins, NFT generation, or deployment manifest paths are not HTTP response status evidence.".to_string(),
         );
     }
+    if config_execution_boundary_invariant(&lower) {
+        obligations.push(
+            "- Config execution-boundary invariant: require evidence that project-controlled config/plugin/loader code is loaded or executed AND evidence that it happens in the wrong phase, runtime, directory, or trust boundary. Module graph construction, NFT tracing, and asset manifest generation alone are not config execution.".to_string(),
+        );
+    }
+    if user_controlled_internal_fetch_invariant(&lower) {
+        obligations.push(
+            "- User-controlled internal fetch invariant: require evidence of a server-side fetch/request/image/metadata/proxy path using a user-controlled URL AND evidence that protocol, hostname, allowlist, or private-network restrictions are missing. Module graphs, analysis output assets, or endpoint aggregation alone are not network fetch evidence.".to_string(),
+        );
+    }
 
     obligations.join("\n")
 }
@@ -3664,6 +3674,104 @@ fn failed_verdict_lacks_material_proof(
         }
     }
 
+    if config_execution_boundary_invariant(&instruction) {
+        let has_config_execution = contains_any(
+            &evidence,
+            &[
+                "next.config",
+                "next_config",
+                "config",
+                "plugin",
+                "loader",
+                "execute",
+                "executes",
+                "load_config",
+                "load config",
+                "require(",
+                "import(",
+            ],
+        );
+        let has_boundary_context = contains_any(
+            &evidence,
+            &[
+                "phase",
+                "runtime",
+                "directory",
+                "trust",
+                "boundary",
+                "project-controlled",
+                "untrusted",
+                "initialization",
+                "outside",
+                "sandbox",
+            ],
+        );
+        if !has_config_execution || !has_boundary_context {
+            return Some(format!(
+                "Config execution-boundary failures must cite project-controlled config/plugin/loader execution and the unintended phase/runtime/directory/trust boundary. Current evidence is missing {}.",
+                missing_pair(
+                    has_config_execution,
+                    "project-controlled config/plugin/loader execution",
+                    has_boundary_context,
+                    "the unintended execution boundary"
+                )
+            ));
+        }
+    }
+
+    if user_controlled_internal_fetch_invariant(&instruction) {
+        let has_network_request = contains_any(
+            &evidence,
+            &[
+                "fetch(", "request(", "http", "https", "url", "uri", "hostname", "remote", "image",
+                "proxy", "metadata",
+            ],
+        );
+        let has_user_controlled_source = contains_any(
+            &evidence,
+            &[
+                "user",
+                "request",
+                "params",
+                "query",
+                "searchparams",
+                "headers",
+                "input",
+                "untrusted",
+                "controlled",
+            ],
+        );
+        let has_missing_restriction = contains_any(
+            &evidence,
+            &[
+                "allowlist",
+                "allowed",
+                "protocol",
+                "hostname",
+                "private-network",
+                "private network",
+                "restrict",
+                "validate",
+                "validation",
+                "remote_patterns",
+                "remotepatterns",
+            ],
+        );
+        if !has_network_request || !has_user_controlled_source || !has_missing_restriction {
+            return Some(format!(
+                "User-controlled internal-fetch failures must cite a server-side network request, the user-controlled URL source, and the missing protocol/hostname/private-network restriction. Current evidence is missing {}.",
+                missing_triple(
+                    has_network_request,
+                    "the server-side network request",
+                    has_user_controlled_source,
+                    "the user-controlled URL source",
+                    has_missing_restriction,
+                    "the missing URL/network restriction"
+                )
+            ));
+        }
+    }
+
     None
 }
 
@@ -3785,6 +3893,43 @@ fn http_status_boundary_invariant(instruction: &str) -> bool {
             "response body",
             "404",
             "500",
+        ],
+    )
+}
+
+fn config_execution_boundary_invariant(instruction: &str) -> bool {
+    contains_any(
+        instruction,
+        &["config loading", "config", "plugin", "loader"],
+    ) && contains_any(
+        instruction,
+        &[
+            "executes",
+            "execution",
+            "runtime",
+            "trust boundary",
+            "phase",
+        ],
+    )
+}
+
+fn user_controlled_internal_fetch_invariant(instruction: &str) -> bool {
+    contains_any(
+        instruction,
+        &[
+            "fetch",
+            "image optimization",
+            "metadata",
+            "route handler",
+            "proxy",
+        ],
+    ) && contains_any(
+        instruction,
+        &[
+            "user-controlled url",
+            "protocol",
+            "hostname",
+            "private-network",
         ],
     )
 }

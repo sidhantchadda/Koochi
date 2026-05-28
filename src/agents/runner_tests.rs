@@ -2297,6 +2297,40 @@ fn material_proof_gate_rejects_nextjs_false_positive_shapes() {
     )
     .unwrap()
     .contains("HTTP status"));
+
+    let config_boundary_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Config execution boundary is violated.".to_string(),
+        evidence: vec![Evidence {
+            path: "crates/next-api/src/instrumentation.rs".to_string(),
+            line: 189,
+            preview: "NftJsonAsset::new(".to_string(),
+        }],
+    };
+    assert!(failed_verdict_lacks_material_proof(
+        &config_boundary_false,
+        "Fail if changed Next.js config loading code executes project-controlled config, plugin, or loader code in an unintended phase, runtime, directory, or trust boundary."
+    )
+    .unwrap()
+    .contains("Config execution-boundary"));
+
+    let internal_fetch_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Analyze paths can include user-controlled endpoints.".to_string(),
+        evidence: vec![Evidence {
+            path: "crates/next-napi-bindings/src/next_api/analyze.rs".to_string(),
+            line: 113,
+            preview: "let modules_data = ResolvedVc::upcast(".to_string(),
+        }],
+    };
+    assert!(failed_verdict_lacks_material_proof(
+        &internal_fetch_false,
+        "Fail if changed server-side fetch, image optimization, metadata, route handler, or proxy code can request a user-controlled URL without protocol, hostname, or private-network restrictions."
+    )
+    .unwrap()
+    .contains("User-controlled internal-fetch"));
 }
 
 #[test]
