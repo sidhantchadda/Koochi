@@ -2198,6 +2198,64 @@ fn material_proof_gate_rejects_nextjs_false_positive_shapes() {
     )
     .unwrap()
     .contains("Redirect-target"));
+
+    let revalidation_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Dependent cache entries are not invalidated.".to_string(),
+        evidence: vec![
+            Evidence {
+                path: "crates/next-api/src/next_server_nft.rs".to_string(),
+                line: 22,
+                preview: "module::{Module, Modules},".to_string(),
+            },
+            Evidence {
+                path: "crates/next-api/src/next_server_nft.rs".to_string(),
+                line: 31,
+                preview: "relativize_glob, traced_modules_for_entries".to_string(),
+            },
+        ],
+    };
+    assert!(failed_verdict_lacks_material_proof(
+        &revalidation_false,
+        "Fail if changed revalidation code updates data without invalidating all dependent route, tag, path, fetch, or router cache entries that can serve stale content."
+    )
+    .unwrap()
+    .contains("Revalidation/cache"));
+
+    let compiler_cache_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Compiler cache may reuse stale artifacts after config changes.".to_string(),
+        evidence: vec![Evidence {
+            path: "crates/next-api/src/next_server_nft.rs".to_string(),
+            line: 178,
+            preview: "file.read().hash(HashAlgorithm::Xxh3Hash128Hex).await?".to_string(),
+        }],
+    };
+    assert!(failed_verdict_lacks_material_proof(
+        &compiler_cache_false,
+        "Fail if changed webpack, Turbopack, SWC, Rspack, or compiler cache code can reuse stale artifacts after relevant config, env, dependency graph, runtime target, or feature flag inputs change."
+    )
+    .unwrap()
+    .contains("Compiler-cache"));
+
+    let filesystem_false = LlmResponse {
+        status: TestStatus::Failed,
+        severity: Some(Severity::High),
+        description: "Path handling lacks containment checks.".to_string(),
+        evidence: vec![Evidence {
+            path: "crates/next-api/src/next_server_nft.rs".to_string(),
+            line: 178,
+            preview: "file.read().hash(HashAlgorithm::Xxh3Hash128Hex).await?".to_string(),
+        }],
+    };
+    assert!(failed_verdict_lacks_material_proof(
+        &filesystem_false,
+        "Fail if changed filesystem, static serving, tracing, cache, output, or build artifact code can read or write paths derived from user or config input without normalization and repository/root containment checks."
+    )
+    .unwrap()
+    .contains("Filesystem path"));
 }
 
 #[test]

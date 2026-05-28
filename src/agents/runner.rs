@@ -3124,6 +3124,21 @@ fn failure_proof_obligations_prompt(instruction: &str) -> String {
             "- Redirect-target invariant: require evidence of redirect/rewrite/navigation/Location handling AND URL/destination/target sanitization behavior. Filesystem `relative` paths, `get_relative_path_to`, module paths, or deployment manifest paths are not redirect-target evidence.".to_string(),
         );
     }
+    if revalidation_cache_invariant(&lower) {
+        obligations.push(
+            "- Revalidation/cache invalidation invariant: require evidence of a revalidation or data-update path AND evidence that dependent route/tag/path/fetch/router cache invalidation is omitted or incomplete. Generic module imports, module graphs, NFT tracing, file hashes, or build artifact manifests are not revalidation evidence.".to_string(),
+        );
+    }
+    if compiler_cache_config_invariant(&lower) {
+        obligations.push(
+            "- Compiler-cache/config invariant: require evidence of a webpack/Turbopack/SWC/Rspack compiler cache reuse path AND evidence that relevant config/env/dependency-graph/runtime-target/feature-flag inputs are omitted from the key or invalidation. Asset hashing, file tracing, or NFT output generation alone is not stale compiler-cache evidence.".to_string(),
+        );
+    }
+    if filesystem_path_containment_invariant(&lower) {
+        obligations.push(
+            "- Filesystem path containment invariant: require evidence of a filesystem read/write/serve/trace path derived from user or config input AND evidence that normalization or repository/root containment is missing. Internal relative path calculations, vendored file hashing, and manifest path serialization are not path traversal evidence by themselves.".to_string(),
+        );
+    }
 
     obligations.join("\n")
 }
@@ -3351,6 +3366,165 @@ fn failed_verdict_lacks_material_proof(
         }
     }
 
+    if revalidation_cache_invariant(&instruction) {
+        let has_revalidation_path = contains_any(
+            &evidence,
+            &[
+                "revalidate",
+                "revalidation",
+                "invalidate",
+                "invalidates",
+                "update_tag",
+                "revalidate_tag",
+                "revalidate_path",
+                "stale",
+            ],
+        );
+        let has_dependent_cache = contains_any(
+            &evidence,
+            &[
+                "route cache",
+                "router cache",
+                "fetch cache",
+                "data cache",
+                "cache entry",
+                "cache entries",
+                "tag",
+                "path",
+                "dependent",
+            ],
+        );
+        if !has_revalidation_path || !has_dependent_cache {
+            return Some(format!(
+                "Revalidation/cache invalidation failures must cite both a revalidation or data-update path and the dependent cache entries that are not invalidated. Current evidence is missing {}.",
+                missing_pair(
+                    has_revalidation_path,
+                    "the revalidation/data-update path",
+                    has_dependent_cache,
+                    "the dependent cache invalidation target"
+                )
+            ));
+        }
+    }
+
+    if compiler_cache_config_invariant(&instruction) {
+        let has_compiler_cache = contains_any(
+            &evidence,
+            &[
+                "webpack",
+                "turbopack",
+                "swc",
+                "rspack",
+                "compiler",
+                "compile",
+                "cache",
+                "artifact",
+            ],
+        );
+        let has_config_input = contains_any(
+            &evidence,
+            &[
+                "config",
+                "next_config",
+                "env",
+                "dependency",
+                "module graph",
+                "module_graph",
+                "runtime",
+                "target",
+                "feature flag",
+                "feature_flag",
+            ],
+        );
+        let has_reuse_or_invalidation = contains_any(
+            &evidence,
+            &[
+                "reuse",
+                "reused",
+                "stale",
+                "invalidate",
+                "invalidates",
+                "key",
+                "cache key",
+            ],
+        );
+        if !has_compiler_cache || !has_config_input || !has_reuse_or_invalidation {
+            return Some(format!(
+                "Compiler-cache/config failures must cite compiler-cache behavior, the relevant config/env/dependency/runtime input, and the missing cache-key or invalidation link. Current evidence is missing {}.",
+                missing_triple(
+                    has_compiler_cache,
+                    "compiler-cache behavior",
+                    has_config_input,
+                    "the config/env/dependency/runtime input",
+                    has_reuse_or_invalidation,
+                    "the stale reuse/cache-key/invalidation link"
+                )
+            ));
+        }
+    }
+
+    if filesystem_path_containment_invariant(&instruction) {
+        let has_filesystem_path = contains_any(
+            &evidence,
+            &[
+                "filesystempath",
+                "file system path",
+                "path",
+                ".join(",
+                "read_dir",
+                "read(",
+                "write",
+                "serve",
+                "trace",
+                "tracing",
+                "output",
+            ],
+        );
+        let has_user_or_config_source = contains_any(
+            &evidence,
+            &[
+                "user",
+                "request",
+                "config",
+                "next_config",
+                "project_path",
+                "input",
+                "metadata",
+                "lockfile",
+                "package",
+                "caller",
+                "untrusted",
+            ],
+        );
+        let has_containment_context = contains_any(
+            &evidence,
+            &[
+                "normalize",
+                "normalization",
+                "canonical",
+                "contain",
+                "repo root",
+                "root",
+                "escape",
+                "traversal",
+                "..",
+            ],
+        );
+        if !has_filesystem_path || !has_user_or_config_source || !has_containment_context {
+            return Some(format!(
+                "Filesystem path containment failures must cite a filesystem path operation, the user/config-derived source of that path, and normalization or repository/root containment context. Current evidence is missing {}.",
+                missing_triple(
+                    has_filesystem_path,
+                    "the filesystem path operation",
+                    has_user_or_config_source,
+                    "the user/config-derived path source",
+                    has_containment_context,
+                    "the normalization or containment context"
+                )
+            ));
+        }
+    }
+
     None
 }
 
@@ -3411,6 +3585,40 @@ fn redirect_target_invariant(instruction: &str) -> bool {
     )
 }
 
+fn revalidation_cache_invariant(instruction: &str) -> bool {
+    contains_any(instruction, &["revalidation", "revalidate"])
+        && contains_any(instruction, &["cache", "router", "fetch", "stale"])
+}
+
+fn compiler_cache_config_invariant(instruction: &str) -> bool {
+    contains_any(
+        instruction,
+        &["compiler cache", "webpack", "turbopack", "swc", "rspack"],
+    ) && contains_any(
+        instruction,
+        &[
+            "config",
+            "env",
+            "dependency graph",
+            "runtime target",
+            "feature flag",
+        ],
+    )
+}
+
+fn filesystem_path_containment_invariant(instruction: &str) -> bool {
+    contains_any(instruction, &["filesystem", "path", "static serving"])
+        && contains_any(
+            instruction,
+            &[
+                "normalization",
+                "containment",
+                "repo root",
+                "repository/root",
+            ],
+        )
+}
+
 fn contains_any(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
@@ -3426,6 +3634,31 @@ fn missing_pair(
         (false, true) => first_label.to_string(),
         (true, false) => second_label.to_string(),
         (true, true) => "nothing".to_string(),
+    }
+}
+
+fn missing_triple(
+    first_present: bool,
+    first_label: &str,
+    second_present: bool,
+    second_label: &str,
+    third_present: bool,
+    third_label: &str,
+) -> String {
+    let missing = [
+        (!first_present).then_some(first_label),
+        (!second_present).then_some(second_label),
+        (!third_present).then_some(third_label),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    match missing.as_slice() {
+        [] => "nothing".to_string(),
+        [one] => (*one).to_string(),
+        [one, two] => format!("{one} and {two}"),
+        [one, two, three] => format!("{one}, {two}, and {three}"),
+        _ => missing.join(", "),
     }
 }
 
