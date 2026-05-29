@@ -87,6 +87,7 @@ where
     let relevant_changed_lines = focus.relevant_changed_lines;
     let review_causal_terms = focus.review_causal_terms;
     let full_repo_search_terms = full_repo_search_terms(&focus.terms);
+    let deterministic_failure = deterministic_failure_for_instruction(agent, &hunks, &review_paths);
 
     let instruction = grounded_agent_prompt(&agent.instruction, context.trim());
 
@@ -106,7 +107,229 @@ where
         allows_direct_verdict,
         full_repo_mode,
         full_repo_search_terms,
+        deterministic_failure,
     })
+}
+
+fn deterministic_failure_for_instruction(
+    agent: &AgentSpec,
+    hunks: &[ReviewHunk],
+    review_paths: &HashSet<String>,
+) -> Option<DeterministicFailure> {
+    deterministic_exact_token_failure(agent, hunks)
+        .or_else(|| deterministic_deleted_source_file_failure(agent, hunks, review_paths))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeterministicLineFilter {
+    Added,
+    Removed,
+    AddedOrRemoved,
+}
+
+fn deterministic_exact_token_failure(
+    agent: &AgentSpec,
+    hunks: &[ReviewHunk],
+) -> Option<DeterministicFailure> {
+    let instruction = agent.instruction.trim();
+    let lower = instruction.to_ascii_lowercase();
+    if !lower.contains("fail if") || !lower.contains("exact token") {
+        return None;
+    }
+    if exact_token_absence_check(&lower) {
+        return None;
+    }
+    let token = exact_token_from_instruction(instruction)?;
+    if token.is_empty() {
+        return None;
+    }
+    let line_filter = exact_token_line_filter(&lower);
+    let rust_only = lower.contains("rust source")
+        || lower.contains("rust line")
+        || lower.contains("rust code")
+        || lower.contains("rust file");
+    let mut evidence = Vec::new();
+    let mut evidence_lines = HashSet::new();
+
+    for hunk in hunks {
+        if rust_only && !hunk.path.ends_with(".rs") {
+            continue;
+        }
+        if !kind_matches(&hunk.path, FileKind::Source) {
+            continue;
+        }
+        for line in &hunk.lines {
+            if !line_filter_matches(line_filter, line.kind) || !line.content.contains(&token) {
+                continue;
+            }
+            let Some(line_number) = changed_line_number(line) else {
+                continue;
+            };
+            evidence_lines.insert((hunk.path.clone(), line_number));
+            evidence.push(Evidence {
+                path: hunk.path.clone(),
+                line: line_number,
+                preview: line.content.trim().to_string(),
+            });
+            if evidence.len() >= MAX_FAILURE_ADJUDICATION_EVIDENCE {
+                break;
+            }
+        }
+        if evidence.len() >= MAX_FAILURE_ADJUDICATION_EVIDENCE {
+            break;
+        }
+    }
+
+    if evidence.is_empty() {
+        return None;
+    }
+
+    let action = match line_filter {
+        DeterministicLineFilter::Added => "added",
+        DeterministicLineFilter::Removed => "removed",
+        DeterministicLineFilter::AddedOrRemoved => "changed",
+    };
+    Some(DeterministicFailure {
+        response: LlmResponse {
+            status: TestStatus::Failed,
+            severity: agent.severity,
+            description: format!(
+                "Deterministic exact-token check failed: a {action} review-scope source line contains `{token}`."
+            ),
+            evidence,
+        },
+        evidence_lines,
+    })
+}
+
+fn deterministic_deleted_source_file_failure(
+    agent: &AgentSpec,
+    hunks: &[ReviewHunk],
+    review_paths: &HashSet<String>,
+) -> Option<DeterministicFailure> {
+    let lower = agent.instruction.to_ascii_lowercase();
+    if !lower.contains("fail if")
+        || !lower.contains("entire")
+        || !lower.contains("rust source file")
+        || !contains_delete_or_remove(&lower)
+    {
+        return None;
+    }
+
+    let mut paths = hunks
+        .iter()
+        .filter(|hunk| hunk.path.ends_with(".rs"))
+        .map(|hunk| hunk.path.clone())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+
+    for path in paths {
+        if review_paths.contains(&path) {
+            continue;
+        }
+        let path_hunks = hunks
+            .iter()
+            .filter(|hunk| hunk.path == path)
+            .collect::<Vec<_>>();
+        if path_hunks.is_empty()
+            || path_hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| line.kind != ReviewLineKind::Removed)
+        {
+            continue;
+        }
+        let Some(first_line) = path_hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .find(|line| line.kind == ReviewLineKind::Removed)
+        else {
+            continue;
+        };
+        let Some(line_number) = first_line.old_line else {
+            continue;
+        };
+        let evidence = Evidence {
+            path: path.clone(),
+            line: line_number,
+            preview: first_line.content.trim().to_string(),
+        };
+        return Some(DeterministicFailure {
+            response: LlmResponse {
+                status: TestStatus::Failed,
+                severity: agent.severity,
+                description: format!(
+                    "Deterministic source-deletion check failed: the commit deletes the Rust source file `{path}`."
+                ),
+                evidence: vec![evidence],
+            },
+            evidence_lines: HashSet::from([(path, line_number)]),
+        });
+    }
+
+    None
+}
+
+fn exact_token_from_instruction(instruction: &str) -> Option<String> {
+    let lower = instruction.to_ascii_lowercase();
+    if let Some((_, rest)) = lower.split_once("exact token")
+        && let Some(token) = first_backticked_term_in_original_span(instruction, rest)
+    {
+        return Some(token);
+    }
+    backticked_terms(instruction).into_iter().next_back()
+}
+
+fn first_backticked_term_in_original_span(instruction: &str, lower_rest: &str) -> Option<String> {
+    let start = instruction.len().saturating_sub(lower_rest.len());
+    backticked_terms(instruction.get(start..).unwrap_or_default())
+        .into_iter()
+        .next()
+}
+
+fn exact_token_line_filter(instruction: &str) -> DeterministicLineFilter {
+    if contains_delete_or_remove(instruction) {
+        return DeterministicLineFilter::Removed;
+    }
+    if instruction.contains("introduces")
+        || instruction.contains("introduced")
+        || instruction.contains("adds")
+        || instruction.contains("added")
+        || instruction.contains("new ")
+        || instruction.contains("current changed")
+    {
+        return DeterministicLineFilter::Added;
+    }
+    DeterministicLineFilter::AddedOrRemoved
+}
+
+fn exact_token_absence_check(instruction: &str) -> bool {
+    instruction.contains("does not contain")
+        || instruction.contains("doesn't contain")
+        || instruction.contains("not contain")
+        || instruction.contains("missing")
+        || instruction.contains("absence")
+}
+
+fn contains_delete_or_remove(value: &str) -> bool {
+    value.contains("remove")
+        || value.contains("removes")
+        || value.contains("removed")
+        || value.contains("removal")
+        || value.contains("delete")
+        || value.contains("deletes")
+        || value.contains("deleted")
+}
+
+fn line_filter_matches(filter: DeterministicLineFilter, kind: ReviewLineKind) -> bool {
+    match filter {
+        DeterministicLineFilter::Added => kind == ReviewLineKind::Added,
+        DeterministicLineFilter::Removed => kind == ReviewLineKind::Removed,
+        DeterministicLineFilter::AddedOrRemoved => {
+            matches!(kind, ReviewLineKind::Added | ReviewLineKind::Removed)
+        }
+    }
 }
 
 fn full_repo_search_terms(terms: &[String]) -> Vec<String> {

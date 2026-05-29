@@ -110,6 +110,301 @@ async fn empty_source_scope_passes_without_llm_call() {
 }
 
 #[tokio::test]
+async fn exact_token_added_invariant_fails_deterministically_without_llm() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "fn chunking_type() {\n    mode: TracedMode::Transitive,\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 3,
+                lines: vec![
+                    ReviewHunkLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "fn chunking_type() {".to_string(),
+                    },
+                    ReviewHunkLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(2),
+                        content: "    mode: TracedMode::Transitive,".to_string(),
+                    },
+                    ReviewHunkLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(3),
+                        content: "}".to_string(),
+                    },
+                ],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(Vec::new()));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "known-fail-no-transitive-tracing-mode".to_string(),
+            name: "known-fail-no-transitive-tracing-mode".to_string(),
+            instruction: "Fail if changed Rust source introduces transitive tracing mode. Search the review scope for the exact token `TracedMode::Transitive`; any occurrence on an added or current changed Rust source line is a violation.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 0);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence[0].path, "changed.rs");
+    assert_eq!(verdicts[0].evidence[0].line, 2);
+    assert!(
+        verdicts[0].evidence[0]
+            .preview
+            .contains("TracedMode::Transitive")
+    );
+}
+
+#[tokio::test]
+async fn exact_token_removed_invariant_fails_deterministically_without_llm() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("context.rs"), "fn handler() {}\n").unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["context.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "context.rs#1".to_string(),
+                path: "context.rs".to_string(),
+                old_start: 1098,
+                old_lines: 1,
+                new_start: 1098,
+                new_lines: 0,
+                lines: vec![ReviewHunkLine {
+                    kind: ReviewLineKind::Removed,
+                    old_line: Some(1098),
+                    new_line: None,
+                    content: ".file_tracing(next_mode.is_production())".to_string(),
+                }],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(Vec::new()));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "known-fail-no-file-tracing-removal".to_string(),
+            name: "known-fail-no-file-tracing-removal".to_string(),
+            instruction: "Fail if the commit removes any Rust source line containing the exact token `file_tracing`.".to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 0);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence[0].path, "context.rs");
+    assert_eq!(verdicts[0].evidence[0].line, 1098);
+    assert!(verdicts[0].evidence[0].preview.contains("file_tracing"));
+}
+
+#[tokio::test]
+async fn exact_token_absence_invariant_is_not_inverted_deterministically() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("changed.rs"),
+        "pub fn handler() {\n    required_guard();\n}\n",
+    )
+    .unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["changed.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "changed.rs#1".to_string(),
+                path: "changed.rs".to_string(),
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 3,
+                lines: vec![
+                    ReviewHunkLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "pub fn handler() {".to_string(),
+                    },
+                    ReviewHunkLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(2),
+                        content: "    required_guard();".to_string(),
+                    },
+                    ReviewHunkLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(3),
+                        content: "}".to_string(),
+                    },
+                ],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"final","status":"passed","severity":null,"description":"guard present","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"guard present after coverage","evidence":[]}"#,
+    ]));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "absence-exact-token".to_string(),
+            name: "absence-exact-token".to_string(),
+            instruction:
+                "Fail if changed Rust source does not contain the exact token `required_guard`."
+                    .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 2);
+    assert_eq!(verdicts[0].status, TestStatus::Passed);
+    assert_eq!(verdicts[0].description, "guard present after coverage");
+}
+
+#[tokio::test]
+async fn deleted_rust_source_file_invariant_does_not_skip_empty_review_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let search = Arc::new(LocalSearchSession::new(ScopeConfig {
+        primary_repo: RepoScope {
+            repo_id: "x".to_string(),
+            root: temp.path().to_path_buf(),
+            revision: GitRevision::Head,
+        },
+        review: ReviewScope {
+            mode: ReviewMode::HeadCommit,
+            files: vec!["deleted.rs".to_string()],
+            hunks: vec![ReviewHunk {
+                id: "deleted.rs#1".to_string(),
+                path: "deleted.rs".to_string(),
+                old_start: 1,
+                old_lines: 2,
+                new_start: 0,
+                new_lines: 0,
+                lines: vec![
+                    ReviewHunkLine {
+                        kind: ReviewLineKind::Removed,
+                        old_line: Some(1),
+                        new_line: None,
+                        content: "pub fn deleted() {".to_string(),
+                    },
+                    ReviewHunkLine {
+                        kind: ReviewLineKind::Removed,
+                        old_line: Some(2),
+                        new_line: None,
+                        content: "}".to_string(),
+                    },
+                ],
+            }],
+            commit: None,
+        },
+        accessible_repos: Vec::new(),
+        mcp_servers: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+    }));
+    let bus = Arc::new(ScriptedToolBus::new(Vec::new()));
+
+    let verdicts = run_agents(
+        vec![AgentSpec {
+            id: "known-fail-no-rust-source-deletions".to_string(),
+            name: "known-fail-no-rust-source-deletions".to_string(),
+            instruction:
+                "Fail if the commit deletes an entire Rust source file from the review scope."
+                    .to_string(),
+            model: "gpt-5-nano".to_string(),
+            severity: Some(Severity::High),
+            initial_context_token_budget: crate::config::DEFAULT_INITIAL_CONTEXT_TOKEN_BUDGET,
+        }],
+        search,
+        bus.clone(),
+        128,
+        crate::config::DEFAULT_MAX_AGENT_STEPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bus.request_count().await, 0);
+    assert_eq!(verdicts[0].status, TestStatus::Failed);
+    assert_eq!(verdicts[0].evidence[0].path, "deleted.rs");
+    assert!(
+        verdicts[0]
+            .description
+            .contains("deletes the Rust source file")
+    );
+}
+
+#[tokio::test]
 async fn batches_agents_by_configured_limit() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("lib.rs"), "pub fn handler() {}\n").unwrap();

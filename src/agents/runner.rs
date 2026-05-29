@@ -806,6 +806,13 @@ struct GroundedRequest {
     allows_direct_verdict: bool,
     full_repo_mode: bool,
     full_repo_search_terms: Vec<String>,
+    deterministic_failure: Option<DeterministicFailure>,
+}
+
+#[derive(Debug, Clone)]
+struct DeterministicFailure {
+    response: LlmResponse,
+    evidence_lines: HashSet<(String, u32)>,
 }
 
 #[derive(Debug, Default)]
@@ -952,7 +959,7 @@ where
         test_id: agent.id.clone(),
         max_steps: max_agent_steps.max(1),
     });
-    if grounded.review_paths.is_empty() {
+    if grounded.review_paths.is_empty() && inventory.is_empty() {
         let response = LlmResponse {
             status: TestStatus::Passed,
             severity: None,
@@ -985,6 +992,62 @@ where
             review_paths: grounded.review_paths,
             changed_lines: grounded.changed_lines,
             relevant_changed_lines: grounded.relevant_changed_lines,
+            review_causal_terms: grounded.review_causal_terms,
+            elapsed,
+            llm_calls: 0,
+            native_tool_calls: 0,
+            native_final_calls: 0,
+            text_fallback_turns: 0,
+            tool_cache_hits: 0,
+            tool_cache_misses: 0,
+            non_progress_terminations: 0,
+            coverage_chunks_delivered: 0,
+            coverage_pass_rejections: 0,
+            debug_stats,
+        });
+    }
+    if let Some(deterministic_failure) = grounded.deterministic_failure.clone() {
+        let response = deterministic_failure.response;
+        let mut evidence_index = grounded.evidence_index;
+        let mut relevant_changed_lines = grounded.relevant_changed_lines;
+        for line in deterministic_failure.evidence_lines {
+            evidence_index.insert(line.clone());
+            relevant_changed_lines.insert(line);
+        }
+        trace(AgentTraceEvent::FinalVerdict {
+            step: 0,
+            response: response.clone(),
+        });
+        trace(AgentTraceEvent::EvidenceClassified {
+            items: classify_evidence(
+                &response.evidence,
+                &evidence_index,
+                &grounded.review_paths,
+                &grounded.changed_lines,
+                &relevant_changed_lines,
+            ),
+        });
+        let elapsed = agent_started.elapsed();
+        let debug_stats = finish_agent_debug_stats(
+            &debug_telemetry,
+            &response,
+            elapsed,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        return Ok(AgentLoopResult {
+            response,
+            evidence_index,
+            review_paths: grounded.review_paths,
+            changed_lines: grounded.changed_lines,
+            relevant_changed_lines,
             review_causal_terms: grounded.review_causal_terms,
             elapsed,
             llm_calls: 0,
