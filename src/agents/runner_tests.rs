@@ -110,7 +110,7 @@ async fn empty_source_scope_passes_without_llm_call() {
 }
 
 #[tokio::test]
-async fn exact_token_added_invariant_fails_deterministically_without_llm() {
+async fn exact_token_added_invariant_fails_after_review_coverage() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("changed.rs"),
@@ -161,7 +161,10 @@ async fn exact_token_added_invariant_fails_deterministically_without_llm() {
         tools: Vec::new(),
         agents: Vec::new(),
     }));
-    let bus = Arc::new(ScriptedToolBus::new(Vec::new()));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"final","status":"passed","severity":null,"description":"no token finding yet","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"no token finding after coverage","evidence":[]}"#,
+    ]));
 
     let verdicts = run_agents(
         vec![AgentSpec {
@@ -180,7 +183,7 @@ async fn exact_token_added_invariant_fails_deterministically_without_llm() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 0);
+    assert_eq!(bus.request_count().await, 2);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence[0].path, "changed.rs");
     assert_eq!(verdicts[0].evidence[0].line, 2);
@@ -192,7 +195,7 @@ async fn exact_token_added_invariant_fails_deterministically_without_llm() {
 }
 
 #[tokio::test]
-async fn exact_token_removed_invariant_fails_deterministically_without_llm() {
+async fn exact_token_removed_invariant_fails_after_review_coverage() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("context.rs"), "fn handler() {}\n").unwrap();
     let search = Arc::new(LocalSearchSession::new(ScopeConfig {
@@ -225,7 +228,10 @@ async fn exact_token_removed_invariant_fails_deterministically_without_llm() {
         tools: Vec::new(),
         agents: Vec::new(),
     }));
-    let bus = Arc::new(ScriptedToolBus::new(Vec::new()));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"final","status":"passed","severity":null,"description":"no token removal yet","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"no token removal after coverage","evidence":[]}"#,
+    ]));
 
     let verdicts = run_agents(
         vec![AgentSpec {
@@ -244,7 +250,7 @@ async fn exact_token_removed_invariant_fails_deterministically_without_llm() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 0);
+    assert_eq!(bus.request_count().await, 2);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence[0].path, "context.rs");
     assert_eq!(verdicts[0].evidence[0].line, 1098);
@@ -373,7 +379,10 @@ async fn deleted_rust_source_file_invariant_does_not_skip_empty_review_paths() {
         tools: Vec::new(),
         agents: Vec::new(),
     }));
-    let bus = Arc::new(ScriptedToolBus::new(Vec::new()));
+    let bus = Arc::new(ScriptedToolBus::new(vec![
+        r#"{"action":"final","status":"passed","severity":null,"description":"no deleted source yet","evidence":[]}"#,
+        r#"{"action":"final","status":"passed","severity":null,"description":"no deleted source after coverage","evidence":[]}"#,
+    ]));
 
     let verdicts = run_agents(
         vec![AgentSpec {
@@ -394,7 +403,7 @@ async fn deleted_rust_source_file_invariant_does_not_skip_empty_review_paths() {
     .await
     .unwrap();
 
-    assert_eq!(bus.request_count().await, 0);
+    assert_eq!(bus.request_count().await, 2);
     assert_eq!(verdicts[0].status, TestStatus::Failed);
     assert_eq!(verdicts[0].evidence[0].path, "deleted.rs");
     assert!(

@@ -1006,62 +1006,6 @@ where
             debug_stats,
         });
     }
-    if let Some(deterministic_failure) = grounded.deterministic_failure.clone() {
-        let response = deterministic_failure.response;
-        let mut evidence_index = grounded.evidence_index;
-        let mut relevant_changed_lines = grounded.relevant_changed_lines;
-        for line in deterministic_failure.evidence_lines {
-            evidence_index.insert(line.clone());
-            relevant_changed_lines.insert(line);
-        }
-        trace(AgentTraceEvent::FinalVerdict {
-            step: 0,
-            response: response.clone(),
-        });
-        trace(AgentTraceEvent::EvidenceClassified {
-            items: classify_evidence(
-                &response.evidence,
-                &evidence_index,
-                &grounded.review_paths,
-                &grounded.changed_lines,
-                &relevant_changed_lines,
-            ),
-        });
-        let elapsed = agent_started.elapsed();
-        let debug_stats = finish_agent_debug_stats(
-            &debug_telemetry,
-            &response,
-            elapsed,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        );
-        return Ok(AgentLoopResult {
-            response,
-            evidence_index,
-            review_paths: grounded.review_paths,
-            changed_lines: grounded.changed_lines,
-            relevant_changed_lines,
-            review_causal_terms: grounded.review_causal_terms,
-            elapsed,
-            llm_calls: 0,
-            native_tool_calls: 0,
-            native_final_calls: 0,
-            text_fallback_turns: 0,
-            tool_cache_hits: 0,
-            tool_cache_misses: 0,
-            non_progress_terminations: 0,
-            coverage_chunks_delivered: 0,
-            coverage_pass_rejections: 0,
-            debug_stats,
-        });
-    }
     let base_prompt = agent_loop_prompt(&agent.id, &grounded.request.instruction);
     let mut history = Vec::new();
     let mut seen_observations = HashSet::new();
@@ -1070,6 +1014,7 @@ where
     let mut targeted_rescue_hint = targeted_rescue_turn(agent, &grounded);
     let mut full_repo_rescue_terms = VecDeque::from(grounded.full_repo_search_terms.clone());
     let mut evidence_index = grounded.evidence_index;
+    let mut relevant_changed_lines = grounded.relevant_changed_lines.clone();
     let mut investigation = InvestigationState::new(agent);
     let mut coverage = ReviewCoverageState::default();
     let mut llm_calls = 0;
@@ -1334,8 +1279,18 @@ where
                 );
                 continue;
             }
+            if let Some(guidance) = apply_deterministic_failure_after_coverage(
+                &mut final_response,
+                &grounded.deterministic_failure,
+                &mut evidence_index,
+                &mut relevant_changed_lines,
+                &coverage,
+                inventory.as_ref(),
+            ) {
+                trace(AgentTraceEvent::PrematureFinal { step, guidance });
+            }
             let direct_verdict_allowed = grounded.allows_direct_verdict
-                && direct_verdict_is_grounded(&final_response, &grounded.relevant_changed_lines)
+                && direct_verdict_is_grounded(&final_response, &relevant_changed_lines)
                 && direct_verdict_satisfies_investigation(&final_response);
             if !direct_verdict_allowed
                 && let Some(guidance) = investigation.final_guidance(&final_response)
@@ -1379,10 +1334,11 @@ where
                 &evidence_index,
                 &grounded.review_paths,
                 &grounded.changed_lines,
-                &grounded.relevant_changed_lines,
+                &relevant_changed_lines,
             )
             .await?
                 && !is_absence_policy(&agent.instruction)
+                && !is_deterministic_failure_response(&final_response)
             {
                 trace(AgentTraceEvent::PrematureFinal {
                     step,
@@ -1419,8 +1375,9 @@ where
                 &evidence_index,
                 &grounded.review_paths,
                 &grounded.changed_lines,
-                &grounded.relevant_changed_lines,
+                &relevant_changed_lines,
             ) && !is_absence_policy(&agent.instruction)
+                && !is_deterministic_failure_response(&final_response)
             {
                 let guidance = "Failed verdict evidence must cite a substantive line that demonstrates the issue. Do not cite only braces, imports, type aliases, comments, or broad plumbing. Use exact path, line, and preview values from the targeted content observation, then return the failed verdict again.".to_string();
                 trace(AgentTraceEvent::PrematureFinal {
@@ -1498,7 +1455,9 @@ where
                 );
                 continue;
             }
-            if final_response.status == TestStatus::Failed && !is_absence_policy(&agent.instruction)
+            if final_response.status == TestStatus::Failed
+                && !is_absence_policy(&agent.instruction)
+                && !is_deterministic_failure_response(&final_response)
             {
                 let claim_signature = failure_claim_signature(&final_response);
                 if let Some(guidance) =
@@ -1597,7 +1556,7 @@ where
                     &evidence_index,
                     &grounded.review_paths,
                     &grounded.changed_lines,
-                    &grounded.relevant_changed_lines,
+                    &relevant_changed_lines,
                 )
                 .await?;
                 llm_calls += 1;
@@ -1685,7 +1644,7 @@ where
                     &evidence_index,
                     &grounded.review_paths,
                     &grounded.changed_lines,
-                    &grounded.relevant_changed_lines,
+                    &relevant_changed_lines,
                 ),
             });
             let elapsed = agent_started.elapsed();
@@ -1708,7 +1667,7 @@ where
                 evidence_index,
                 review_paths: grounded.review_paths,
                 changed_lines: grounded.changed_lines,
-                relevant_changed_lines: grounded.relevant_changed_lines,
+                relevant_changed_lines: relevant_changed_lines.clone(),
                 review_causal_terms: grounded.review_causal_terms,
                 elapsed,
                 llm_calls,
@@ -1880,12 +1839,28 @@ where
                             continue;
                         }
                         non_progress_terminations += 1;
-                        let response = no_concrete_finding_response(agent, &reason);
+                        let mut response = no_concrete_finding_response(agent, &reason);
+                        apply_deterministic_failure_after_coverage(
+                            &mut response,
+                            &grounded.deterministic_failure,
+                            &mut evidence_index,
+                            &mut relevant_changed_lines,
+                            &coverage,
+                            inventory.as_ref(),
+                        );
                         trace(AgentTraceEvent::NonProgressTerminated {
                             step,
                             response: response.clone(),
                         });
-                        trace(AgentTraceEvent::EvidenceClassified { items: Vec::new() });
+                        trace(AgentTraceEvent::EvidenceClassified {
+                            items: classify_evidence(
+                                &response.evidence,
+                                &evidence_index,
+                                &grounded.review_paths,
+                                &grounded.changed_lines,
+                                &relevant_changed_lines,
+                            ),
+                        });
                         let elapsed = agent_started.elapsed();
                         let debug_stats = finish_agent_debug_stats(
                             &debug_telemetry,
@@ -1906,7 +1881,7 @@ where
                             evidence_index,
                             review_paths: grounded.review_paths,
                             changed_lines: grounded.changed_lines,
-                            relevant_changed_lines: grounded.relevant_changed_lines,
+                            relevant_changed_lines: relevant_changed_lines.clone(),
                             review_causal_terms: grounded.review_causal_terms,
                             elapsed,
                             llm_calls,
@@ -1975,7 +1950,7 @@ where
             &evidence_index,
             &grounded.review_paths,
             &grounded.changed_lines,
-            &grounded.relevant_changed_lines,
+            &relevant_changed_lines,
         )
         && !failed_verdict_is_speculative(&response)
         && !failed_verdict_contradicts_no_finding_language(&response)
@@ -1991,7 +1966,7 @@ where
             &evidence_index,
             &grounded.review_paths,
             &grounded.changed_lines,
-            &grounded.relevant_changed_lines,
+            &relevant_changed_lines,
         )
         .await?;
         llm_calls += 1;
@@ -2014,7 +1989,7 @@ where
                     &evidence_index,
                     &grounded.review_paths,
                     &grounded.changed_lines,
-                    &grounded.relevant_changed_lines,
+                    &relevant_changed_lines,
                 ),
             });
             let elapsed = agent_started.elapsed();
@@ -2037,7 +2012,7 @@ where
                 evidence_index,
                 review_paths: grounded.review_paths,
                 changed_lines: grounded.changed_lines,
-                relevant_changed_lines: grounded.relevant_changed_lines,
+                relevant_changed_lines: relevant_changed_lines.clone(),
                 review_causal_terms: grounded.review_causal_terms,
                 elapsed,
                 llm_calls,
@@ -2061,7 +2036,7 @@ where
         });
     }
 
-    let response = if !coverage.is_complete(inventory.as_ref()) {
+    let mut response = if !coverage.is_complete(inventory.as_ref()) {
         LlmResponse {
             status: TestStatus::Failed,
             severity: agent.severity,
@@ -2084,6 +2059,14 @@ where
             evidence: Vec::new(),
         }
     };
+    apply_deterministic_failure_after_coverage(
+        &mut response,
+        &grounded.deterministic_failure,
+        &mut evidence_index,
+        &mut relevant_changed_lines,
+        &coverage,
+        inventory.as_ref(),
+    );
     trace(AgentTraceEvent::StepLimit {
         response: response.clone(),
     });
@@ -2093,7 +2076,7 @@ where
             &evidence_index,
             &grounded.review_paths,
             &grounded.changed_lines,
-            &grounded.relevant_changed_lines,
+            &relevant_changed_lines,
         ),
     });
     let elapsed = agent_started.elapsed();
@@ -2116,7 +2099,7 @@ where
         evidence_index,
         review_paths: grounded.review_paths,
         changed_lines: grounded.changed_lines,
-        relevant_changed_lines: grounded.relevant_changed_lines,
+        relevant_changed_lines,
         review_causal_terms: grounded.review_causal_terms,
         elapsed,
         llm_calls,
@@ -2169,6 +2152,39 @@ fn direct_verdict_satisfies_investigation(response: &LlmResponse) -> bool {
         TestStatus::Passed => true,
         TestStatus::Failed => false,
     }
+}
+
+fn apply_deterministic_failure_after_coverage(
+    response: &mut LlmResponse,
+    deterministic_failure: &Option<DeterministicFailure>,
+    evidence_index: &mut HashSet<(String, u32)>,
+    relevant_changed_lines: &mut HashSet<(String, u32)>,
+    coverage: &ReviewCoverageState,
+    inventory: &ReviewScopeInventory,
+) -> Option<String> {
+    if response.status != TestStatus::Passed || !coverage.is_complete(inventory) {
+        return None;
+    }
+    let deterministic_failure = deterministic_failure.as_ref()?;
+    for line in &deterministic_failure.evidence_lines {
+        evidence_index.insert(line.clone());
+        relevant_changed_lines.insert(line.clone());
+    }
+    *response = deterministic_failure.response.clone();
+    Some(format!(
+        "Passed verdict rejected because deterministic review-scope evidence proves the fail condition: {}",
+        response.description
+    ))
+}
+
+fn is_deterministic_failure_response(response: &LlmResponse) -> bool {
+    response.status == TestStatus::Failed
+        && (response
+            .description
+            .starts_with("Deterministic exact-token check failed:")
+            || response
+                .description
+                .starts_with("Deterministic source-deletion check failed:"))
 }
 
 fn failed_verdict_lacks_line_evidence(response: &LlmResponse) -> bool {
